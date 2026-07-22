@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd unit for native pi-memoryd on Mac.
+
+  Install:
+    make install
+    cp config/com.earendil.pi-memoryd.plist ~/Library/LaunchAgents/
+    # edit ProgramArguments paths + EnvironmentVariables / use a wrapper
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.earendil.pi-memoryd.plist
+
+  Prefer scripts/run-native.sh so SOPS decrypt + env loading stay outside the binary.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.earendil.pi-memoryd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE/Developer/tireless-ledger/scripts/run-native.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/REPLACE/Developer/tireless-ledger</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE/.local/share/pi-memoryd/stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE/.local/share/pi-memoryd/stderr.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

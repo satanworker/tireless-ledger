@@ -1,0 +1,7 @@
+.git
+.env
+data
+pi-memoryd
+config/vector.s3.yaml
+secrets
+*.log

@@ -1,0 +1,6 @@
+/pi-memoryd
+/bin/
+/data/
+/.env
+/config/vector.s3.yaml
+*.log

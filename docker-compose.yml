@@ -1,0 +1,59 @@
+services:
+  pi-memoryd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pi-memoryd:local
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      PI_MEMORYD_LISTEN: ":8090"
+      PI_MEMORYD_VECTOR_URL: "http://vector-writer:8080"
+      PI_MEMORYD_STORAGE_URL: "s3://${PI_MEMORYD_S3_BUCKET:?set PI_MEMORYD_S3_BUCKET}/${PI_MEMORYD_S3_PREFIX:-vector-index}"
+      PI_MEMORYD_DIMENSIONS: "${PI_MEMORYD_DIMENSIONS:-384}"
+      PI_MEMORYD_FLUSH_SECONDS: "${PI_MEMORYD_FLUSH_SECONDS:-300}"
+      PI_MEMORYD_BATCH_THRESHOLD: "${PI_MEMORYD_BATCH_THRESHOLD:-500}"
+      PI_MEMORYD_STATE: "/data/dedup_state.json"
+      PI_MEMORYD_VECTOR_CONFIG: "/data/vector.generated.yaml"
+      AWS_REGION: "${AWS_REGION:-eu-west-1}"
+      AWS_DEFAULT_REGION: "${AWS_REGION:-eu-west-1}"
+      AWS_ENDPOINT_URL: "${PI_MEMORYD_S3_ENDPOINT:-}"
+      AWS_ENDPOINT: "${PI_MEMORYD_S3_ENDPOINT:-}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+    volumes:
+      - pi-memoryd-data:/data
+    depends_on:
+      vector-writer:
+        condition: service_healthy
+
+  vector-writer:
+    image: ghcr.io/opendata-oss/vector:latest
+    restart: unless-stopped
+    command: ["vector", "--config", "/config/vector.yaml"]
+    ports:
+      - "8080:8080"
+    environment:
+      AWS_REGION: "${AWS_REGION:-eu-west-1}"
+      AWS_DEFAULT_REGION: "${AWS_REGION:-eu-west-1}"
+      AWS_ENDPOINT_URL: "${PI_MEMORYD_S3_ENDPOINT:-}"
+      AWS_ENDPOINT: "${PI_MEMORYD_S3_ENDPOINT:-}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./config/vector.s3.yaml:/config/vector.yaml:ro
+      - vector-cache:/var/cache/opendata-vector
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+volumes:
+  pi-memoryd-data:
+  vector-cache:

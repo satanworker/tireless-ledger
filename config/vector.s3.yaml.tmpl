@@ -1,0 +1,37 @@
+storage:
+  type: SlateDb
+  path: ${PI_MEMORYD_S3_PREFIX}
+  object_store:
+    type: Aws
+    region: ${AWS_REGION}
+    bucket: ${PI_MEMORYD_S3_BUCKET}
+  block_cache:
+    type: FoyerHybrid
+    memory_capacity: ${VECTOR_CACHE_MEMORY_BYTES}
+    disk_capacity: ${VECTOR_CACHE_DISK_BYTES}
+    disk_path: /var/cache/opendata-vector/block-cache
+dimensions: ${PI_MEMORYD_DIMENSIONS}
+distance_metric: ${PI_MEMORYD_DISTANCE}
+flush_interval: ${PI_MEMORYD_FLUSH_SECONDS}
+split_threshold_vectors: ${VECTOR_SPLIT_THRESHOLD_VECTORS}
+merge_threshold_vectors: ${VECTOR_MERGE_THRESHOLD_VECTORS}
+split_search_neighbourhood: ${VECTOR_SPLIT_SEARCH_NEIGHBOURHOOD}
+metadata_fields:
+  - name: scope
+    field_type: String
+    indexed: true
+  - name: project_name
+    field_type: String
+    indexed: true
+  - name: file_path
+    field_type: String
+    indexed: true
+  - name: file_hash
+    field_type: String
+    indexed: true
+  - name: timestamp
+    field_type: Int64
+    indexed: false
+  - name: forward_content
+    field_type: String
+    indexed: false
