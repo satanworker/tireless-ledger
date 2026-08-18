@@ -1,3 +1,5 @@
 creation_rules:
   - path_regex: secrets/.*\.sops\.(env|ya?ml|json)$
-    age: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDvO9YYWYuUSD8c4965erLNp6QTj42Ro1LoUjKDc3GvX
+    age: >-
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDvO9YYWYuUSD8c4965erLNp6QTj42Ro1LoUjKDc3GvX,
+      age1xgyzemfkhuu5a3w47fe2lfpgxm49xrukr5uczpknemeueeujfg2qcfrmup
