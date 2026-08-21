@@ -4,7 +4,7 @@ title: Single-process Go CGO Lance (drop Python sidecar)
 emoji: ⚡
 status: completed
 created: 2026-08-21T11:11:40.665Z
-updated: 2026-08-21T13:55:00.000Z
+updated: 2026-08-21T14:07:00.000Z
 ---
 ## Checklist
 - [x] Wire lance.go CGO store: connect R2, merge-insert, hybrid, walk, compact-on-16
@@ -27,6 +27,7 @@ updated: 2026-08-21T13:55:00.000Z
 - Production was cut over at 2026-08-21 13:48 UTC to image `sha256:6ecc8f5356e5d52684024d07adb6491e5363d98b5ca711c9b4605f61b7fb0cce`. Readiness passed after the native Lance warmup, the existing Codex session walk passed, and the Python `lance-writer` container was stopped and removed. The previous daemon image remains available as `pi-memoryd:pre-cgo-20260821` for rollback.
 - The explicitly requested VPS Codex-history follow-on scan found 350 JSONL files / 550 MiB and extracted 15,426 user/assistant turns in 5.19s. The client now bounds embedding input to 800 characters (while storing full text) to stay inside BGE-small's 512-token window. A 100-turn write trial completed in 10.24s; the full run started at 13:52 UTC and reached 1,700 processed / 1,600 newly accepted / 100 skipped in 3m38s (~7.8 turns/s end to end, including compaction and concurrent measurement).
 - During that active write load, five-request medians were 0.683s for BM25 and 0.337s for session walk. The first BM25 request was cold at 1.837s. `pi-memoryd` used about 50 MiB RSS and the two-thread embedder about 122 MiB RSS / 195% CPU.
+- The original foreground extractor ended when its tool session was collected after 3,800 unique turns; production remained healthy. Ingest resumed from parsed-turn offset 3,800 at 14:06 UTC as durable user unit `tireless-codex-ingest.service`; its first resumed 100-row batch persisted successfully.
 
 ## Decisions
 

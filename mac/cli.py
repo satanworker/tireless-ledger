@@ -90,8 +90,10 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 
     for turn in walk_roots(args.pi, args.codex, args.host):
         n += 1
+        if n <= args.skip:
+            continue
         buf.append(turn)
-        if args.limit and n >= args.limit:
+        if args.limit and n >= args.skip + args.limit:
             break
         if len(buf) >= POST_BATCH:
             flush()
@@ -156,6 +158,7 @@ def main() -> None:
 
     si = sub.add_parser("ingest", help="embed + POST /v1/memory/ingest")
     si.add_argument("--limit", type=int, default=0)
+    si.add_argument("--skip", type=int, default=0, help="skip this many parsed turns before ingesting")
     si.add_argument("--dry-run", action="store_true")
     si.set_defaults(func=cmd_ingest)
 
