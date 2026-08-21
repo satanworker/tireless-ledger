@@ -26,6 +26,17 @@ indexes:
 docker compose run --rm --no-deps pi-memoryd --optimize
 ```
 
+On the VPS this is automated by a persistent user timer. It runs daily at
+04:30 UTC with up to 15 minutes of randomized delay and catches up after
+downtime. Install or refresh it with:
+
+```bash
+make install-optimize-timer
+```
+
+The timer uses a non-blocking runtime lock, so delayed timer invocations cannot
+overlap an optimization already in progress.
+
 For corpora above roughly 10,000 rows, an explicitly reversible IVF-Flat index can reduce dense-search latency while retaining full-precision vectors:
 
 ```sh

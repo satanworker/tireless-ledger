@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Tireless Ledger Lance index optimization
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+Persistent=true
+RandomizedDelaySec=15min
+AccuracySec=1min
+Unit=tireless-ledger-optimize.service
+
+[Install]
+WantedBy=timers.target

@@ -15,7 +15,8 @@ GOARCH         ?= $(shell go env GOARCH)
 
 .PHONY: all build build-native release test clean \
 	install uninstall run secrets-decrypt secrets-edit render-config \
-	docker-build up down doctor recall-local embed-local mac-test
+	docker-build up down doctor recall-local embed-local mac-test \
+	install-optimize-timer
 
 all: build
 
@@ -96,3 +97,6 @@ up: secrets-decrypt
 
 down:
 	docker compose down
+
+install-optimize-timer:
+	./scripts/install-optimize-timer.sh
