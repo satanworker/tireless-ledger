@@ -23,7 +23,7 @@ const (
 	lanceCompactFragments = 16
 	lanceVectorIndexName  = "vector_ivf_flat"
 	lanceVectorPartitions = uint32(64)
-	lanceVectorNProbes    = 32
+	lanceVectorNProbes    = 64
 )
 
 var lanceOutputColumns = []string{

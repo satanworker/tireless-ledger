@@ -83,7 +83,7 @@ Production uses 384-dimensional `BAAI/bge-small-en-v1.5` vectors. Query prefixes
 | Variable | Purpose |
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, normally `s3://<bucket>/session-recall-lance` |
-| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to 32 of 64 |
+| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to all 64 for exhaustive coverage |
 | `PI_MEMORYD_S3_BUCKET` | Compose bucket interpolation |
 | `PI_MEMORYD_S3_ENDPOINT` | R2 S3 endpoint; passed as Lance `aws_endpoint` |
 | `PI_MEMORYD_KEY_ID` | R2 access key ID |

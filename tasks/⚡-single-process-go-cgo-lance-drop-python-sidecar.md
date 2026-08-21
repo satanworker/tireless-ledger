@@ -4,7 +4,7 @@ title: Single-process Go CGO Lance (drop Python sidecar)
 emoji: ⚡
 status: completed
 created: 2026-08-21T11:11:40.665Z
-updated: 2026-08-21T17:42:10.000Z
+updated: 2026-08-21T18:07:32.000Z
 ---
 ## Checklist
 - [x] Wire lance.go CGO store: connect R2, merge-insert, hybrid, walk, compact-on-16
@@ -31,8 +31,8 @@ updated: 2026-08-21T17:42:10.000Z
 - The resumed extraction completed with 11,724 newly accepted rows, zero skipped, in 1,739.43s. Together with the earlier rows, the live table contains 15,524 extracted Codex-history turns. Automatic fragment compaction ran 11 times without a failure.
 - Immediately after bulk ingest, warm medians had regressed with corpus size and stale index tails: hybrid 1.982s, BM25 2.197s, vector 0.981s, and walk 0.511s. Ordinary compaction had not folded newly written rows into the existing FTS/B-tree indexes.
 - A one-shot `--optimize` path now compacts, runs Lance `OptimizeIndex`, and prunes old versions. It reduced the table from 15 fragments to 3; the subsequent IVF build/maintenance reduced it to 1. Future automatic compactions also refresh every index so the stale-tail regression does not recur.
-- The 15,524-row table now has a reversible 64-partition IVF-Flat vector index. Production scans 32 partitions per query (`PI_MEMORYD_VECTOR_NPROBES=32`). Against exact search across five representative queries, all vector and hybrid top-1 results matched; vector top-5 overlap was 88% and hybrid top-5 overlap was 92%. The rejected 16-probe setting retained only 72% top-5 overlap.
-- Final post-restart ten-sample warm medians were BM25 0.211s, vector 0.203s, hybrid 0.267s, and 50-row session walk 0.221s. Relative to post-ingest/pre-maintenance, that is about 90%, 79%, 87%, and 57% lower median latency respectively. Query embedding itself was 0.016s median. One hybrid sample was a 3.42s R2/network tail outlier.
+- The 15,524-row table now has a reversible 64-partition IVF-Flat vector index. Production scans all 64 partitions per query (`PI_MEMORYD_VECTOR_NPROBES=64`) for complete vector coverage. Across five representative queries, both vector and hybrid rankings matched exhaustive search at all 25 top-five positions. The rejected 16-probe setting retained only 72% top-five overlap; the intermediate 32-probe setting retained 88% vector / 92% hybrid overlap.
+- Final 64-probe ten-sample warm medians were BM25 0.211s, vector 0.211s, hybrid 0.225s, and 50-row session walk 0.221s. Relative to post-ingest/pre-maintenance, that is about 90%, 78%, 89%, and 57% lower median latency respectively. Query embedding itself was 0.016s median. The 64-probe vector/hybrid maxima in this run were 0.319s / 0.294s.
 - The final image is `sha256:4ec73dba25cfcc294cefdf13be154775df21fe421ad223bf579902fd980c2009`; exact-scan rollback remains `pi-memoryd:pre-ann-20260821` (`sha256:f218d104fcc9ec1acdeada8fb0d88d658983a74a8cfc0fc0869c8cedc6c84e95`). Both services are healthy. Steady-state RSS was about 48 MiB for `pi-memoryd` and 40 MiB for the embedder, with 3.7 GiB host memory available.
 
 ## Decisions

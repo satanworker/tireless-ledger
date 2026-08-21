@@ -233,7 +233,7 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.AWSRegion, "aws-region", env("AWS_REGION", env("AWS_DEFAULT_REGION", defaultRegion)), "AWS region")
 	flag.StringVar(&cfg.S3Endpoint, "s3-endpoint", env("PI_MEMORYD_S3_ENDPOINT", env("AWS_ENDPOINT_URL", env("AWS_ENDPOINT", ""))), "S3-compatible endpoint URL")
 	flag.IntVar(&cfg.Dimensions, "dimensions", envInt("PI_MEMORYD_DIMENSIONS", 384), "vector dimensions")
-	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 32), "IVF partitions scanned per vector query")
+	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 64), "IVF partitions scanned per vector query")
 	flag.StringVar(&cfg.StatePath, "state", env("PI_MEMORYD_STATE", "./data/dedup_state.json"), "dedup state path")
 	flag.BoolVar(&cfg.DryRunS3, "dry-run-s3", envBool("PI_MEMORYD_DRY_RUN_S3", false), "skip AWS SDK S3 validation")
 	flag.BoolVar(&cfg.Optimize, "optimize", false, "compact data, refresh indexes, prune old versions, and exit")
