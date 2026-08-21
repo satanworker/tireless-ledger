@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,12 +12,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -26,14 +23,9 @@ import (
 )
 
 const (
-	defaultListenAddr     = ":8090"
-	defaultVectorURL      = "http://127.0.0.1:8080"
-	defaultRegion         = "eu-west-1"
-	defaultStorageURL     = "s3://YOUR_PRODUCTION_BUCKET_NAME/vector-index"
-	defaultFlushSeconds   = 300
-	defaultBatchThreshold = 32
-	defaultHTTPClientTO   = 60 * time.Second
-	contentTypeProtoJSON  = "application/protobuf+json"
+	defaultListenAddr = ":8090"
+	defaultRegion     = "eu-west-1"
+	defaultStorageURL = "s3://YOUR_PRODUCTION_BUCKET_NAME/vector-index"
 )
 
 type MemoryScope string
@@ -97,15 +89,6 @@ type queryResponse struct {
 	Results []queryResult `json:"results"`
 }
 
-type vectorWriteRequest struct {
-	UpsertVectors []vectorRecord `json:"upsertVectors"`
-}
-
-type vectorRecord struct {
-	ID         string                 `json:"id"`
-	Attributes map[string]interface{} `json:"attributes"`
-}
-
 type bm25Query struct {
 	Field string `json:"field"`
 	Query string `json:"query"`
@@ -131,15 +114,6 @@ type comparisonFilter struct {
 	Value interface{} `json:"value"`
 }
 
-type vectorSearchResponse struct {
-	Status  string `json:"status"`
-	Results []struct {
-		Score  float64      `json:"score"`
-		Vector vectorRecord `json:"vector"`
-	} `json:"results"`
-	Message string `json:"message,omitempty"`
-}
-
 type dedupState struct {
 	mu    sync.RWMutex
 	Path  string            `json:"-"`
@@ -147,29 +121,27 @@ type dedupState struct {
 }
 
 type server struct {
-	cfg        runtimeConfig
-	client     *http.Client
-	dedup      *dedupState
-	writeMu    sync.Mutex
-	vectorProc *exec.Cmd
-	mem        *memStore
+	cfg     runtimeConfig
+	dedup   *dedupState
+	writeMu sync.Mutex
+	mem     *memStore
+	lance   lanceStore
 }
 
 type runtimeConfig struct {
-	ListenAddr     string
-	VectorURL      string
-	StorageURL     string
-	AWSRegion      string
-	S3Endpoint     string
-	Dimensions     int
-	DistanceMetric string
-	FlushSeconds   int
-	BatchThreshold int
-	StatePath      string
-	ConfigPath     string
-	VectorBinary   string
-	StartVector    bool
-	DryRunS3       bool
+	ListenAddr string
+	StorageURL string
+	AWSRegion  string
+	S3Endpoint string
+	Dimensions int
+	StatePath  string
+	DryRunS3   bool
+}
+
+type lanceStore interface {
+	Close() error
+	Upsert(context.Context, []MemoryItem) error
+	Search(context.Context, vectorSearchRequest) ([]queryResult, error)
 }
 
 func main() {
@@ -185,13 +157,6 @@ func main() {
 		slog.Error("s3 validation failed", "err", err)
 		os.Exit(1)
 	}
-	if !local {
-		if err := writeVectorConfig(cfg); err != nil {
-			slog.Error("write vector config", "err", err)
-			os.Exit(1)
-		}
-	}
-
 	state, err := loadDedupState(cfg.StatePath)
 	if err != nil {
 		slog.Error("load dedup state", "err", err)
@@ -199,21 +164,21 @@ func main() {
 	}
 
 	s := &server{
-		cfg:    cfg,
-		client: &http.Client{Timeout: defaultHTTPClientTO},
-		dedup:  state,
+		cfg:   cfg,
+		dedup: state,
 	}
 	if local {
 		s.mem = newMemStore(cfg.Dimensions)
 		slog.Info("using in-memory vector store (memory://)")
 	}
 
-	if cfg.StartVector && s.mem == nil {
-		if err := s.startVector(); err != nil {
-			slog.Error("start opendata vector", "err", err)
+	if !local {
+		s.lance, err = openLanceStore(context.Background(), cfg)
+		if err != nil {
+			slog.Error("open lance store", "err", err)
 			os.Exit(1)
 		}
-		defer s.stopVector()
+		defer s.lance.Close()
 	}
 
 	mux := http.NewServeMux()
@@ -222,7 +187,7 @@ func main() {
 	mux.HandleFunc("POST /v1/memory/query", s.query)
 	mux.HandleFunc("GET /v1/memory/session", s.sessionWalk)
 
-	slog.Info("pi-memoryd listening", "addr", cfg.ListenAddr, "vector_url", cfg.VectorURL, "storage_url", cfg.StorageURL)
+	slog.Info("pi-memoryd listening", "addr", cfg.ListenAddr, "storage_url", cfg.StorageURL)
 	if err := http.ListenAndServe(cfg.ListenAddr, mux); err != nil {
 		slog.Error("http server stopped", "err", err)
 		os.Exit(1)
@@ -232,18 +197,11 @@ func main() {
 func loadConfig() runtimeConfig {
 	cfg := runtimeConfig{}
 	flag.StringVar(&cfg.ListenAddr, "listen", env("PI_MEMORYD_LISTEN", defaultListenAddr), "HTTP listen address")
-	flag.StringVar(&cfg.VectorURL, "vector-url", env("PI_MEMORYD_VECTOR_URL", defaultVectorURL), "OpenData Vector HTTP URL")
 	flag.StringVar(&cfg.StorageURL, "storage-url", env("PI_MEMORYD_STORAGE_URL", defaultStorageURL), "S3 URL, e.g. s3://bucket/vector-index")
 	flag.StringVar(&cfg.AWSRegion, "aws-region", env("AWS_REGION", env("AWS_DEFAULT_REGION", defaultRegion)), "AWS region")
 	flag.StringVar(&cfg.S3Endpoint, "s3-endpoint", env("PI_MEMORYD_S3_ENDPOINT", env("AWS_ENDPOINT_URL", env("AWS_ENDPOINT", ""))), "S3-compatible endpoint URL")
 	flag.IntVar(&cfg.Dimensions, "dimensions", envInt("PI_MEMORYD_DIMENSIONS", 384), "vector dimensions")
-	flag.StringVar(&cfg.DistanceMetric, "distance", env("PI_MEMORYD_DISTANCE", "L2"), "OpenData distance metric")
-	flag.IntVar(&cfg.FlushSeconds, "flush-seconds", envInt("PI_MEMORYD_FLUSH_SECONDS", defaultFlushSeconds), "writer debounce flush window")
-	flag.IntVar(&cfg.BatchThreshold, "batch-threshold", envInt("PI_MEMORYD_BATCH_THRESHOLD", defaultBatchThreshold), "writer batch row threshold")
 	flag.StringVar(&cfg.StatePath, "state", env("PI_MEMORYD_STATE", "./data/dedup_state.json"), "dedup state path")
-	flag.StringVar(&cfg.ConfigPath, "vector-config", env("PI_MEMORYD_VECTOR_CONFIG", "./data/vector.yaml"), "generated OpenData Vector config path")
-	flag.StringVar(&cfg.VectorBinary, "vector-binary", env("PI_MEMORYD_VECTOR_BINARY", "opendata-vector"), "OpenData Vector binary")
-	flag.BoolVar(&cfg.StartVector, "start-vector", envBool("PI_MEMORYD_START_VECTOR", false), "spawn OpenData Vector process")
 	flag.BoolVar(&cfg.DryRunS3, "dry-run-s3", envBool("PI_MEMORYD_DRY_RUN_S3", false), "skip AWS SDK S3 validation")
 	flag.Parse()
 	return cfg
@@ -274,80 +232,6 @@ func validateS3(ctx context.Context, cfg runtimeConfig) error {
 	})
 	_, err = client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &prefix, MaxKeys: int32Ptr(1)})
 	return err
-}
-
-func writeVectorConfig(cfg runtimeConfig) error {
-	bucket, prefix, err := parseS3URL(cfg.StorageURL)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(cfg.ConfigPath), 0o755); err != nil {
-		return err
-	}
-	body := fmt.Sprintf(`storage:
-  type: SlateDb
-  path: %s
-  object_store:
-    type: Aws
-    region: %s
-    bucket: %s
-dimensions: %d
-distance_metric: %s
-flush_interval: %d
-metadata_fields:
-  - name: scope
-    field_type: String
-    indexed: true
-  - name: project_name
-    field_type: String
-    indexed: true
-  - name: file_path
-    field_type: String
-    indexed: true
-  - name: file_hash
-    field_type: String
-    indexed: true
-  - name: timestamp
-    field_type: Int64
-    indexed: false
-  - name: session_id
-    field_type: String
-    indexed: true
-  - name: host
-    field_type: String
-    indexed: true
-  - name: harness
-    field_type: String
-    indexed: true
-  - name: role
-    field_type: String
-    indexed: true
-  - name: forward_content
-    field_type: Text
-    indexed: true
-`, prefix, cfg.AWSRegion, bucket, cfg.Dimensions, cfg.DistanceMetric, cfg.FlushSeconds)
-	return os.WriteFile(cfg.ConfigPath, []byte(body), 0o600)
-}
-
-func (s *server) startVector() error {
-	u, err := url.Parse(s.cfg.VectorURL)
-	if err != nil {
-		return err
-	}
-	port := u.Port()
-	if port == "" {
-		port = "8080"
-	}
-	s.vectorProc = exec.Command(s.cfg.VectorBinary, "--port", port, "vector", "--config", s.cfg.ConfigPath)
-	s.vectorProc.Stdout = os.Stdout
-	s.vectorProc.Stderr = os.Stderr
-	return s.vectorProc.Start()
-}
-
-func (s *server) stopVector() {
-	if s.vectorProc != nil && s.vectorProc.Process != nil {
-		_ = s.vectorProc.Process.Kill()
-	}
 }
 
 func (s *server) ready(w http.ResponseWriter, r *http.Request) {
@@ -529,22 +413,10 @@ func (s *server) vectorSearch(searchReq vectorSearchRequest) ([]queryResult, err
 	if s.mem != nil {
 		return s.mem.search(searchReq), nil
 	}
-	var searchResp vectorSearchResponse
-	if err := s.postVector("/api/v1/vector/search", searchReq, &searchResp); err != nil {
-		return nil, err
+	if s.lance == nil {
+		return nil, errors.New("lance store is not initialized")
 	}
-	out := make([]queryResult, 0, len(searchResp.Results))
-	for _, res := range searchResp.Results {
-		attrs := res.Vector.Attributes
-		if attrs == nil {
-			attrs = map[string]interface{}{}
-		}
-		content, _ := attrs["forward_content"].(string)
-		delete(attrs, "vector")
-		delete(attrs, "forward_content")
-		out = append(out, queryResult{ID: res.Vector.ID, Score: res.Score, ForwardContent: content, Metadata: attrs})
-	}
-	return out, nil
+	return s.lance.Search(context.Background(), searchReq)
 }
 
 func queryFilter(req queryRequest) *vectorFilter {
@@ -618,60 +490,11 @@ func (s *server) flushBatch(items []MemoryItem) error {
 		}
 		return s.dedup.Save()
 	}
-	n := s.cfg.BatchThreshold
-	if n <= 0 {
-		n = defaultBatchThreshold
+	if s.lance == nil {
+		return errors.New("lance store is not initialized")
 	}
-	for i := 0; i < len(items); i += n {
-		end := i + n
-		if end > len(items) {
-			end = len(items)
-		}
-		if err := s.writeVectors(items[i:end]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func tooBig(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "413") || strings.Contains(msg, "Payload Too Large") || strings.Contains(msg, "broken pipe")
-}
-
-func (s *server) writeVectors(items []MemoryItem) error {
-	if len(items) == 0 {
-		return nil
-	}
-	writeReq := vectorWriteRequest{UpsertVectors: make([]vectorRecord, 0, len(items))}
-	for _, item := range items {
-		writeReq.UpsertVectors = append(writeReq.UpsertVectors, vectorRecord{ID: safeID(item.ID), Attributes: map[string]interface{}{
-			"vector":          item.Vector,
-			"forward_content": item.ForwardContent,
-			"scope":           string(item.Metadata.Scope),
-			"project_name":    item.Metadata.ProjectName,
-			"file_path":       item.Metadata.FilePath,
-			"file_hash":       item.Metadata.FileHash,
-			"timestamp":       item.Metadata.Timestamp,
-			"session_id":      item.Metadata.SessionID,
-			"host":            item.Metadata.Host,
-			"harness":         item.Metadata.Harness,
-			"role":            item.Metadata.Role,
-		}})
-	}
-	var resp map[string]interface{}
-	if err := s.postVector("/api/v1/vector/write", writeReq, &resp); err != nil {
-		if len(items) > 1 && tooBig(err) {
-			mid := len(items) / 2
-			if e := s.writeVectors(items[:mid]); e != nil {
-				return e
-			}
-			return s.writeVectors(items[mid:])
-		}
-		slog.Error("vector write failed", "records", len(items), "err", err)
+	if err := s.lance.Upsert(context.Background(), items); err != nil {
+		slog.Error("lance write failed", "records", len(items), "err", err)
 		return err
 	}
 	for _, item := range items {
@@ -680,31 +503,8 @@ func (s *server) writeVectors(items []MemoryItem) error {
 	if err := s.dedup.Save(); err != nil {
 		return err
 	}
-	slog.Info("flushed memory batch", "records", len(items))
+	slog.Info("flushed lance batch", "records", len(items))
 	return nil
-}
-
-func (s *server) postVector(path string, in, out interface{}) error {
-	body, err := json.Marshal(in)
-	if err != nil {
-		return err
-	}
-	resp, err := s.client.Post(strings.TrimRight(s.cfg.VectorURL, "/")+path, contentTypeProtoJSON, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var er struct {
-			Message string `json:"message"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&er)
-		if er.Message == "" {
-			er.Message = resp.Status
-		}
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, er.Message)
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func validateMemoryItem(item MemoryItem, dims int) error {

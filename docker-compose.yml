@@ -10,40 +10,15 @@ services:
       - "100.127.82.49:8090:8090"
     environment:
       PI_MEMORYD_LISTEN: ":8090"
-      PI_MEMORYD_VECTOR_URL: "http://lance-writer:8080"
       PI_MEMORYD_STORAGE_URL: "s3://${PI_MEMORYD_S3_BUCKET:?set PI_MEMORYD_S3_BUCKET}/session-recall-lance"
       PI_MEMORYD_STATE: "/data/dedup_state.json"
-      PI_MEMORYD_FLUSH_SECONDS: "300"
-      PI_MEMORYD_BATCH_THRESHOLD: "32"
       AWS_DEFAULT_REGION: "${AWS_REGION:-auto}"
       AWS_ENDPOINT_URL: "${PI_MEMORYD_S3_ENDPOINT:-}"
       AWS_ENDPOINT: "${PI_MEMORYD_S3_ENDPOINT:-}"
-      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_ACCESS_KEY_ID: "${PI_MEMORYD_KEY_ID:?set PI_MEMORYD_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${PI_MEMORYD_APPLICATION_KEY:?set PI_MEMORYD_APPLICATION_KEY}"
     volumes:
       - pi-memoryd-data:/data
-    depends_on:
-      - lance-writer
-
-  lance-writer:
-    build:
-      context: .
-      dockerfile: docker/lance.Dockerfile
-    image: tireless-lance:local
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      LANCE_URI: "s3://${PI_MEMORYD_S3_BUCKET:?set PI_MEMORYD_S3_BUCKET}/session-recall-lance"
-      LANCE_TABLE: "turns"
-      LANCE_DIMS: "384"
-      LANCE_PORT: "8080"
-      AWS_DEFAULT_REGION: "${AWS_REGION:-auto}"
-      AWS_ENDPOINT_URL: "${PI_MEMORYD_S3_ENDPOINT:-}"
-      AWS_ENDPOINT: "${PI_MEMORYD_S3_ENDPOINT:-}"
-      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
-    volumes:
-      - lance-cache:/data/lance
 
   # CPU embed only. docker compose --profile embed up
   # 4x Neoverse-N1 / 7.5GiB: -ngl 0 -t 2 -c 512. Same BGE GGUF as Mac ingest.
@@ -79,4 +54,3 @@ services:
 
 volumes:
   pi-memoryd-data:
-  lance-cache:

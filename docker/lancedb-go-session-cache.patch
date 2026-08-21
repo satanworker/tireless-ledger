@@ -1,0 +1,281 @@
+diff --git a/rust/Cargo.toml b/rust/Cargo.toml
+index aa89c42..7e6cfdd 100644
+--- a/rust/Cargo.toml
++++ b/rust/Cargo.toml
+@@ -8,7 +8,7 @@ repository = "https://github.com/lancedb/lancedb-go"
+ keywords = ["lancedb", "lance", "database", "vector", "search"]
+ categories = ["database-implementations"]
+ authors = ["LanceDB Devs <dev@lancedb.com>"]
+-rust-version = "1.78.0"
++rust-version = "1.91.0"
+ publish = false
+ 
+ [lib]
+@@ -17,18 +17,18 @@ crate-type = ["staticlib"]
+ path = "src/lib_simple.rs"
+ 
+ [dependencies]
+-lancedb = { git = "https://github.com/lancedb/lancedb.git", tag = "v0.24.0", default-features = false }
++lancedb = { git = "https://github.com/lancedb/lancedb.git", tag = "v0.37.1", default-features = false }
+ tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+ libc = "0.2"
+ log = "0.4"
+ env_logger = "0.11"
+-arrow = { version = "56.2", optional = false }
+-arrow-array = "56.2"
+-arrow-data = "56.2"
+-arrow-schema = "56.2"
+-arrow-ord = "56.2"
+-arrow-cast = "56.2"
+-arrow-ipc = "56.2"
++arrow = { version = "58.0.0", optional = false }
++arrow-array = "58.0.0"
++arrow-data = "58.0.0"
++arrow-schema = "58.0.0"
++arrow-ord = "58.0.0"
++arrow-cast = "58.0.0"
++arrow-ipc = "58.0.0"
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ tokio-stream = "0.1"
+diff --git a/rust/src/data.rs b/rust/src/data.rs
+index 0f80ec2..86e8c42 100644
+--- a/rust/src/data.rs
++++ b/rust/src/data.rs
+@@ -333,10 +333,7 @@ pub extern "C" fn simple_lancedb_table_add_json(
+             Ok(record_batch) => {
+                 // Add the record batch to the table
+                 match rt.block_on(async {
+-                    use arrow_array::RecordBatchIterator;
+-                    let batches = vec![Ok(record_batch.clone())];
+-                    let batch_iter = RecordBatchIterator::new(batches, record_batch.schema());
+-                    table.add(batch_iter).execute().await
++                    table.add(vec![record_batch.clone()]).execute().await
+                 }) {
+                     Ok(_) => {
+                         unsafe {
+@@ -402,17 +399,7 @@ pub extern "C" fn simple_lancedb_table_add_ipc(
+ 
+                 // Add the record batches to the table
+                 match rt.block_on(async {
+-                    use arrow_array::RecordBatchIterator;
+-
+-                    // Get schema from the first batch
+-                    let schema = record_batches[0].schema();
+-
+-                    // Create iterator from record batches
+-                    let batches: Vec<Result<arrow_array::RecordBatch, arrow_schema::ArrowError>> =
+-                        record_batches.into_iter().map(Ok).collect();
+-                    let batch_iter = RecordBatchIterator::new(batches, schema);
+-
+-                    table.add(batch_iter).execute().await
++                    table.add(record_batches).execute().await
+                 }) {
+                     Ok(_) => {
+                         unsafe {
+diff --git a/rust/src/index.rs b/rust/src/index.rs
+index 410ff1c..7e448e0 100644
+--- a/rust/src/index.rs
++++ b/rust/src/index.rs
+@@ -265,7 +265,6 @@ pub extern "C" fn simple_lancedb_table_index_stats(
+                     "index_type": format!("{:?}", index_stats.index_type),
+                     "distance_type": index_stats.distance_type,
+                     "num_indices": index_stats.num_indices,
+-                    "loss": index_stats.loss,
+                 });
+ 
+                 match serde_json::to_string(&stats_json) {
+diff --git a/rust/src/schema_evolve.rs b/rust/src/schema_evolve.rs
+index ff50828..720e002 100644
+--- a/rust/src/schema_evolve.rs
++++ b/rust/src/schema_evolve.rs
+@@ -94,7 +94,13 @@ pub extern "C" fn simple_lancedb_table_add_columns(
+ 
+         let table = unsafe { &*(table_handle as *const lancedb::Table) };
+         let rt = get_simple_runtime();
+-        match rt.block_on(async { table.add_columns(transforms, None).await }) {
++        match rt.block_on(async {
++            table
++                .add_columns()
++                .transform(transforms)
++                .execute()
++                .await
++        }) {
+             Ok(res) => {
+                 unsafe {
+                     *version_out = res.version;
+diff --git a/rust/src/table.rs b/rust/src/table.rs
+index 2fb383c..c171c2b 100644
+--- a/rust/src/table.rs
++++ b/rust/src/table.rs
+@@ -42,13 +42,9 @@ pub extern "C" fn simple_lancedb_create_table(
+             Ok(schema_json_value) => match create_arrow_schema_from_json(&schema_json_value) {
+                 Ok(arrow_schema) => {
+                     match rt.block_on(async {
+-                        use arrow_array::RecordBatchIterator;
+-                        let empty_batches = RecordBatchIterator::new(
+-                            vec![]
+-                                as Vec<Result<arrow_array::RecordBatch, arrow_schema::ArrowError>>,
+-                            Arc::new(arrow_schema),
+-                        );
+-                        conn.create_table(&name, empty_batches).execute().await
++                        conn.create_empty_table(&name, Arc::new(arrow_schema))
++                            .execute()
++                            .await
+                     }) {
+                         Ok(_) => SimpleResult::ok(),
+                         Err(e) => SimpleResult::error(format!("Failed to create table: {}", e)),
+@@ -103,12 +99,9 @@ pub extern "C" fn simple_lancedb_create_table_with_ipc(
+         };
+ 
+         match rt.block_on(async {
+-            use arrow_array::RecordBatchIterator;
+-            let empty_batches = RecordBatchIterator::new(
+-                vec![] as Vec<Result<arrow_array::RecordBatch, arrow_schema::ArrowError>>,
+-                arrow_schema, // arrow_schema is already Arc<Schema>
+-            );
+-            conn.create_table(&name, empty_batches).execute().await
++            conn.create_empty_table(&name, arrow_schema)
++                .execute()
++                .await
+         }) {
+             Ok(_) => SimpleResult::ok(),
+             Err(e) => SimpleResult::error(format!("Failed to create table: {}", e)),
+diff --git a/include/lancedb.h b/include/lancedb.h
+index 653c415..a2ffe37 100644
+--- a/include/lancedb.h
++++ b/include/lancedb.h
+@@ -238,6 +238,11 @@ struct SimpleResult *simple_lancedb_table_create_index_v2(void *table_handle,
+  */
+ struct SimpleResult *simple_lancedb_table_count_rows(void *table_handle, int64_t *count);
+ 
++/**
++ * Count data fragments in a table.
++ */
++struct SimpleResult *simple_lancedb_table_count_fragments(void *table_handle, int64_t *count);
++
+ /**
+  * Get table version (simple version)
+  */
+diff --git a/pkg/internal/table.go b/pkg/internal/table.go
+index 95f0a0c..32c2c29 100644
+--- a/pkg/internal/table.go
++++ b/pkg/internal/table.go
+@@ -264,6 +264,26 @@ func (t *Table) Count(_ context.Context) (int64, error) {
+ 	return int64(count), nil
+ }
+ 
++// FragmentCount returns the number of data fragments in the table. It is an
++// optional capability used by applications that compact on a fragment limit.
++func (t *Table) FragmentCount(_ context.Context) (int, error) {
++	t.mu.RLock()
++	defer t.mu.RUnlock()
++	if t.closed || t.handle == nil {
++		return 0, fmt.Errorf("table is closed")
++	}
++	var count C.int64_t
++	result := C.simple_lancedb_table_count_fragments(t.handle, &count)
++	defer C.simple_lancedb_result_free(result)
++	if !result.SUCCESS {
++		if result.ERROR_MESSAGE != nil {
++			return 0, fmt.Errorf("failed to count fragments: %s", C.GoString(result.ERROR_MESSAGE))
++		}
++		return 0, fmt.Errorf("failed to count fragments: unknown error")
++	}
++	return int(count), nil
++}
++
+ // Version returns the current version of the Table
+ func (t *Table) Version(_ context.Context) (int, error) {
+ 	t.mu.RLock()
+@@ -999,6 +1019,10 @@ func optimizeActionToJSON(action contracts.OptimizeAction) ([]byte, error) {
+ 			envelope.OlderThanSeconds = &secs
+ 		}
+ 		envelope.DeleteUnverified = action.Prune.DeleteUnverified
++		if action.Prune.OlderThan == 0 && action.Prune.DeleteUnverified != nil {
++			zero := uint64(0)
++			envelope.OlderThanSeconds = &zero
++		}
+ 		envelope.ErrorIfTaggedOldVersions = action.Prune.ErrorIfTaggedOldVersions
+ 		return json.Marshal(envelope)
+ 
+diff --git a/rust/src/connection.rs b/rust/src/connection.rs
+index 70fd6c3..51a6fba 100644
+--- a/rust/src/connection.rs
++++ b/rust/src/connection.rs
+@@ -8,6 +8,10 @@ use crate::runtime::get_simple_runtime;
+-use lancedb::connect;
++use lancedb::{connect, ObjectStoreRegistry};
+ use std::collections::HashMap;
+ use std::os::raw::{c_char, c_void};
++use std::sync::Arc;
++
++const INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
++const METADATA_CACHE_BYTES: usize = 64 * 1024 * 1024;
+ 
+ /// Connect to a LanceDB database (simple version)
+ #[no_mangle]
+@@ -83,8 +87,19 @@ pub extern "C" fn simple_lancedb_connect_with_options(
+         let rt = get_simple_runtime();
+ 
+         match rt.block_on(async {
++            let session = Arc::new(lancedb::Session::new(
++                INDEX_CACHE_BYTES,
++                METADATA_CACHE_BYTES,
++                Arc::new(ObjectStoreRegistry::default()),
++            ));
++            eprintln!(
++                "lancedb-go session cache index_mb={} meta_mb={}",
++                INDEX_CACHE_BYTES / 1024 / 1024,
++                METADATA_CACHE_BYTES / 1024 / 1024
++            );
+             connect(&uri_str)
+                 .storage_options(storage_options)
++                .session(session)
+                 .execute()
+                 .await
+         }) {
+diff --git a/rust/src/metadata.rs b/rust/src/metadata.rs
+index 69cf7e1..565ec12 100644
+--- a/rust/src/metadata.rs
++++ b/rust/src/metadata.rs
+@@ -42,6 +42,39 @@ pub extern "C" fn simple_lancedb_table_count_rows(
+     }
+ }
+ 
++/// Count data fragments in a table.
++#[no_mangle]
++#[allow(clippy::not_unsafe_ptr_arg_deref)]
++pub extern "C" fn simple_lancedb_table_count_fragments(
++    table_handle: *mut c_void,
++    count: *mut i64,
++) -> *mut SimpleResult {
++    let result = std::panic::catch_unwind(|| -> SimpleResult {
++        if table_handle.is_null() || count.is_null() {
++            return SimpleResult::error("Invalid null arguments".to_string());
++        }
++        let table = unsafe { &*(table_handle as *const lancedb::Table) };
++        let dataset = match table.dataset() {
++            Some(dataset) => dataset,
++            None => return SimpleResult::error("Fragment count requires a native table".to_string()),
++        };
++        let rt = get_simple_runtime();
++        match rt.block_on(async { dataset.get().await.map(|ds| ds.count_fragments()) }) {
++            Ok(n) => {
++                unsafe { *count = n as i64 };
++                SimpleResult::ok()
++            }
++            Err(e) => SimpleResult::error(format!("Failed to count fragments: {}", e)),
++        }
++    });
++    match result {
++        Ok(res) => Box::into_raw(Box::new(res)),
++        Err(_) => Box::into_raw(Box::new(SimpleResult::error(
++            "Panic in simple_lancedb_table_count_fragments".to_string(),
++        ))),
++    }
++}
++
+ /// Get table version (simple version)
+ #[no_mangle]
+ #[allow(clippy::not_unsafe_ptr_arg_deref)]

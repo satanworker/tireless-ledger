@@ -10,7 +10,7 @@ import (
 
 func testServer() *server {
 	return &server{
-		cfg:   runtimeConfig{Dimensions: 2, BatchThreshold: 32},
+		cfg:   runtimeConfig{Dimensions: 2},
 		dedup: &dedupState{Files: map[string]string{}},
 		mem:   newMemStore(2),
 	}

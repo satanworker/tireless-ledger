@@ -16,6 +16,7 @@ from parse import walk_roots
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 DIMS = 384
 POST_BATCH = 100
+EMBED_MAX_CHARS = 800
 DEFAULT_EMBED = "http://127.0.0.1:8091"
 
 
@@ -74,7 +75,10 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         if args.dry_run:
             buf = []
             return
-        texts = [t["forward_content"][:8000] for t in buf]
+        # BGE-small has a 512-token input window. Keep the full text in Lance,
+        # but bound the text sent to llama.cpp so a long Codex turn cannot
+        # reject the entire ingest batch.
+        texts = [t["forward_content"][:EMBED_MAX_CHARS] for t in buf]
         vecs = _embed_texts(args.embed_url, texts)
         recs = [_ingest_item(t, vecs[j]) for j, t in enumerate(buf)]
         resp = _post(url, {"records": recs})

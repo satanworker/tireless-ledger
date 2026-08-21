@@ -2,16 +2,31 @@
 id: single-process-go-cgo-lance-drop-python-sidecar
 title: Single-process Go CGO Lance (drop Python sidecar)
 emoji: ⚡
-status: pending
+status: completed
 created: 2026-08-21T11:11:40.665Z
-updated: 2026-08-21T11:11:40.665Z
+updated: 2026-08-21T13:55:00.000Z
 ---
 ## Checklist
-- [ ] Wire lance.go CGO store: connect R2, merge-insert, hybrid, walk, compact-on-16
-- [ ] Patch lancedb-go FFI Session cache (256MiB index / 64MiB meta) in Docker so VPS does not OOM
-- [ ] Docker CGO build: rust liblancedb_go.a + Go 1.24, drop lance-writer from compose
-- [ ] Mac tests stay CGO_ENABLED=0 + memory://; no Python sidecar in product path
-- [ ] Deploy to home-satan, time Mac walk/hybrid vs previous sidecar hop
+- [x] Wire lance.go CGO store: connect R2, merge-insert, hybrid, walk, compact-on-16
+- [x] Patch lancedb-go FFI Session cache (256MiB index / 64MiB meta) in Docker so VPS does not OOM
+- [x] Docker CGO build: rust liblancedb_go.a + Go 1.24, drop lance-writer from compose
+- [x] Mac tests stay CGO_ENABLED=0 + memory://; no Python sidecar in product path
+- [x] Deploy to home-satan, time Mac walk/hybrid vs previous sidecar hop
+
+## Validation (2026-08-21)
+
+- `CGO_ENABLED=0 go test ./...` and `go vet ./...` pass with Go 1.24.
+- The Linux/arm64 CGO image builds, starts, and passes `go test ./...` inside its native builder.
+- A localhost-only native canary connected to the live R2 `turns` table and logged the patched 256 MiB index / 64 MiB metadata cache sizes.
+- Canary walk output exactly matched the sidecar output; hybrid returned the same top-five IDs; cursor ordering was strict.
+- The first native build exposed a performance mismatch: `lancedb-go` main pinned Rust LanceDB 0.24 / Lance 1 while the sidecar used LanceDB 0.37.1 / Lance 10. The overlay now advances the Rust bridge to stable LanceDB 0.37.1 / Lance 10 and adapts its changed batch, schema-evolution, and index-stat APIs.
+- In an alternating ten-sample benchmark after the upgrade: hybrid median was 0.334s native vs 0.403s sidecar; vector median 0.338s vs 0.345s; session walk median 0.199s vs 1.164s. BM25-only improved from 0.443s to 0.266s native but remains slower than the sidecar's 0.209s median.
+- Across three fresh-process samples, the first post-ready hybrid was 1.122s native vs 0.844s Python, but median boot-to-ready was 3.205s native vs 7.456s Python; total start-to-first-hybrid was about 4.35s vs 8.37s. Cold walk itself was 0.778s native vs 1.342s Python, with about 4.24s vs 8.55s total start-to-result.
+- Walk output remained byte-identical and hybrid returned the same top-five IDs. The warm upgraded canary used about 21 MiB RSS; its cache limits remained logged at 256 MiB / 64 MiB.
+- A single named Lance 10 smoke record persisted to R2 (`accepted: 1`), immediately hybrid-queried and walked back, and was skipped on duplicate ingest. No bulk sync was started.
+- Production was cut over at 2026-08-21 13:48 UTC to image `sha256:6ecc8f5356e5d52684024d07adb6491e5363d98b5ca711c9b4605f61b7fb0cce`. Readiness passed after the native Lance warmup, the existing Codex session walk passed, and the Python `lance-writer` container was stopped and removed. The previous daemon image remains available as `pi-memoryd:pre-cgo-20260821` for rollback.
+- The explicitly requested VPS Codex-history follow-on scan found 350 JSONL files / 550 MiB and extracted 15,426 user/assistant turns in 5.19s. The client now bounds embedding input to 800 characters (while storing full text) to stay inside BGE-small's 512-token window. A 100-turn write trial completed in 10.24s; the full run started at 13:52 UTC and reached 1,700 processed / 1,600 newly accepted / 100 skipped in 3m38s (~7.8 turns/s end to end, including compaction and concurrent measurement).
+- During that active write load, five-request medians were 0.683s for BM25 and 0.337s for session walk. The first BM25 request was cold at 1.837s. `pi-memoryd` used about 50 MiB RSS and the two-thread embedder about 122 MiB RSS / 195% CPU.
 
 ## Decisions
 

@@ -48,11 +48,11 @@ embed-local:
 	@test -s $(GGUF) || (echo "missing $(GGUF)" >&2; exit 1)
 	llama-server -m $(GGUF) --host 127.0.0.1 --port 8091 --embedding --pooling cls --embeddings -c 512 -b 512 -ub 512
 
-## Local smoke: in-RAM index, no B2, no OpenData binary.
+## Local smoke: in-RAM index, no R2 and no CGO.
 recall-local: $(BIN)
 	@mkdir -p /tmp/pi-memoryd-local
 	PI_MEMORYD_STORAGE_URL=memory:// PI_MEMORYD_STATE=/tmp/pi-memoryd-local/dedup.json \
-		$(BIN) --listen :8090 --storage-url memory:// --dry-run-s3 --flush-seconds 1
+		$(BIN) --listen :8090 --storage-url memory:// --dry-run-s3
 
 clean:
 	rm -rf $(BIN_DIR) pi-memoryd
@@ -85,14 +85,13 @@ doctor:
 	@echo "target:  $$(go env GOOS)/$$(go env GOARCH)"
 	@echo "sops:    $$(command -v sops || echo MISSING)"
 	@echo "binary:  $$(test -x $(BIN) && ls -lh $(BIN) || echo 'not built (make build)')"
-	@echo "vector:  $$(command -v opendata-vector || command -v vector || echo 'not on PATH (needed if PI_MEMORYD_START_VECTOR=true)')"
 	@echo "sops file: $(SOPS_FILE)"
 
 ## Optional: Linux/server only. Not the Mac path.
 docker-build:
 	docker compose build
 
-up: render-config
+up: secrets-decrypt
 	docker compose up -d --build
 
 down:

@@ -8,7 +8,7 @@ import (
 	"unicode"
 )
 
-// memStore is a local stand-in for OpenData Vector (memory://).
+// memStore is the pure-Go test store for memory://.
 // Enough for Mac smoke tests: L2 ANN + bag-of-words BM25-ish.
 type memStore struct {
 	mu    sync.RWMutex
@@ -232,7 +232,7 @@ func tokenize(s string) []string {
 }
 
 func bm25Score(query, doc string) float64 {
-	// ponytail: term overlap, not real BM25. Swap when OpenData is up.
+	// Lightweight term overlap is sufficient for memory:// tests.
 	q := tokenize(query)
 	if len(q) == 0 {
 		return 0
