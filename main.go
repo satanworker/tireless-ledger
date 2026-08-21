@@ -129,19 +129,26 @@ type server struct {
 }
 
 type runtimeConfig struct {
-	ListenAddr string
-	StorageURL string
-	AWSRegion  string
-	S3Endpoint string
-	Dimensions int
-	StatePath  string
-	DryRunS3   bool
+	ListenAddr        string
+	StorageURL        string
+	AWSRegion         string
+	S3Endpoint        string
+	Dimensions        int
+	VectorNProbes     int
+	StatePath         string
+	DryRunS3          bool
+	Optimize          bool
+	CreateVectorIndex bool
+	DropVectorIndex   bool
 }
 
 type lanceStore interface {
 	Close() error
 	Upsert(context.Context, []MemoryItem) error
 	Search(context.Context, vectorSearchRequest) ([]queryResult, error)
+	Optimize(context.Context) error
+	CreateVectorIndex(context.Context) error
+	DropVectorIndex(context.Context) error
 }
 
 func main() {
@@ -179,6 +186,31 @@ func main() {
 			os.Exit(1)
 		}
 		defer s.lance.Close()
+		if cfg.CreateVectorIndex && cfg.DropVectorIndex {
+			slog.Error("--create-vector-index and --drop-vector-index are mutually exclusive")
+			os.Exit(1)
+		}
+		if cfg.CreateVectorIndex {
+			if err := s.lance.CreateVectorIndex(context.Background()); err != nil {
+				slog.Error("create vector index", "err", err)
+				os.Exit(1)
+			}
+		}
+		if cfg.DropVectorIndex {
+			if err := s.lance.DropVectorIndex(context.Background()); err != nil {
+				slog.Error("drop vector index", "err", err)
+				os.Exit(1)
+			}
+		}
+		if cfg.Optimize {
+			if err := s.lance.Optimize(context.Background()); err != nil {
+				slog.Error("optimize lance store", "err", err)
+				os.Exit(1)
+			}
+		}
+		if cfg.Optimize || cfg.CreateVectorIndex || cfg.DropVectorIndex {
+			return
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -201,8 +233,12 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.AWSRegion, "aws-region", env("AWS_REGION", env("AWS_DEFAULT_REGION", defaultRegion)), "AWS region")
 	flag.StringVar(&cfg.S3Endpoint, "s3-endpoint", env("PI_MEMORYD_S3_ENDPOINT", env("AWS_ENDPOINT_URL", env("AWS_ENDPOINT", ""))), "S3-compatible endpoint URL")
 	flag.IntVar(&cfg.Dimensions, "dimensions", envInt("PI_MEMORYD_DIMENSIONS", 384), "vector dimensions")
+	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 32), "IVF partitions scanned per vector query")
 	flag.StringVar(&cfg.StatePath, "state", env("PI_MEMORYD_STATE", "./data/dedup_state.json"), "dedup state path")
 	flag.BoolVar(&cfg.DryRunS3, "dry-run-s3", envBool("PI_MEMORYD_DRY_RUN_S3", false), "skip AWS SDK S3 validation")
+	flag.BoolVar(&cfg.Optimize, "optimize", false, "compact data, refresh indexes, prune old versions, and exit")
+	flag.BoolVar(&cfg.CreateVectorIndex, "create-vector-index", false, "create a 64-partition IVF-Flat vector index and exit")
+	flag.BoolVar(&cfg.DropVectorIndex, "drop-vector-index", false, "drop the IVF-Flat vector index and exit")
 	flag.Parse()
 	return cfg
 }

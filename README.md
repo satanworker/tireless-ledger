@@ -18,6 +18,22 @@ docker compose build pi-memoryd
 docker compose up -d pi-memoryd
 ```
 
+After a bulk ingest, run one offline maintenance pass to compact the final
+fragment tail and fold newly written rows into the existing FTS and scalar
+indexes:
+
+```bash
+docker compose run --rm --no-deps pi-memoryd --optimize
+```
+
+For corpora above roughly 10,000 rows, an explicitly reversible IVF-Flat index can reduce dense-search latency while retaining full-precision vectors:
+
+```sh
+docker compose run --rm --no-deps pi-memoryd --create-vector-index --optimize
+# Roll back to exhaustive vector scans:
+docker compose run --rm --no-deps pi-memoryd --drop-vector-index
+```
+
 `llama-embed` remains an optional separate process:
 
 ```bash
@@ -67,6 +83,7 @@ Production uses 384-dimensional `BAAI/bge-small-en-v1.5` vectors. Query prefixes
 | Variable | Purpose |
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, normally `s3://<bucket>/session-recall-lance` |
+| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to 32 of 64 |
 | `PI_MEMORYD_S3_BUCKET` | Compose bucket interpolation |
 | `PI_MEMORYD_S3_ENDPOINT` | R2 S3 endpoint; passed as Lance `aws_endpoint` |
 | `PI_MEMORYD_KEY_ID` | R2 access key ID |

@@ -21,6 +21,9 @@ import (
 const (
 	lanceTableName        = "turns"
 	lanceCompactFragments = 16
+	lanceVectorIndexName  = "vector_ivf_flat"
+	lanceVectorPartitions = uint32(64)
+	lanceVectorNProbes    = 32
 )
 
 var lanceOutputColumns = []string{
@@ -29,9 +32,10 @@ var lanceOutputColumns = []string{
 }
 
 type cgoLanceStore struct {
-	conn  contracts.IConnection
-	table contracts.ITable
-	dims  int
+	conn    contracts.IConnection
+	table   contracts.ITable
+	dims    int
+	nprobes int
 }
 
 type lanceFragmentCounter interface {
@@ -64,7 +68,11 @@ func openLanceStore(ctx context.Context, cfg runtimeConfig) (lanceStore, error) 
 	if err != nil {
 		return nil, err
 	}
-	store := &cgoLanceStore{conn: conn, dims: cfg.Dimensions}
+	nprobes := cfg.VectorNProbes
+	if nprobes <= 0 {
+		nprobes = lanceVectorNProbes
+	}
+	store := &cgoLanceStore{conn: conn, dims: cfg.Dimensions, nprobes: nprobes}
 	table, err := conn.OpenTable(ctx, lanceTableName)
 	if err != nil {
 		table, err = store.createTable(ctx)
@@ -166,6 +174,78 @@ func (s *cgoLanceStore) Close() error {
 	return first
 }
 
+func (s *cgoLanceStore) Optimize(ctx context.Context) error {
+	counter := s.table.(lanceFragmentCounter)
+	before, err := counter.FragmentCount(ctx)
+	if err != nil {
+		return fmt.Errorf("count fragments before maintenance: %w", err)
+	}
+	compact, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{Kind: contracts.OptimizeCompact})
+	if err != nil {
+		return fmt.Errorf("compact lance fragments: %w", err)
+	}
+	if _, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{Kind: contracts.OptimizeIndex}); err != nil {
+		return fmt.Errorf("refresh lance indexes: %w", err)
+	}
+	deleteUnverified := true
+	if _, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{
+		Kind: contracts.OptimizePrune,
+		Prune: contracts.PruneParams{
+			OlderThan:        time.Nanosecond,
+			DeleteUnverified: &deleteUnverified,
+		},
+	}); err != nil {
+		return fmt.Errorf("prune lance versions: %w", err)
+	}
+	after, err := counter.FragmentCount(ctx)
+	if err != nil {
+		return fmt.Errorf("count fragments after maintenance: %w", err)
+	}
+	slog.Info("lance maintenance complete", "fragments_before", before, "fragments_after", after, "compaction", compact)
+	return nil
+}
+
+func (s *cgoLanceStore) CreateVectorIndex(ctx context.Context) error {
+	indexes, err := s.table.GetAllIndexes(ctx)
+	if err != nil {
+		return fmt.Errorf("list lance indexes: %w", err)
+	}
+	for _, index := range indexes {
+		for _, column := range index.Columns {
+			if column == "vector" {
+				slog.Info("vector index already exists", "name", index.Name, "type", index.IndexType)
+				return nil
+			}
+		}
+	}
+	partitions := lanceVectorPartitions
+	if err := s.table.CreateIndexWithParams(ctx, []string{"vector"}, contracts.IndexTypeIvfFlat,
+		contracts.IndexParams{NumPartitions: &partitions, DistanceType: contracts.DistanceTypeL2},
+		&contracts.CreateIndexOptions{Name: lanceVectorIndexName, WaitTimeout: 10 * time.Minute}); err != nil {
+		return fmt.Errorf("create IVF-Flat vector index: %w", err)
+	}
+	slog.Info("created IVF-Flat vector index", "name", lanceVectorIndexName, "partitions", partitions, "nprobes", s.nprobes)
+	return nil
+}
+
+func (s *cgoLanceStore) DropVectorIndex(ctx context.Context) error {
+	indexes, err := s.table.GetAllIndexes(ctx)
+	if err != nil {
+		return fmt.Errorf("list lance indexes: %w", err)
+	}
+	for _, index := range indexes {
+		if index.Name == lanceVectorIndexName {
+			if err := s.table.DropIndex(ctx, index.Name); err != nil {
+				return fmt.Errorf("drop IVF-Flat vector index: %w", err)
+			}
+			slog.Info("dropped IVF-Flat vector index", "name", index.Name)
+			return nil
+		}
+	}
+	slog.Info("IVF-Flat vector index is absent", "name", lanceVectorIndexName)
+	return nil
+}
+
 func (s *cgoLanceStore) Upsert(ctx context.Context, items []MemoryItem) error {
 	counter := s.table.(lanceFragmentCounter)
 	_, err := counter.FragmentCount(ctx)
@@ -188,6 +268,10 @@ func (s *cgoLanceStore) Upsert(ctx context.Context, items []MemoryItem) error {
 	stats, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{Kind: contracts.OptimizeCompact})
 	if err != nil {
 		slog.Warn("lance compaction failed; write is persisted", "fragments", fragments, "err", err)
+		return nil
+	}
+	if _, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{Kind: contracts.OptimizeIndex}); err != nil {
+		slog.Warn("lance index refresh failed; write is persisted", "err", err)
 		return nil
 	}
 	deleteUnverified := true
@@ -275,7 +359,8 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	switch {
 	case hasVector:
 		config.Limit = &limit
-		config.VectorSearch = &contracts.VectorSearch{Column: "vector", Vector: req.Vector, K: limit}
+		nprobes := s.nprobes
+		config.VectorSearch = &contracts.VectorSearch{Column: "vector", Vector: req.Vector, K: limit, Nprobes: &nprobes}
 		if hasText {
 			if req.BM25.Field != "" && req.BM25.Field != "forward_content" {
 				return nil, fmt.Errorf("unsupported BM25 field %q", req.BM25.Field)

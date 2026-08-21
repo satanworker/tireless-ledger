@@ -13,7 +13,7 @@ COPY docker/lancedb-go-session-cache.patch /tmp/lancedb-go-session-cache.patch
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/opt/lancedb-go/rust/target \
     git -C /opt/lancedb-go apply /tmp/lancedb-go-session-cache.patch \
-  && cargo build --manifest-path /opt/lancedb-go/rust/Cargo.toml --release --features aws \
+  && CARGO_BUILD_JOBS=1 cargo build --manifest-path /opt/lancedb-go/rust/Cargo.toml --release --features aws \
   && mkdir -p /opt/lancedb-go/lib/linux_arm64 \
   && cp /opt/lancedb-go/rust/target/release/liblancedb_go.a /opt/lancedb-go/lib/linux_arm64/
 
@@ -24,7 +24,7 @@ RUN go mod download
 COPY --from=lance-build /opt/lancedb-go /opt/lancedb-go
 COPY . .
 RUN go mod edit -replace github.com/lancedb/lancedb-go=/opt/lancedb-go \
-  && CGO_ENABLED=1 CGO_LDFLAGS='/opt/lancedb-go/lib/linux_arm64/liblancedb_go.a -lm -ldl -lpthread' \
+  && GOMAXPROCS=1 CGO_ENABLED=1 CGO_LDFLAGS='/opt/lancedb-go/lib/linux_arm64/liblancedb_go.a -lm -ldl -lpthread' \
      go build -trimpath -ldflags='-s -w' -o /out/pi-memoryd .
 
 FROM debian:bookworm-slim

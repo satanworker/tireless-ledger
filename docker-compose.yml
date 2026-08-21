@@ -11,6 +11,7 @@ services:
     environment:
       PI_MEMORYD_LISTEN: ":8090"
       PI_MEMORYD_STORAGE_URL: "s3://${PI_MEMORYD_S3_BUCKET:?set PI_MEMORYD_S3_BUCKET}/session-recall-lance"
+      PI_MEMORYD_VECTOR_NPROBES: "${PI_MEMORYD_VECTOR_NPROBES:-32}"
       PI_MEMORYD_STATE: "/data/dedup_state.json"
       AWS_DEFAULT_REGION: "${AWS_REGION:-auto}"
       AWS_ENDPOINT_URL: "${PI_MEMORYD_S3_ENDPOINT:-}"
@@ -51,6 +52,12 @@ services:
       - "2"
     volumes:
       - ./models:/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   pi-memoryd-data:
