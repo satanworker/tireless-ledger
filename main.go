@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +31,7 @@ const (
 	defaultRegion         = "eu-west-1"
 	defaultStorageURL     = "s3://YOUR_PRODUCTION_BUCKET_NAME/vector-index"
 	defaultFlushSeconds   = 300
-	defaultBatchThreshold = 500
-	defaultQueueDepth     = 10000
+	defaultBatchThreshold = 32
 	defaultHTTPClientTO   = 60 * time.Second
 	contentTypeProtoJSON  = "application/protobuf+json"
 )
@@ -52,6 +52,10 @@ type Metadata struct {
 	FilePath    string      `json:"file_path,omitempty"`
 	FileHash    string      `json:"file_hash"`
 	Timestamp   int64       `json:"timestamp"`
+	SessionID   string      `json:"session_id,omitempty"`
+	Host        string      `json:"host,omitempty"`
+	Harness     string      `json:"harness,omitempty"`
+	Role        string      `json:"role,omitempty"`
 }
 
 type MemoryItem struct {
@@ -72,9 +76,13 @@ type ingestResponse struct {
 }
 
 type queryRequest struct {
-	QueryVector []float32 `json:"query_vector"`
-	Scope       string    `json:"scope"`
-	ProjectName string    `json:"project_name"`
+	QueryVector []float32 `json:"query_vector,omitempty"`
+	QueryText   string    `json:"query_text,omitempty"`
+	Scope       string    `json:"scope,omitempty"`
+	ProjectName string    `json:"project_name,omitempty"`
+	SessionID   string    `json:"session_id,omitempty"`
+	Host        string    `json:"host,omitempty"`
+	Harness     string    `json:"harness,omitempty"`
 	Limit       int       `json:"limit"`
 }
 
@@ -98,11 +106,19 @@ type vectorRecord struct {
 	Attributes map[string]interface{} `json:"attributes"`
 }
 
+type bm25Query struct {
+	Field string `json:"field"`
+	Query string `json:"query"`
+}
+
 type vectorSearchRequest struct {
-	Vector        []float32    `json:"vector"`
-	K             int          `json:"k"`
-	Filter        vectorFilter `json:"filter,omitempty"`
-	IncludeFields []string     `json:"includeFields,omitempty"`
+	Vector        []float32     `json:"vector,omitempty"`
+	BM25          *bm25Query    `json:"bm25,omitempty"`
+	K             int           `json:"k"`
+	Filter        *vectorFilter `json:"filter,omitempty"`
+	IncludeFields []string      `json:"includeFields,omitempty"`
+	AfterTS       int64         `json:"after_ts,omitempty"`
+	AfterID       string        `json:"after_id,omitempty"`
 }
 
 type vectorFilter struct {
@@ -134,8 +150,9 @@ type server struct {
 	cfg        runtimeConfig
 	client     *http.Client
 	dedup      *dedupState
-	queue      chan MemoryItem
+	writeMu    sync.Mutex
 	vectorProc *exec.Cmd
+	mem        *memStore
 }
 
 type runtimeConfig struct {
@@ -148,7 +165,6 @@ type runtimeConfig struct {
 	DistanceMetric string
 	FlushSeconds   int
 	BatchThreshold int
-	QueueDepth     int
 	StatePath      string
 	ConfigPath     string
 	VectorBinary   string
@@ -161,14 +177,19 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
+	local := isMemoryURL(cfg.StorageURL)
+	if local {
+		cfg.DryRunS3 = true
+	}
 	if err := validateS3(context.Background(), cfg); err != nil {
 		slog.Error("s3 validation failed", "err", err)
 		os.Exit(1)
 	}
-
-	if err := writeVectorConfig(cfg); err != nil {
-		slog.Error("write vector config", "err", err)
-		os.Exit(1)
+	if !local {
+		if err := writeVectorConfig(cfg); err != nil {
+			slog.Error("write vector config", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	state, err := loadDedupState(cfg.StatePath)
@@ -181,10 +202,13 @@ func main() {
 		cfg:    cfg,
 		client: &http.Client{Timeout: defaultHTTPClientTO},
 		dedup:  state,
-		queue:  make(chan MemoryItem, cfg.QueueDepth),
+	}
+	if local {
+		s.mem = newMemStore(cfg.Dimensions)
+		slog.Info("using in-memory vector store (memory://)")
 	}
 
-	if cfg.StartVector {
+	if cfg.StartVector && s.mem == nil {
 		if err := s.startVector(); err != nil {
 			slog.Error("start opendata vector", "err", err)
 			os.Exit(1)
@@ -192,12 +216,11 @@ func main() {
 		defer s.stopVector()
 	}
 
-	go s.writerLoop()
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /-/ready", s.ready)
 	mux.HandleFunc("POST /v1/memory/ingest", s.ingest)
 	mux.HandleFunc("POST /v1/memory/query", s.query)
+	mux.HandleFunc("GET /v1/memory/session", s.sessionWalk)
 
 	slog.Info("pi-memoryd listening", "addr", cfg.ListenAddr, "vector_url", cfg.VectorURL, "storage_url", cfg.StorageURL)
 	if err := http.ListenAndServe(cfg.ListenAddr, mux); err != nil {
@@ -217,7 +240,6 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.DistanceMetric, "distance", env("PI_MEMORYD_DISTANCE", "L2"), "OpenData distance metric")
 	flag.IntVar(&cfg.FlushSeconds, "flush-seconds", envInt("PI_MEMORYD_FLUSH_SECONDS", defaultFlushSeconds), "writer debounce flush window")
 	flag.IntVar(&cfg.BatchThreshold, "batch-threshold", envInt("PI_MEMORYD_BATCH_THRESHOLD", defaultBatchThreshold), "writer batch row threshold")
-	flag.IntVar(&cfg.QueueDepth, "queue-depth", envInt("PI_MEMORYD_QUEUE_DEPTH", defaultQueueDepth), "ingest FIFO depth")
 	flag.StringVar(&cfg.StatePath, "state", env("PI_MEMORYD_STATE", "./data/dedup_state.json"), "dedup state path")
 	flag.StringVar(&cfg.ConfigPath, "vector-config", env("PI_MEMORYD_VECTOR_CONFIG", "./data/vector.yaml"), "generated OpenData Vector config path")
 	flag.StringVar(&cfg.VectorBinary, "vector-binary", env("PI_MEMORYD_VECTOR_BINARY", "opendata-vector"), "OpenData Vector binary")
@@ -227,13 +249,17 @@ func loadConfig() runtimeConfig {
 	return cfg
 }
 
+func isMemoryURL(raw string) bool {
+	return strings.HasPrefix(raw, "memory:")
+}
+
 func validateS3(ctx context.Context, cfg runtimeConfig) error {
+	if isMemoryURL(cfg.StorageURL) || cfg.DryRunS3 {
+		return nil
+	}
 	bucket, prefix, err := parseS3URL(cfg.StorageURL)
 	if err != nil {
 		return err
-	}
-	if cfg.DryRunS3 {
-		return nil
 	}
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWSRegion))
 	if err != nil {
@@ -284,9 +310,21 @@ metadata_fields:
   - name: timestamp
     field_type: Int64
     indexed: false
-  - name: forward_content
+  - name: session_id
     field_type: String
-    indexed: false
+    indexed: true
+  - name: host
+    field_type: String
+    indexed: true
+  - name: harness
+    field_type: String
+    indexed: true
+  - name: role
+    field_type: String
+    indexed: true
+  - name: forward_content
+    field_type: Text
+    indexed: true
 `, prefix, cfg.AWSRegion, bucket, cfg.Dimensions, cfg.DistanceMetric, cfg.FlushSeconds)
 	return os.WriteFile(cfg.ConfigPath, []byte(body), 0o600)
 }
@@ -323,6 +361,7 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := ingestResponse{}
+	todo := make([]MemoryItem, 0, len(req.Records))
 	for i, rec := range req.Records {
 		if err := validateMemoryItem(rec, s.cfg.Dimensions); err != nil {
 			resp.Errors = append(resp.Errors, fmt.Sprintf("records[%d]: %v", i, err))
@@ -332,13 +371,14 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
 			resp.Skipped++
 			continue
 		}
-		select {
-		case s.queue <- rec:
-			resp.Accepted++
-		default:
-			resp.Errors = append(resp.Errors, "ingest queue full")
-		}
+		todo = append(todo, rec)
 	}
+	if err := s.flushBatch(todo); err != nil {
+		resp.Errors = append(resp.Errors, err.Error())
+		writeJSON(w, http.StatusBadGateway, resp)
+		return
+	}
+	resp.Accepted = len(todo)
 	status := http.StatusAccepted
 	if len(resp.Errors) > 0 && resp.Accepted == 0 {
 		status = http.StatusBadRequest
@@ -352,63 +392,259 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 		errorJSON(w, http.StatusBadRequest, err)
 		return
 	}
-	if len(req.QueryVector) != s.cfg.Dimensions {
+	hasVec := len(req.QueryVector) > 0
+	hasText := strings.TrimSpace(req.QueryText) != ""
+	if !hasVec && !hasText {
+		errorJSON(w, http.StatusBadRequest, errors.New("query_vector or query_text required"))
+		return
+	}
+	if hasVec && len(req.QueryVector) != s.cfg.Dimensions {
 		errorJSON(w, http.StatusBadRequest, fmt.Errorf("query_vector dimensions=%d want=%d", len(req.QueryVector), s.cfg.Dimensions))
 		return
 	}
 	if req.Limit <= 0 {
 		req.Limit = 5
 	}
-	searchReq := vectorSearchRequest{
-		Vector:        req.QueryVector,
-		K:             req.Limit,
-		IncludeFields: []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp"},
-		Filter: vectorFilter{And: []vectorFilter{
-			{Eq: &comparisonFilter{Field: "scope", Value: req.Scope}},
-			{Eq: &comparisonFilter{Field: "project_name", Value: req.ProjectName}},
-		}},
+	filter := queryFilter(req)
+	include := []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role"}
+	fetchK := req.Limit
+	if hasVec && hasText && fetchK < 20 {
+		fetchK = 20
 	}
-	var searchResp vectorSearchResponse
-	if err := s.postVector("/api/v1/vector/search", searchReq, &searchResp); err != nil {
+	if s.mem != nil {
+		var lists [][]queryResult
+		if hasVec {
+			lists = append(lists, s.mem.search(vectorSearchRequest{Vector: req.QueryVector, K: fetchK, Filter: filter}))
+		}
+		if hasText {
+			lists = append(lists, s.mem.search(vectorSearchRequest{BM25: &bm25Query{Field: "forward_content", Query: req.QueryText}, K: fetchK, Filter: filter}))
+		}
+		out := queryResponse{Results: lists[0]}
+		if len(lists) == 2 {
+			out.Results = rrfMerge(lists[0], lists[1], req.Limit)
+		} else if len(out.Results) > req.Limit {
+			out.Results = out.Results[:req.Limit]
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	searchReq := vectorSearchRequest{K: fetchK, Filter: filter, IncludeFields: include}
+	if hasVec {
+		searchReq.Vector = req.QueryVector
+	}
+	if hasText {
+		searchReq.BM25 = &bm25Query{Field: "forward_content", Query: req.QueryText}
+	}
+	hits, err := s.vectorSearch(searchReq)
+	if err != nil {
 		errorJSON(w, http.StatusBadGateway, err)
 		return
 	}
-	out := queryResponse{Results: make([]queryResult, 0, len(searchResp.Results))}
-	for _, res := range searchResp.Results {
-		attrs := res.Vector.Attributes
-		content, _ := attrs["forward_content"].(string)
-		delete(attrs, "vector")
-		out.Results = append(out.Results, queryResult{ID: res.Vector.ID, Score: res.Score, ForwardContent: content, Metadata: attrs})
+	out := queryResponse{Results: hits}
+	if len(out.Results) > req.Limit {
+		out.Results = out.Results[:req.Limit]
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *server) writerLoop() {
-	batch := make([]MemoryItem, 0, s.cfg.BatchThreshold)
-	timer := time.NewTimer(time.Duration(s.cfg.FlushSeconds) * time.Second)
-	defer timer.Stop()
-	for {
-		select {
-		case item := <-s.queue:
-			batch = append(batch, item)
-			if len(batch) >= s.cfg.BatchThreshold {
-				s.flushBatch(batch)
-				batch = batch[:0]
-				resetTimer(timer, time.Duration(s.cfg.FlushSeconds)*time.Second)
-			}
-		case <-timer.C:
-			if len(batch) > 0 {
-				s.flushBatch(batch)
-				batch = batch[:0]
-			}
-			resetTimer(timer, time.Duration(s.cfg.FlushSeconds)*time.Second)
+func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sid := strings.TrimSpace(q.Get("session_id"))
+	if sid == "" {
+		errorJSON(w, http.StatusBadRequest, errors.New("session_id required"))
+		return
+	}
+	limit := 50
+	if v := q.Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	var afterTS int64
+	if v := q.Get("after_ts"); v != "" {
+		fmt.Sscanf(v, "%d", &afterTS)
+	}
+	afterID := q.Get("after_id")
+	host := strings.TrimSpace(q.Get("host"))
+	harness := strings.TrimSpace(q.Get("harness"))
+	if s.mem != nil {
+		writeJSON(w, http.StatusOK, queryResponse{Results: s.mem.bySession(sid, host, harness, afterTS, afterID, limit)})
+		return
+	}
+	filter := sessionWalkFilter(sid, host, harness)
+	hits, err := s.vectorSearch(vectorSearchRequest{
+		K:             limit,
+		Filter:        filter,
+		AfterTS:       afterTS,
+		AfterID:       afterID,
+		IncludeFields: []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role"},
+	})
+	if err != nil {
+		errorJSON(w, http.StatusBadGateway, err)
+		return
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		ti, tj := metaTS(hits[i]), metaTS(hits[j])
+		if ti == tj {
+			return hits[i].ID < hits[j].ID
 		}
+		return ti < tj
+	})
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	writeJSON(w, http.StatusOK, queryResponse{Results: hits})
+}
+
+func sessionWalkFilter(sid, host, harness string) *vectorFilter {
+	parts := []vectorFilter{{Eq: &comparisonFilter{Field: "session_id", Value: sid}}}
+	if host != "" {
+		parts = append(parts, vectorFilter{Eq: &comparisonFilter{Field: "host", Value: host}})
+	}
+	if harness != "" {
+		parts = append(parts, vectorFilter{Eq: &comparisonFilter{Field: "harness", Value: harness}})
+	}
+	if len(parts) == 1 {
+		return &parts[0]
+	}
+	return &vectorFilter{And: parts}
+}
+
+func metaTS(r queryResult) int64 {
+	switch v := r.Metadata["timestamp"].(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	default:
+		return 0
 	}
 }
 
-func (s *server) flushBatch(items []MemoryItem) {
+func (s *server) vectorSearch(searchReq vectorSearchRequest) ([]queryResult, error) {
+	if s.mem != nil {
+		return s.mem.search(searchReq), nil
+	}
+	var searchResp vectorSearchResponse
+	if err := s.postVector("/api/v1/vector/search", searchReq, &searchResp); err != nil {
+		return nil, err
+	}
+	out := make([]queryResult, 0, len(searchResp.Results))
+	for _, res := range searchResp.Results {
+		attrs := res.Vector.Attributes
+		if attrs == nil {
+			attrs = map[string]interface{}{}
+		}
+		content, _ := attrs["forward_content"].(string)
+		delete(attrs, "vector")
+		delete(attrs, "forward_content")
+		out = append(out, queryResult{ID: res.Vector.ID, Score: res.Score, ForwardContent: content, Metadata: attrs})
+	}
+	return out, nil
+}
+
+func queryFilter(req queryRequest) *vectorFilter {
+	var parts []vectorFilter
+	if req.Scope != "" {
+		parts = append(parts, vectorFilter{Eq: &comparisonFilter{Field: "scope", Value: req.Scope}})
+	}
+	if req.ProjectName != "" {
+		parts = append(parts, vectorFilter{Eq: &comparisonFilter{Field: "project_name", Value: req.ProjectName}})
+	}
+	if req.SessionID != "" {
+		parts = append(parts, vectorFilter{Eq: &comparisonFilter{Field: "session_id", Value: req.SessionID}})
+	}
+	if req.Host != "" {
+		parts = append(parts, vectorFilter{Eq: &comparisonFilter{Field: "host", Value: req.Host}})
+	}
+	if req.Harness != "" {
+		parts = append(parts, vectorFilter{Eq: &comparisonFilter{Field: "harness", Value: req.Harness}})
+	}
+	switch len(parts) {
+	case 0:
+		return nil
+	case 1:
+		return &parts[0]
+	default:
+		return &vectorFilter{And: parts}
+	}
+}
+
+func rrfMerge(a, b []queryResult, limit int) []queryResult {
+	const k = 60
+	score := map[string]float64{}
+	best := map[string]queryResult{}
+	add := func(list []queryResult) {
+		for i, hit := range list {
+			score[hit.ID] += 1.0 / float64(k+i+1)
+			if _, ok := best[hit.ID]; !ok {
+				best[hit.ID] = hit
+			}
+		}
+	}
+	add(a)
+	add(b)
+	out := make([]queryResult, 0, len(best))
+	for id, hit := range best {
+		hit.Score = score[id]
+		out = append(out, hit)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Score == out[j].Score {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].Score > out[j].Score
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (s *server) flushBatch(items []MemoryItem) error {
 	if len(items) == 0 {
-		return
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.mem != nil {
+		s.mem.upsert(items)
+		for _, item := range items {
+			s.dedup.Mark(item.Metadata.FilePath, item.Metadata.FileHash)
+		}
+		return s.dedup.Save()
+	}
+	n := s.cfg.BatchThreshold
+	if n <= 0 {
+		n = defaultBatchThreshold
+	}
+	for i := 0; i < len(items); i += n {
+		end := i + n
+		if end > len(items) {
+			end = len(items)
+		}
+		if err := s.writeVectors(items[i:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tooBig(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "413") || strings.Contains(msg, "Payload Too Large") || strings.Contains(msg, "broken pipe")
+}
+
+func (s *server) writeVectors(items []MemoryItem) error {
+	if len(items) == 0 {
+		return nil
 	}
 	writeReq := vectorWriteRequest{UpsertVectors: make([]vectorRecord, 0, len(items))}
 	for _, item := range items {
@@ -420,20 +656,32 @@ func (s *server) flushBatch(items []MemoryItem) {
 			"file_path":       item.Metadata.FilePath,
 			"file_hash":       item.Metadata.FileHash,
 			"timestamp":       item.Metadata.Timestamp,
+			"session_id":      item.Metadata.SessionID,
+			"host":            item.Metadata.Host,
+			"harness":         item.Metadata.Harness,
+			"role":            item.Metadata.Role,
 		}})
 	}
 	var resp map[string]interface{}
 	if err := s.postVector("/api/v1/vector/write", writeReq, &resp); err != nil {
+		if len(items) > 1 && tooBig(err) {
+			mid := len(items) / 2
+			if e := s.writeVectors(items[:mid]); e != nil {
+				return e
+			}
+			return s.writeVectors(items[mid:])
+		}
 		slog.Error("vector write failed", "records", len(items), "err", err)
-		return
+		return err
 	}
 	for _, item := range items {
 		s.dedup.Mark(item.Metadata.FilePath, item.Metadata.FileHash)
 	}
 	if err := s.dedup.Save(); err != nil {
-		slog.Error("save dedup state failed", "err", err)
+		return err
 	}
 	slog.Info("flushed memory batch", "records", len(items))
+	return nil
 }
 
 func (s *server) postVector(path string, in, out interface{}) error {
@@ -454,7 +702,7 @@ func (s *server) postVector(path string, in, out interface{}) error {
 		if er.Message == "" {
 			er.Message = resp.Status
 		}
-		return errors.New(er.Message)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, er.Message)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
@@ -532,6 +780,9 @@ func (d *dedupState) Mark(filePath, fileHash string) {
 func (d *dedupState) Save() error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	if d.Path == "" {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(d.Path), 0o755); err != nil {
 		return err
 	}
@@ -576,16 +827,6 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 
 func errorJSON(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
-}
-
-func resetTimer(t *time.Timer, d time.Duration) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	t.Reset(d)
 }
 
 func env(key, def string) string {

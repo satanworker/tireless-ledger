@@ -1,7 +1,9 @@
 .git
 .env
 data
+models
 pi-memoryd
 config/vector.s3.yaml
 secrets
 *.log
+mac

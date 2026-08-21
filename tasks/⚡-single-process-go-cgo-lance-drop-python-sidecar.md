@@ -1,0 +1,53 @@
+---
+id: single-process-go-cgo-lance-drop-python-sidecar
+title: Single-process Go CGO Lance (drop Python sidecar)
+emoji: ⚡
+status: pending
+created: 2026-08-21T11:11:40.665Z
+updated: 2026-08-21T11:11:40.665Z
+---
+## Checklist
+- [ ] Wire lance.go CGO store: connect R2, merge-insert, hybrid, walk, compact-on-16
+- [ ] Patch lancedb-go FFI Session cache (256MiB index / 64MiB meta) in Docker so VPS does not OOM
+- [ ] Docker CGO build: rust liblancedb_go.a + Go 1.24, drop lance-writer from compose
+- [ ] Mac tests stay CGO_ENABLED=0 + memory://; no Python sidecar in product path
+- [ ] Deploy to home-satan, time Mac walk/hybrid vs previous sidecar hop
+
+## Decisions
+
+- Product is session recall: fuzzy + keyword search, then cursor-walk the indexed thread over HTTP. Resume/replay of original jsonl is out of scope.
+- Source of truth is R2 Lance table `turns` at prefix `s3://tireless-ledger/session-recall-lance/`. Do not make local disk the live table. Do not RAM-copy the whole turns table.
+- Hybrid (ANN + BM25) is required. Walk is filter scan + cursor (`after_ts`/`after_id`), order `(timestamp, id)`. Indexed windows only (user+assistant; not tools/thinking/jsonl).
+- One service for recall: `pi-memoryd` only. No Python. No `lance-writer` sidecar. Embeddings stay a separate optional process (`llama-embed` / llama.cpp `:8091`) — not part of this merge.
+- Language: Go + CGO, not a Rust rewrite of the daemon. Reason: `pi-memoryd` already owns ingest/query/walk/dedup/HTTP. `lancedb-go` wraps the same Rust engine (`liblancedb_go.a`). A full Rust rewrite of the daemon is extra work for no engine gain.
+- Mac tests stay `CGO_ENABLED=0` + `memory://`. Do not require native Lance on the Mac for unit tests.
+- Same 384-d model everywhere: `BAAI/bge-small-en-v1.5`. Query prefix only on queries. Never mix Mac Metal and VPS CPU on this R2 prefix. Current ingest embedder for this prefix is VPS llama `:8091`.
+- Write-through: HTTP 200 only after persist. Compact when ≥16 fragments, not after every 32-row flush. `accepted` = persist.
+- Lance Session cache must be capped: 256 MiB index + 64 MiB metadata. Defaults (~6 GiB + 1 GiB) would OOM the 7.5 GiB VPS. Official `lancedb-go` FFI (`simple_lancedb_connect_with_options`) currently only passes storage_options JSON — no Session. Patch `lancedb-go` `rust/src/connection.rs` in the Docker build (overlay) to create `lance::session::Session` with those sizes and pass it to `connect().session(...)`. Do not vendor a fork in git unless the overlay is tiny and checked in as a patch file.
+- SDK pin: `github.com/lancedb/lancedb-go` **main** (not tagged v0.1.2). v0.1.2 lacks FTS/hybrid. Needs Go 1.24 + Arrow v17. Native lib: build `liblancedb_go.a` with `--features aws` for R2. R2 keys: `access_key_id`, `secret_access_key`, `region`, `aws_endpoint` (not `endpoint`), `virtual_hosted_style_request=false`.
+- Store APIs to implement against Python sidecar behavior in `docker/lance/server.py`: merge_insert on `id`; hybrid via VectorQuery.WithFullText + RRF; BM25 via FullTextSearch; walk via Select/Query + SQL where + sort in Go if no order_by; compact via OptimizeWithAction Compact then Prune older_than 0; FTS on `forward_content`; btree on `session_id`; warmup 1-row scan + dummy FTS on open.
+- Keep daemon HTTP API unchanged: `GET /-/ready`, `POST /v1/memory/ingest`, `POST /v1/memory/query`, `GET /v1/memory/session`. Drop `PI_MEMORYD_VECTOR_URL` / `start-vector` / OpenData yaml generation on the Lance path.
+- SSH only `home-satan` (`-o IdentitiesOnly=yes -i ~/.ssh/home_satan`). Tailscale `:8090`. No fancy auth this run. Object-store keys only in project SOPS / `.env`. Don't check in a prebuilt `tireless` binary.
+- Don't start bulk `tireless sync` on battery. Full history dump (~1610 jsonl / ~60k windows) is a later item, not this task's deploy smoke.
+- Don't KeepAlive llama; don't Metal for background ticks.
+
+## Remaining work (maps to checklist)
+
+1. `lance.go` (`//go:build cgo`) + `lance_nocgo.go` (`//go:build !cgo`). Wire `server.lance` in `main.go`: open when storage is s3 (not memory://); `flushBatch`/`vectorSearch`/`sessionWalk` go through Lance; compact-on-16 after writes. SQL quote/filter/cursor helpers with tests that run without CGO.
+2. Docker overlay patch for Session cache 256/64. Confirm connect uses it (log cache sizes at boot).
+3. Dockerfile: rust stage build native lib for linux/arm64; Go 1.24 CGO link `-lm -ldl -lpthread`. Compose: delete `lance-writer` and `depends_on`; drop `PI_MEMORYD_VECTOR_URL`. Keep `llama-embed` profile. Makefile `test` stays `CGO_ENABLED=0`.
+4. Mac `go test ./...` with CGO off must still pass (`memory://` HTTP tests). Product path must not import/run Python sidecar.
+5. rsync to home-satan, `compose up --build` pi-memoryd only, smoke ingest+hybrid+walk on existing test sids (pi `019f6fe1-00a0-7214-9ce3-0e07d8852430`, Codex `019e92ea-9064-75f0-9f21-ce54439ffa4b`). Time Mac walk/hybrid vs last sidecar numbers (walk ~1.4–1.7s Mac / ~1.2s sidecar HTTP; hybrid ~0.58s after warmup). Goal: walk <1s after boot warmup if the HTTP hop was the tax.
+
+## Out of scope this task
+
+- Full history re-sync (empty cursor, AC only, hours, VPS embed `-t 2`).
+- IVF on `vector` after ~5–10k / full dump ~60k.
+- Rust rewrite of pi-memoryd.
+- Sub-200ms cold object-store (needs Enterprise/Foyer; rejected whole-table RAM).
+- OpenData (abandoned). Python sidecar is spike only; delete from compose when Go path is live; files under `docker/lance/` can stay until after deploy smoke.
+
+## Current live stack (before this change)
+
+- VPS `home-satan` / `100.127.82.49`: daemon `:8090`, llama `:8091`, Python `lance-writer` internal `:8080`.
+- Table already has two test threads ingested; R2 compacted (~7 objects). Cursor emptied for Lance (`cursor.json.pre-lance.bak`).

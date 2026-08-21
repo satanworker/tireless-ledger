@@ -7,9 +7,9 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/pi-memoryd .
 
-FROM gcr.io/distroless/static-debian12:nonroot
-WORKDIR /
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/pi-memoryd /usr/local/bin/pi-memoryd
 EXPOSE 8090
-USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/pi-memoryd"]

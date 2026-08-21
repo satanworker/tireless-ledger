@@ -16,6 +16,9 @@ flush_interval: ${PI_MEMORYD_FLUSH_SECONDS}
 split_threshold_vectors: ${VECTOR_SPLIT_THRESHOLD_VECTORS}
 merge_threshold_vectors: ${VECTOR_MERGE_THRESHOLD_VECTORS}
 split_search_neighbourhood: ${VECTOR_SPLIT_SEARCH_NEIGHBOURHOOD}
+# FTS compact filter cannot resume (unexpected phase Init). Don't schedule major FTS compact.
+delete_compaction_threshold: 1.0
+fts_stats_poll_interval: 3600
 metadata_fields:
   - name: scope
     field_type: String
@@ -32,6 +35,18 @@ metadata_fields:
   - name: timestamp
     field_type: Int64
     indexed: false
-  - name: forward_content
+  - name: session_id
     field_type: String
-    indexed: false
+    indexed: true
+  - name: host
+    field_type: String
+    indexed: true
+  - name: harness
+    field_type: String
+    indexed: true
+  - name: role
+    field_type: String
+    indexed: true
+  - name: forward_content
+    field_type: Text
+    indexed: true

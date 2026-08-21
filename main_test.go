@@ -1,6 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -48,5 +53,72 @@ func TestDedupState(t *testing.T) {
 	}
 	if state.Seen("a.go", "hash2") {
 		t.Fatalf("new hash should not be skipped")
+	}
+}
+
+func TestRRFMerge(t *testing.T) {
+	a := []queryResult{{ID: "x", Score: 1, ForwardContent: "ann"}, {ID: "y", Score: 2, ForwardContent: "ann-y"}}
+	b := []queryResult{{ID: "y", Score: 9, ForwardContent: "bm25-y"}, {ID: "z", Score: 8, ForwardContent: "bm25-z"}}
+	out := rrfMerge(a, b, 3)
+	if len(out) != 3 {
+		t.Fatalf("len=%d", len(out))
+	}
+	if out[0].ID != "y" {
+		t.Fatalf("want y first, got %q score=%v", out[0].ID, out[0].Score)
+	}
+}
+
+func TestTooBig(t *testing.T) {
+	if tooBig(nil) || !tooBig(errors.New("HTTP 413: Payload Too Large")) || !tooBig(errors.New("write: broken pipe")) {
+		t.Fatal("tooBig")
+	}
+}
+
+func TestWriteVectorsSplitsOn413(t *testing.T) {
+	nWrite := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req vectorWriteRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		nWrite++
+		if len(req.UpsertVectors) > 2 {
+			http.Error(w, `{"message":"Payload Too Large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer ts.Close()
+	s := &server{
+		cfg:    runtimeConfig{BatchThreshold: 32, VectorURL: ts.URL},
+		client: ts.Client(),
+		dedup:  &dedupState{Files: map[string]string{}},
+	}
+	items := make([]MemoryItem, 4)
+	for i := range items {
+		items[i] = MemoryItem{ID: fmt.Sprintf("i%d", i), Metadata: Metadata{FilePath: fmt.Sprintf("p%d", i), FileHash: fmt.Sprintf("h%d", i)}}
+	}
+	if err := s.flushBatch(items); err != nil {
+		t.Fatal(err)
+	}
+	if nWrite < 3 {
+		t.Fatalf("writes=%d want split", nWrite)
+	}
+	for i := range items {
+		if !s.dedup.Seen(items[i].Metadata.FilePath, items[i].Metadata.FileHash) {
+			t.Fatalf("not marked %d", i)
+		}
+	}
+}
+
+func TestQueryFilter(t *testing.T) {
+	if queryFilter(queryRequest{}) != nil {
+		t.Fatal("empty filter must omit")
+	}
+	f := queryFilter(queryRequest{SessionID: "abc"})
+	if f == nil || f.Eq == nil || f.Eq.Field != "session_id" || f.Eq.Value != "abc" {
+		t.Fatalf("filter=%+v", f)
+	}
+	f = queryFilter(queryRequest{Scope: "session_memory", SessionID: "abc"})
+	if f == nil || len(f.And) != 2 {
+		t.Fatalf("and=%+v", f)
 	}
 }
