@@ -137,11 +137,17 @@ def iter_codex_turns(path: Path, host: str) -> Iterator[dict[str, Any]]:
             text = _parts_text(pl.get("content"))
             if len(text) < MIN_CHARS or (role == "user" and _skip_user(text)):
                 continue
-            key = sha256_hex(text)[:16]
+            # Codex repeats the same response_item when a rollout resumes or
+            # forks. Its payload id remains stable across those copies, while
+            # the JSONL line number does not. Prefer the source-owned id so a
+            # replay merge-inserts the logical message instead of creating a
+            # second row. Legacy rows without an id retain the ordinal fallback.
+            source_id = str(pl.get("id") or "").strip()
+            turn_id = source_id or f"line-{i}"
+            key = source_id or f"legacy-{sha256_hex(text)[:16]}"
             if key in seen:
                 continue
             seen.add(key)
-            turn_id = f"{i}"
             yield _turn(
                 host=host,
                 harness="codex",

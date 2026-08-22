@@ -41,6 +41,17 @@ def _ingest_item(turn: dict, vector: list[float]) -> dict:
     }
 
 
+def _load_known_files(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    with path.open() as f:
+        state = json.load(f)
+    files = state.get("files") if isinstance(state, dict) else None
+    if not isinstance(files, dict):
+        raise SystemExit(f"invalid dedup state: {path}")
+    return {str(k): str(v) for k, v in files.items()}
+
+
 def cmd_parse(args: argparse.Namespace) -> None:
     n = 0
     for turn in walk_roots(args.pi, args.codex, args.host):
@@ -67,6 +78,8 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     accepted = skipped = n = 0
     url = args.server.rstrip("/") + "/v1/memory/ingest"
     buf: list[dict] = []
+    known_files = _load_known_files(args.known_state)
+    seen_ids: set[str] = set()
 
     def flush() -> None:
         nonlocal accepted, skipped, buf
@@ -91,6 +104,14 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     for turn in walk_roots(args.pi, args.codex, args.host):
         n += 1
         if n <= args.skip:
+            continue
+        if turn["id"] in seen_ids:
+            skipped += 1
+            continue
+        seen_ids.add(turn["id"])
+        meta = turn["metadata"]
+        if known_files.get(meta["file_path"]) == meta["file_hash"]:
+            skipped += 1
             continue
         buf.append(turn)
         if args.limit and n >= args.skip + args.limit:
@@ -159,6 +180,12 @@ def main() -> None:
     si = sub.add_parser("ingest", help="embed + POST /v1/memory/ingest")
     si.add_argument("--limit", type=int, default=0)
     si.add_argument("--skip", type=int, default=0, help="skip this many parsed turns before ingesting")
+    si.add_argument(
+        "--known-state",
+        type=Path,
+        default=None,
+        help="skip file_path/file_hash pairs already present in a copied server dedup state",
+    )
     si.add_argument("--dry-run", action="store_true")
     si.set_defaults(func=cmd_ingest)
 

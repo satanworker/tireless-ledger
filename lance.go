@@ -246,6 +246,25 @@ func (s *cgoLanceStore) DropVectorIndex(ctx context.Context) error {
 	return nil
 }
 
+func (s *cgoLanceStore) AuditDuplicates(ctx context.Context) (duplicateAudit, error) {
+	rows, err := s.table.Select(ctx, contracts.QueryConfig{Columns: []string{"id"}})
+	if err != nil {
+		return duplicateAudit{}, fmt.Errorf("scan lance IDs: %w", err)
+	}
+	counts := make(map[string]int, len(rows))
+	for _, row := range rows {
+		counts[stringValue(row["id"])]++
+	}
+	duplicates := make([]string, 0)
+	for id, count := range counts {
+		if count > 1 {
+			duplicates = append(duplicates, id)
+		}
+	}
+	sort.Strings(duplicates)
+	return duplicateAudit{Rows: len(rows), UniqueIDs: len(counts), DuplicateIDs: duplicates}, nil
+}
+
 func (s *cgoLanceStore) Upsert(ctx context.Context, items []MemoryItem) error {
 	counter := s.table.(lanceFragmentCounter)
 	_, err := counter.FragmentCount(ctx)

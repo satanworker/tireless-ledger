@@ -140,6 +140,13 @@ type runtimeConfig struct {
 	Optimize          bool
 	CreateVectorIndex bool
 	DropVectorIndex   bool
+	AuditDuplicates   bool
+}
+
+type duplicateAudit struct {
+	Rows         int      `json:"rows"`
+	UniqueIDs    int      `json:"unique_ids"`
+	DuplicateIDs []string `json:"duplicate_ids"`
 }
 
 type lanceStore interface {
@@ -149,6 +156,7 @@ type lanceStore interface {
 	Optimize(context.Context) error
 	CreateVectorIndex(context.Context) error
 	DropVectorIndex(context.Context) error
+	AuditDuplicates(context.Context) (duplicateAudit, error)
 }
 
 func main() {
@@ -208,7 +216,21 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		if cfg.Optimize || cfg.CreateVectorIndex || cfg.DropVectorIndex {
+		if cfg.AuditDuplicates {
+			audit, err := s.lance.AuditDuplicates(context.Background())
+			if err != nil {
+				slog.Error("audit duplicate IDs", "err", err)
+				os.Exit(1)
+			}
+			if err := json.NewEncoder(os.Stdout).Encode(audit); err != nil {
+				slog.Error("encode duplicate audit", "err", err)
+				os.Exit(1)
+			}
+			if len(audit.DuplicateIDs) != 0 {
+				os.Exit(2)
+			}
+		}
+		if cfg.Optimize || cfg.CreateVectorIndex || cfg.DropVectorIndex || cfg.AuditDuplicates {
 			return
 		}
 	}
@@ -239,6 +261,7 @@ func loadConfig() runtimeConfig {
 	flag.BoolVar(&cfg.Optimize, "optimize", false, "compact data, refresh indexes, prune old versions, and exit")
 	flag.BoolVar(&cfg.CreateVectorIndex, "create-vector-index", false, "create a 64-partition IVF-Flat vector index and exit")
 	flag.BoolVar(&cfg.DropVectorIndex, "drop-vector-index", false, "drop the IVF-Flat vector index and exit")
+	flag.BoolVar(&cfg.AuditDuplicates, "audit-duplicates", false, "scan all rows for duplicate IDs and exit non-zero if any exist")
 	flag.Parse()
 	return cfg
 }
@@ -282,6 +305,7 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := ingestResponse{}
 	todo := make([]MemoryItem, 0, len(req.Records))
+	pending := make(map[string]string, len(req.Records))
 	for i, rec := range req.Records {
 		if err := validateMemoryItem(rec, s.cfg.Dimensions); err != nil {
 			resp.Errors = append(resp.Errors, fmt.Sprintf("records[%d]: %v", i, err))
@@ -291,6 +315,15 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
 			resp.Skipped++
 			continue
 		}
+		if hash, ok := pending[rec.ID]; ok {
+			if hash != rec.Metadata.FileHash {
+				resp.Errors = append(resp.Errors, fmt.Sprintf("records[%d]: id %q has conflicting content", i, rec.ID))
+				continue
+			}
+			resp.Skipped++
+			continue
+		}
+		pending[rec.ID] = rec.Metadata.FileHash
 		todo = append(todo, rec)
 	}
 	if err := s.flushBatch(todo); err != nil {

@@ -34,11 +34,11 @@ def test_codex_skips_agents_md_and_dupes(tmp_path: Path) -> None:
             [
                 '{"timestamp":"2026-06-03T21:09:41.734Z","type":"session_meta","payload":{"id":"019e8f52-0cc9-7e91-a2bc-daea4b591f58","cwd":"/Users/x/swap-ui"}}',
                 '{"timestamp":"2026-06-03T21:09:42.850Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp\\nskip"}]}}',
-                '{"timestamp":"2026-06-03T21:09:42.857Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}}'
+                '{"timestamp":"2026-06-03T21:09:42.857Z","type":"response_item","payload":{"type":"message","id":"msg-user","role":"user","content":[{"type":"input_text","text":"%s"}]}}'
                 % user,
                 '{"timestamp":"2026-06-03T21:09:50Z","type":"event_msg","payload":{"type":"user_message","message":"%s"}}'
                 % user,
-                '{"timestamp":"2026-06-03T21:10:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Studio picker is GGUF only, your Qwen is MLX."}]}}',
+                '{"timestamp":"2026-06-03T21:10:00Z","type":"response_item","payload":{"type":"message","id":"msg-assistant","role":"assistant","content":[{"type":"output_text","text":"Studio picker is GGUF only, your Qwen is MLX."}]}}',
             ]
         )
         + "\n"
@@ -48,6 +48,41 @@ def test_codex_skips_agents_md_and_dupes(tmp_path: Path) -> None:
     assert turns[0]["metadata"]["session_id"] == "019e8f52-0cc9-7e91-a2bc-daea4b591f58"
     assert turns[0]["metadata"]["project_name"] == "swap-ui"
     assert "AGENTS.md" not in turns[0]["forward_content"]
+    assert turns[0]["id"] == record_id("mac", "codex", "019e8f52-0cc9-7e91-a2bc-daea4b591f58", "msg-user")
+
+
+def test_codex_resume_reuses_payload_id(tmp_path: Path) -> None:
+    original = tmp_path / "rollout-original.jsonl"
+    resumed = tmp_path / "rollout-resumed.jsonl"
+    message = "The stable payload id identifies this logical response."
+    original.write_text(
+        "\n".join(
+            [
+                '{"timestamp":"2026-07-26T12:23:36Z","type":"session_meta","payload":{"id":"thread-original","cwd":"/srv/project"}}',
+                '{"timestamp":"2026-07-26T12:25:20Z","type":"response_item","payload":{"type":"message","id":"msg-stable","role":"assistant","content":[{"type":"output_text","text":"%s"}]}}'
+                % message,
+            ]
+        )
+        + "\n"
+    )
+    resumed.write_text(
+        "\n".join(
+            [
+                '{"timestamp":"2026-07-26T14:00:15Z","type":"session_meta","payload":{"id":"rollout-resumed","forked_from_id":"thread-original","cwd":"/srv/project"}}',
+                '{"timestamp":"2026-07-26T14:00:15Z","type":"session_meta","payload":{"id":"thread-original","cwd":"/srv/project"}}',
+                '{"timestamp":"2026-07-26T14:00:15Z","type":"event_msg","payload":{"type":"token_count"}}',
+                '{"timestamp":"2026-07-26T14:00:15Z","type":"response_item","payload":{"type":"message","id":"msg-stable","role":"assistant","content":[{"type":"output_text","text":"%s"}]}}'
+                % message,
+            ]
+        )
+        + "\n"
+    )
+
+    first = list(iter_codex_turns(original, "vps"))[0]
+    replay = list(iter_codex_turns(resumed, "vps"))[0]
+    assert first["id"] == replay["id"]
+    assert first["metadata"]["file_path"] == replay["metadata"]["file_path"]
+    assert replay["metadata"]["session_id"] == "thread-original"
 
 
 if __name__ == "__main__":
@@ -56,4 +91,5 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_pi_user_and_assistant(Path(d))
         test_codex_skips_agents_md_and_dupes(Path(d))
+        test_codex_resume_reuses_payload_id(Path(d))
     print("ok")

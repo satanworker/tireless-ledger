@@ -6,7 +6,7 @@
 clients -> pi-memoryd (:8090) -> lancedb-go/CGO -> R2 Lance table `turns`
 ```
 
-The live source of truth is `s3://<bucket>/session-recall-lance/`. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+The live source of truth defaults to `s3://<bucket>/session-recall-lance-payload-id-v3/`. Set `PI_MEMORYD_S3_PREFIX` to select a different prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
 
 ## Builds
 
@@ -93,7 +93,8 @@ Production uses 384-dimensional `BAAI/bge-small-en-v1.5` vectors. Query prefixes
 
 | Variable | Purpose |
 |---|---|
-| `PI_MEMORYD_STORAGE_URL` | Lance database URI, normally `s3://<bucket>/session-recall-lance` |
+| `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
+| `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-payload-id-v3` |
 | `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to all 64 for exhaustive coverage |
 | `PI_MEMORYD_S3_BUCKET` | Compose bucket interpolation |
 | `PI_MEMORYD_S3_ENDPOINT` | R2 S3 endpoint; passed as Lance `aws_endpoint` |
