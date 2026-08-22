@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -121,11 +122,12 @@ type dedupState struct {
 }
 
 type server struct {
-	cfg     runtimeConfig
-	dedup   *dedupState
-	writeMu sync.Mutex
-	mem     *memStore
-	lance   lanceStore
+	cfg        runtimeConfig
+	dedup      *dedupState
+	writeMu    sync.Mutex
+	mem        *memStore
+	lance      lanceStore
+	readyCheck func(context.Context) error
 }
 
 type runtimeConfig struct {
@@ -194,6 +196,13 @@ func main() {
 			os.Exit(1)
 		}
 		defer s.lance.Close()
+		s.readyCheck = func(ctx context.Context) error {
+			_, err := s.lance.Search(ctx, vectorSearchRequest{
+				BM25: &bm25Query{Field: "forward_content", Query: "warmup"},
+				K:    1,
+			})
+			return err
+		}
 		if cfg.CreateVectorIndex && cfg.DropVectorIndex {
 			slog.Error("--create-vector-index and --drop-vector-index are mutually exclusive")
 			os.Exit(1)
@@ -294,6 +303,14 @@ func validateS3(ctx context.Context, cfg runtimeConfig) error {
 }
 
 func (s *server) ready(w http.ResponseWriter, r *http.Request) {
+	if s.readyCheck != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := s.readyCheck(ctx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "error": err.Error()})
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 

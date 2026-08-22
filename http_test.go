@@ -2,11 +2,23 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+func TestReadyChecksBackingStore(t *testing.T) {
+	s := testServer()
+	s.readyCheck = func(context.Context) error { return errors.New("missing Lance index file") }
+	recorder := httptest.NewRecorder()
+	s.ready(recorder, httptest.NewRequest(http.MethodGet, "/-/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
 
 func testServer() *server {
 	return &server{
