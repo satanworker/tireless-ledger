@@ -262,8 +262,20 @@ func main() {
 				slog.Error("save dedup state after host deletion", "host", cfg.DeleteHost, "err", err)
 				os.Exit(1)
 			}
+			rawRegistry, err := loadRawRegistry(filepath.Join(filepath.Dir(cfg.StatePath), "raw_registry.json"))
+			if err != nil {
+				slog.Error("load raw registry for host deletion", "host", cfg.DeleteHost, "err", err)
+				os.Exit(1)
+			}
+			rawRegistryEntries := rawRegistry.RemoveHost(cfg.DeleteHost)
+			if rawRegistryEntries > 0 {
+				if err := rawRegistry.Save(); err != nil {
+					slog.Error("save raw registry after host deletion", "host", cfg.DeleteHost, "err", err)
+					os.Exit(1)
+				}
+			}
 			if err := json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-				"deleted_host": cfg.DeleteHost, "rows": rows, "registry_entries": registryEntries,
+				"deleted_host": cfg.DeleteHost, "rows": rows, "registry_entries": registryEntries, "raw_registry_entries": rawRegistryEntries,
 			}); err != nil {
 				slog.Error("encode host deletion", "err", err)
 				os.Exit(1)

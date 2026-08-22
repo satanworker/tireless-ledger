@@ -220,6 +220,20 @@ func (r *rawRegistry) Save() error {
 	return os.Rename(tmpName, r.Path)
 }
 
+func (r *rawRegistry) RemoveHost(host string) int {
+	prefix := host + "/"
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed := 0
+	for key := range r.Objects {
+		if strings.HasPrefix(key, prefix) {
+			delete(r.Objects, key)
+			removed++
+		}
+	}
+	return removed
+}
+
 type rawStatusResponse struct {
 	Enabled       bool      `json:"enabled"`
 	Indexed       int       `json:"indexed"`

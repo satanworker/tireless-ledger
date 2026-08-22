@@ -79,6 +79,18 @@ func TestTruncateRunesDoesNotSplitUTF8(t *testing.T) {
 	}
 }
 
+func TestRawRegistryRemoveHost(t *testing.T) {
+	r := &rawRegistry{Objects: map[string]rawRegistryEntry{
+		"mbp14/codex/a.jsonl": {}, "mbp14/pi/b.jsonl": {}, "mbp140/pi/c.jsonl": {}, "vps/codex/d.jsonl": {},
+	}}
+	if removed := r.RemoveHost("mbp14"); removed != 2 {
+		t.Fatalf("removed=%d", removed)
+	}
+	if len(r.Objects) != 2 {
+		t.Fatalf("objects=%v", r.Objects)
+	}
+}
+
 func TestRawIngestRetriesFailedEmbedding(t *testing.T) {
 	body := []byte("{\"type\":\"session\",\"id\":\"s1\"}\n" +
 		"{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"A retry must eventually succeed.\"}}\n")
