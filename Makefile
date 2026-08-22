@@ -17,7 +17,7 @@ GOARCH         ?= $(shell go env GOARCH)
 .PHONY: all build build-native release test clean \
 	install uninstall run secrets-decrypt secrets-edit render-config \
 	docker-build up down doctor recall-local embed-local mac-test \
-	install-optimize-timer build-uploader install-uploader-bin install-raw-uploader
+	install-optimize-timer install-upload-timer build-uploader install-uploader-bin install-raw-uploader
 
 all: build
 
@@ -107,6 +107,9 @@ down:
 
 install-optimize-timer:
 	./scripts/install-optimize-timer.sh
+
+install-upload-timer:
+	./scripts/install-upload-timer.sh
 
 install-uploader-bin: $(UPLOAD_BIN)
 	@mkdir -p $(INSTALL_DIR)

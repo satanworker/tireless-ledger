@@ -1,0 +1,15 @@
+[Unit]
+Description=Upload original Codex and Pi sessions to Tireless Ledger raw storage
+ConditionPathExists=%h/tireless-ledger/.env
+ConditionPathExists=%h/.local/bin/tireless-upload
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tireless-ledger
+Environment=TIRELESS_UPLOAD_ENV=%h/tireless-ledger/.env
+Environment=TIRELESS_UPLOAD_HOST=fedora-4gb-hel1-2
+ExecStart=%h/tireless-ledger/scripts/upload-raw-sessions.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=30min

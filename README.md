@@ -116,6 +116,14 @@ make install-raw-uploader
 
 The launch agent repeats the small `tireless-upload` sync every minute. It compares object sizes and uploads only new or growing JSONL files. There is no local parsing, formatting, deduplication, or embedding.
 
+The VPS uses the same uploader under a user systemd timer:
+
+```bash
+make install-upload-timer
+```
+
+It uploads the VPS's untouched session trees every minute; extraction and embeddings still run only in `pi-memoryd` and `llama-embed`.
+
 ## Production environment
 
 | Variable | Purpose |
