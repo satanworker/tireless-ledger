@@ -128,6 +128,7 @@ type server struct {
 	mem        *memStore
 	lance      lanceStore
 	readyCheck func(context.Context) error
+	raw        *rawIngestor
 }
 
 type runtimeConfig struct {
@@ -144,6 +145,11 @@ type runtimeConfig struct {
 	DropVectorIndex   bool
 	AuditDuplicates   bool
 	DeleteHost        string
+	RawURL            string
+	RawPollInterval   time.Duration
+	RawMaxObjectBytes int64
+	EmbedURL          string
+	EmbedBatchSize    int
 }
 
 type duplicateAudit struct {
@@ -273,6 +279,17 @@ func main() {
 	mux.HandleFunc("POST /v1/memory/ingest", s.ingest)
 	mux.HandleFunc("POST /v1/memory/query", s.query)
 	mux.HandleFunc("GET /v1/memory/session", s.sessionWalk)
+	mux.HandleFunc("GET /v1/raw/status", s.rawStatus)
+
+	if cfg.RawURL != "" {
+		raw, err := newRawIngestor(context.Background(), s)
+		if err != nil {
+			slog.Error("initialize raw ingestion", "err", err)
+			os.Exit(1)
+		}
+		s.raw = raw
+		go raw.Run(context.Background())
+	}
 
 	slog.Info("pi-memoryd listening", "addr", cfg.ListenAddr, "storage_url", cfg.StorageURL)
 	if err := http.ListenAndServe(cfg.ListenAddr, mux); err != nil {
@@ -296,6 +313,11 @@ func loadConfig() runtimeConfig {
 	flag.BoolVar(&cfg.DropVectorIndex, "drop-vector-index", false, "drop the IVF-Flat vector index and exit")
 	flag.BoolVar(&cfg.AuditDuplicates, "audit-duplicates", false, "scan all rows for duplicate IDs and exit non-zero if any exist")
 	flag.StringVar(&cfg.DeleteHost, "delete-host", "", "delete every row and dedup entry for exactly this host, then exit")
+	flag.StringVar(&cfg.RawURL, "raw-url", env("PI_MEMORYD_RAW_URL", ""), "optional S3 prefix containing raw session files")
+	flag.DurationVar(&cfg.RawPollInterval, "raw-poll-interval", envDuration("PI_MEMORYD_RAW_POLL_INTERVAL", 30*time.Second), "raw S3 polling interval")
+	flag.Int64Var(&cfg.RawMaxObjectBytes, "raw-max-object-bytes", envInt64("PI_MEMORYD_RAW_MAX_OBJECT_BYTES", 128<<20), "largest raw object accepted")
+	flag.StringVar(&cfg.EmbedURL, "embed-url", env("PI_MEMORYD_EMBED_URL", "http://llama-embed:8091"), "OpenAI-compatible embedding server")
+	flag.IntVar(&cfg.EmbedBatchSize, "embed-batch-size", envInt("PI_MEMORYD_EMBED_BATCH_SIZE", 32), "texts per embedding request")
 	flag.Parse()
 	return cfg
 }
@@ -704,18 +726,41 @@ func (d *dedupState) RemoveHost(host string) int {
 
 func (d *dedupState) Save() error {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
 	if d.Path == "" {
+		d.mu.RUnlock()
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(d.Path), 0o755); err != nil {
-		return err
-	}
 	b, err := json.MarshalIndent(d, "", "  ")
+	d.mu.RUnlock()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(d.Path, b, 0o600)
+	dir := filepath.Dir(d.Path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".dedup-state-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, d.Path)
 }
 
 func parseS3URL(raw string) (bucket, prefix string, err error) {
@@ -767,6 +812,26 @@ func envInt(key string, def int) int {
 		return v
 	}
 	return def
+}
+
+func envInt64(key string, def int64) int64 {
+	var v int64
+	if _, err := fmt.Sscanf(os.Getenv(key), "%d", &v); err == nil {
+		return v
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }
 
 func envBool(key string, def bool) bool {

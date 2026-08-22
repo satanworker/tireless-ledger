@@ -1,9 +1,9 @@
 # pi-memoryd
 
-`pi-memoryd` is the single recall service for indexed Pi and Codex session windows. Production is one Go process linked to LanceDB through CGO; clients continue to use the existing HTTP API. Embeddings are produced by clients or the optional llama.cpp service and are not part of the daemon.
+`pi-memoryd` is the single recall service for indexed Pi and Codex sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
 
 ```text
-clients -> pi-memoryd (:8090) -> lancedb-go/CGO -> R2 Lance table `turns`
+Mac JSONL -> R2 raw prefix -> pi-memoryd -> VPS llama.cpp -> R2 Lance table `turns`
 ```
 
 The live source of truth defaults to `s3://<bucket>/session-recall-lance-payload-id-v3/`. Set `PI_MEMORYD_S3_PREFIX` to select a different prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
@@ -45,10 +45,10 @@ docker compose run --rm --no-deps pi-memoryd --create-vector-index --optimize
 docker compose run --rm --no-deps pi-memoryd --drop-vector-index
 ```
 
-`llama-embed` remains an optional separate process:
+`llama-embed` runs next to the daemon and is used only by the VPS worker:
 
 ```bash
-docker compose --profile embed up -d llama-embed
+docker compose up -d llama-embed
 ```
 
 Mac and portable unit tests deliberately stay pure Go and use `memory://`:
@@ -75,6 +75,7 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 - `POST /v1/memory/ingest`
 - `POST /v1/memory/query`
 - `GET /v1/memory/session?session_id=...&after_ts=...&after_id=...`
+- `GET /v1/raw/status`
 
 Example hybrid query:
 
@@ -88,6 +89,32 @@ Example hybrid query:
 ```
 
 Production uses 384-dimensional `BAAI/bge-small-en-v1.5` vectors. Query prefixes belong only on query embeddings; do not mix embeddings from different model/runtime configurations in the same table.
+
+## Raw session ingestion
+
+The raw object layout is deliberately the only contract:
+
+```text
+<host>/pi/<any subdirectories>/<file>.jsonl
+<host>/codex/<any subdirectories>/<file>.jsonl
+```
+
+Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, extracts user/assistant messages, embeds them through the local llama.cpp container, and merge-inserts stable message IDs. An object is recorded as indexed only after every batch is persisted. On a crash, the object is retried; already persisted messages are harmlessly skipped or upserted. Failed objects retry with bounded exponential backoff. Parser-version changes automatically reprocess the derived data.
+
+The durable registry is `/data/raw_registry.json`. Inspect progress with:
+
+```bash
+curl -sS http://100.127.82.49:8090/v1/raw/status
+```
+
+On a Mac, copy `config/raw-upload.env.example` to `~/.config/tireless-ledger/raw-upload.env`, insert the R2 credentials, and run:
+
+```bash
+scripts/upload-raw-sessions.sh
+make install-raw-uploader
+```
+
+The launch agent repeats the small `tireless-upload` sync every minute. It compares object sizes and uploads only new or growing JSONL files. There is no local parsing, formatting, deduplication, or embedding.
 
 ## Production environment
 
@@ -103,5 +130,9 @@ Production uses 384-dimensional `BAAI/bge-small-en-v1.5` vectors. Query prefixes
 | `AWS_REGION` | R2 region (`auto` is supported) |
 | `PI_MEMORYD_DIMENSIONS` | Vector size, default `384` |
 | `PI_MEMORYD_STATE` | Local dedup registry path |
+| `PI_MEMORYD_RAW_URL` | Raw session prefix, e.g. `s3://bucket/session-recall-raw-v1` |
+| `PI_MEMORYD_RAW_POLL_INTERVAL` | Raw object scan interval, default `30s` |
+| `PI_MEMORYD_RAW_MAX_OBJECT_BYTES` | Per-object safety limit, default `128 MiB` |
+| `PI_MEMORYD_EMBED_URL` | VPS embedding service, default `http://llama-embed:8091` |
 
 Encrypted values live in `secrets/pi-memoryd.sops.env`; `.env` is generated locally and must not be committed.

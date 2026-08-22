@@ -2,6 +2,7 @@ SOPS_FILE      ?= secrets/pi-memoryd.sops.env
 ENV_FILE       ?= .env
 BIN_DIR        ?= bin
 BIN            ?= $(BIN_DIR)/pi-memoryd
+UPLOAD_BIN     ?= $(BIN_DIR)/tireless-upload
 INSTALL_DIR    ?= $(HOME)/.local/bin
 DATA_DIR       ?= $(HOME)/.local/share/pi-memoryd
 PREFIX         ?= $(HOME)/.local
@@ -16,7 +17,7 @@ GOARCH         ?= $(shell go env GOARCH)
 .PHONY: all build build-native release test clean \
 	install uninstall run secrets-decrypt secrets-edit render-config \
 	docker-build up down doctor recall-local embed-local mac-test \
-	install-optimize-timer
+	install-optimize-timer build-uploader install-uploader-bin install-raw-uploader
 
 all: build
 
@@ -27,6 +28,12 @@ $(BIN): go.mod go.sum $(wildcard *.go)
 	@mkdir -p $(BIN_DIR)
 	$(GO_ENV) go build $(GO_FLAGS) -ldflags='$(GO_LDFLAGS)' -o $(BIN) .
 	@echo "built $(BIN) ($(GOOS)/$(GOARCH), CGO_ENABLED=0, stripped)"
+
+build-uploader: $(UPLOAD_BIN)
+
+$(UPLOAD_BIN): go.mod go.sum $(wildcard cmd/tireless-upload/*.go)
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 go build $(GO_FLAGS) -ldflags='$(GO_LDFLAGS)' -o $(UPLOAD_BIN) ./cmd/tireless-upload
 
 ## Cross / explicit release artifacts
 release:
@@ -100,3 +107,10 @@ down:
 
 install-optimize-timer:
 	./scripts/install-optimize-timer.sh
+
+install-uploader-bin: $(UPLOAD_BIN)
+	@mkdir -p $(INSTALL_DIR)
+	install -m 0755 $(UPLOAD_BIN) $(INSTALL_DIR)/tireless-upload
+
+install-raw-uploader: install-uploader-bin
+	./scripts/install-raw-upload-launchd.sh
