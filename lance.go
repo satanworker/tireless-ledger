@@ -265,6 +265,21 @@ func (s *cgoLanceStore) AuditDuplicates(ctx context.Context) (duplicateAudit, er
 	return duplicateAudit{Rows: len(rows), UniqueIDs: len(counts), DuplicateIDs: duplicates}, nil
 }
 
+func (s *cgoLanceStore) DeleteHost(ctx context.Context, host string) (int, error) {
+	filter := "host = " + lanceQuote(host)
+	rows, err := s.table.Select(ctx, contracts.QueryConfig{Columns: []string{"id"}, Where: filter})
+	if err != nil {
+		return 0, fmt.Errorf("select host rows: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if err := s.table.Delete(ctx, filter); err != nil {
+		return 0, fmt.Errorf("delete host rows: %w", err)
+	}
+	return len(rows), nil
+}
+
 func (s *cgoLanceStore) Upsert(ctx context.Context, items []MemoryItem) error {
 	counter := s.table.(lanceFragmentCounter)
 	_, err := counter.FragmentCount(ctx)

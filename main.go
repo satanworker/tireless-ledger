@@ -143,6 +143,7 @@ type runtimeConfig struct {
 	CreateVectorIndex bool
 	DropVectorIndex   bool
 	AuditDuplicates   bool
+	DeleteHost        string
 }
 
 type duplicateAudit struct {
@@ -159,6 +160,7 @@ type lanceStore interface {
 	CreateVectorIndex(context.Context) error
 	DropVectorIndex(context.Context) error
 	AuditDuplicates(context.Context) (duplicateAudit, error)
+	DeleteHost(context.Context, string) (int, error)
 }
 
 func main() {
@@ -239,7 +241,29 @@ func main() {
 				os.Exit(2)
 			}
 		}
-		if cfg.Optimize || cfg.CreateVectorIndex || cfg.DropVectorIndex || cfg.AuditDuplicates {
+		if cfg.DeleteHost != "" {
+			if strings.Contains(cfg.DeleteHost, "/") {
+				slog.Error("delete host", "err", "host must not contain a slash")
+				os.Exit(1)
+			}
+			rows, err := s.lance.DeleteHost(context.Background(), cfg.DeleteHost)
+			if err != nil {
+				slog.Error("delete host rows", "host", cfg.DeleteHost, "err", err)
+				os.Exit(1)
+			}
+			registryEntries := s.dedup.RemoveHost(cfg.DeleteHost)
+			if err := s.dedup.Save(); err != nil {
+				slog.Error("save dedup state after host deletion", "host", cfg.DeleteHost, "err", err)
+				os.Exit(1)
+			}
+			if err := json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
+				"deleted_host": cfg.DeleteHost, "rows": rows, "registry_entries": registryEntries,
+			}); err != nil {
+				slog.Error("encode host deletion", "err", err)
+				os.Exit(1)
+			}
+		}
+		if cfg.Optimize || cfg.CreateVectorIndex || cfg.DropVectorIndex || cfg.AuditDuplicates || cfg.DeleteHost != "" {
 			return
 		}
 	}
@@ -271,6 +295,7 @@ func loadConfig() runtimeConfig {
 	flag.BoolVar(&cfg.CreateVectorIndex, "create-vector-index", false, "create a 64-partition IVF-Flat vector index and exit")
 	flag.BoolVar(&cfg.DropVectorIndex, "drop-vector-index", false, "drop the IVF-Flat vector index and exit")
 	flag.BoolVar(&cfg.AuditDuplicates, "audit-duplicates", false, "scan all rows for duplicate IDs and exit non-zero if any exist")
+	flag.StringVar(&cfg.DeleteHost, "delete-host", "", "delete every row and dedup entry for exactly this host, then exit")
 	flag.Parse()
 	return cfg
 }
@@ -661,6 +686,20 @@ func (d *dedupState) Mark(filePath, fileHash string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.Files[filePath] = fileHash
+}
+
+func (d *dedupState) RemoveHost(host string) int {
+	prefix := host + "/"
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	removed := 0
+	for filePath := range d.Files {
+		if strings.HasPrefix(filePath, prefix) {
+			delete(d.Files, filePath)
+			removed++
+		}
+	}
+	return removed
 }
 
 func (d *dedupState) Save() error {

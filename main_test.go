@@ -51,6 +51,21 @@ func TestDedupState(t *testing.T) {
 	}
 }
 
+func TestDedupStateRemoveHost(t *testing.T) {
+	state := &dedupState{Files: map[string]string{
+		"mbp14/codex/session/turn":  "a",
+		"mbp140/codex/session/turn": "b",
+		"vps/codex/session/turn":    "c",
+		"mbp14/pi/session/turn":     "d",
+	}}
+	if removed := state.RemoveHost("mbp14"); removed != 2 {
+		t.Fatalf("removed=%d", removed)
+	}
+	if len(state.Files) != 2 || state.Files["mbp140/codex/session/turn"] != "b" {
+		t.Fatalf("files=%v", state.Files)
+	}
+}
+
 func TestRRFMerge(t *testing.T) {
 	a := []queryResult{{ID: "x", Score: 1, ForwardContent: "ann"}, {ID: "y", Score: 2, ForwardContent: "ann-y"}}
 	b := []queryResult{{ID: "y", Score: 9, ForwardContent: "bm25-y"}, {ID: "z", Score: 8, ForwardContent: "bm25-z"}}
