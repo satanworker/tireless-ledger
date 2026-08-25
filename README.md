@@ -6,7 +6,28 @@
 Mac JSONL -> R2 raw prefix -> pi-memoryd -> VPS llama.cpp -> R2 Lance `chunks` + `messages`
 ```
 
-The live source of truth defaults to `s3://<bucket>/session-recall-lance-token-chunks-v4/`. Set `PI_MEMORYD_S3_PREFIX` to select a different prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+The live derived recall store defaults to `s3://<bucket>/session-recall-lance-token-chunks-v4/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+
+## Current production state
+
+Production was cut over to split-table reads on 2026-08-25. Search reads
+`chunks`, session reconstruction reads `messages`, and dual-write remains
+enabled so the legacy `turns` table stays current for immediate rollback.
+
+The cutover migration did not re-embed or truncate data. It copied the existing
+rows and vectors from a pinned Lance snapshot, then compared source and
+destination ID sets. Snapshot version 3828 contained 55,774 messages and
+115,490 chunks (171,264 rows); both destination tables had zero missing IDs.
+A later live audit contained 171,517 rows, 171,517 unique IDs, and zero
+duplicates. A representative complete session response was byte-identical on
+legacy and split reads. Original JSONL objects remain in R2 independently of
+all derived Lance tables.
+
+One known raw object is stored but deliberately not indexed:
+`mbp14/codex/2026/02/27/rollout-2026-02-27T00-36-04-019c9c4f-3d7a-7451-bceb-52a1be460c9f.jsonl`
+is 168,898,859 bytes, above the configured 134,217,728-byte safety limit. Its
+original R2 object is intact; increasing the limit and replaying it is a future
+choice, not data recovery.
 
 ## Builds
 
@@ -81,7 +102,14 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 - Concurrent native searches are bounded and timed out at the HTTP boundary; a timed-out CGO call keeps its slot until native work actually returns, preventing orphan-query pileups.
 - Writes never run compaction or index refresh inline. Offline maintenance
   compacts fragments, refreshes indexes, and prunes obsolete versions after
-  bulk ingestion and through the scheduled quiet-hours optimizer.
+  bulk ingestion and through the scheduled threshold-based optimizer.
+
+The 2026-08-25 production baseline was 0.51–0.67 seconds for warm BM25 and
+3.92 seconds for warm hybrid recall. The first hybrid request after loading a
+fresh process took 10.9 seconds; legacy warm hybrid recall was approximately
+9 seconds. Four concurrent BM25 requests completed in 1.10–1.50 seconds, while
+four concurrent hybrid requests completed in two bounded pairs at roughly 10
+and 19 seconds. These are operational baselines, not hard performance targets.
 
 ## HTTP API
 
@@ -125,9 +153,12 @@ raw files or recomputing embeddings. The rollout is deliberately reversible:
 1. Run the new image with `PI_MEMORYD_DUAL_WRITE_SPLIT=true` and
    `PI_MEMORYD_SPLIT_TABLES=false`. Reads stay on `turns`, while new writes also
    land in `chunks` and `messages`.
-2. Run `make migrate-split`. It copies in 1,024-row batches with merge-insert on
-   stable IDs and saves `/data/split_migration.json` after every batch. Re-running
-   the command resumes the checkpoint and is safe after interruption.
+2. Run `make migrate-split`. It pins one immutable source-table version, copies
+   in 1,024-row batches with merge-insert on stable IDs, and saves
+   `/data/split_migration.json` after every batch. Re-running the command resumes
+   that exact snapshot and is safe after interruption. Before marking the
+   checkpoint complete, an ID-only reconciliation copies any omissions and
+   proves that no source IDs are missing from either destination.
 3. Create/refresh the chunk indexes, validate the shadow service, then set
    `PI_MEMORYD_SPLIT_TABLES=true` while leaving dual-write enabled for the
    rollback observation window. Disable dual-write only after that window.
@@ -135,6 +166,22 @@ raw files or recomputing embeddings. The rollout is deliberately reversible:
 Keep the old `turns` table and previous image during the observation window;
 rolling back is an environment toggle and container restart, not another data
 rebuild.
+
+The current VPS rollback image is
+`pi-memoryd:pre-split-20260825` (`sha256:0ce78d40f440...`). To switch only the
+data path back while preserving dual-write:
+
+```bash
+PI_MEMORYD_SPLIT_TABLES=false PI_MEMORYD_DUAL_WRITE_SPLIT=true \
+  docker compose up -d --no-deps --force-recreate pi-memoryd
+```
+
+For a binary rollback as well, restore the saved image tag first:
+
+```bash
+docker tag pi-memoryd:pre-split-20260825 pi-memoryd:local
+docker compose up -d --no-deps --force-recreate pi-memoryd
+```
 
 The durable registry is `/data/raw_registry.json`. Inspect progress with:
 
