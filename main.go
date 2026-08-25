@@ -355,7 +355,7 @@ func loadConfig() runtimeConfig {
 	flag.IntVar(&cfg.Dimensions, "dimensions", envInt("PI_MEMORYD_DIMENSIONS", 384), "vector dimensions")
 	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 64), "IVF partitions scanned per vector query")
 	flag.BoolVar(&cfg.SplitTables, "split-tables", envBool("PI_MEMORYD_SPLIT_TABLES", false), "serve separate messages and chunks tables")
-	flag.BoolVar(&cfg.DualWriteSplit, "dual-write-split", envBool("PI_MEMORYD_DUAL_WRITE_SPLIT", false), "write legacy and split tables while serving legacy")
+	flag.BoolVar(&cfg.DualWriteSplit, "dual-write-split", envBool("PI_MEMORYD_DUAL_WRITE_SPLIT", false), "write both legacy and split tables")
 	flag.BoolVar(&cfg.MigrateSplit, "migrate-split", false, "copy legacy turns into split tables and exit")
 	flag.BoolVar(&cfg.PrintFragments, "fragment-counts", false, "print active table fragment counts and exit")
 	flag.IntVar(&cfg.MigrationBatch, "migration-batch", envInt("PI_MEMORYD_MIGRATION_BATCH", 1024), "rows per resumable split migration batch")

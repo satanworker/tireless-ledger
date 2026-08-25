@@ -11,8 +11,9 @@ The live derived recall store defaults to `s3://<bucket>/session-recall-lance-to
 ## Current production state
 
 Production was cut over to split-table reads on 2026-08-25. Search reads
-`chunks`, session reconstruction reads `messages`, and dual-write remains
-enabled so the legacy `turns` table stays current for immediate rollback.
+`chunks`, session reconstruction reads `messages`, and dual-write was disabled
+after validation. Normal production does not open or write the retired legacy
+`turns` table.
 
 The cutover migration did not re-embed or truncate data. It copied the existing
 rows and vectors from a pinned Lance snapshot, then compared source and
@@ -163,25 +164,12 @@ raw files or recomputing embeddings. The rollout is deliberately reversible:
    `PI_MEMORYD_SPLIT_TABLES=true` while leaving dual-write enabled for the
    rollback observation window. Disable dual-write only after that window.
 
-Keep the old `turns` table and previous image during the observation window;
-rolling back is an environment toggle and container restart, not another data
-rebuild.
-
-The current VPS rollback image is
-`pi-memoryd:pre-split-20260825` (`sha256:0ce78d40f440...`). To switch only the
-data path back while preserving dual-write:
-
-```bash
-PI_MEMORYD_SPLIT_TABLES=false PI_MEMORYD_DUAL_WRITE_SPLIT=true \
-  docker compose up -d --no-deps --force-recreate pi-memoryd
-```
-
-For a binary rollback as well, restore the saved image tag first:
-
-```bash
-docker tag pi-memoryd:pre-split-20260825 pi-memoryd:local
-docker compose up -d --no-deps --force-recreate pi-memoryd
-```
+Keep the old `turns` table and previous image during the observation window.
+After dual-write is disabled, that table becomes a historical snapshot and is
+not a lossless rollback target for newer sessions. Untouched raw JSONL in R2 is
+the authoritative recovery source. The current VPS still retains the old image
+as `pi-memoryd:pre-split-20260825` (`sha256:0ce78d40f440...`) and the dormant
+legacy table, but neither participates in normal runtime operation.
 
 The durable registry is `/data/raw_registry.json`. Inspect progress with:
 
@@ -214,7 +202,7 @@ It uploads the VPS's untouched session trees every minute; extraction and embedd
 | `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-token-chunks-v4` |
 | `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to all 64 for exhaustive coverage |
 | `PI_MEMORYD_SPLIT_TABLES` | Read/write separate `chunks` and `messages` tables; production default `true` |
-| `PI_MEMORYD_DUAL_WRITE_SPLIT` | Write both legacy and split layouts regardless of which layout serves reads; production default `true` for rollback safety |
+| `PI_MEMORYD_DUAL_WRITE_SPLIT` | Write both legacy and split layouts during migration/observation; production default `false` |
 | `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable legacy-to-split copy batch; default `1024` |
 | `PI_MEMORYD_MAX_CONCURRENT_QUERIES` | Maximum native Lance searches in flight; default `2` |
 | `PI_MEMORYD_QUERY_TIMEOUT` | HTTP-side query deadline; default `30s` |

@@ -80,18 +80,12 @@ func openLanceStore(ctx context.Context, cfg runtimeConfig) (lanceStore, error) 
 		nprobes = lanceVectorNProbes
 	}
 	store := &cgoLanceStore{conn: conn, dims: cfg.Dimensions, nprobes: nprobes, split: cfg.SplitTables, dualWrite: cfg.DualWriteSplit || cfg.MigrateSplit}
-	table, err := conn.OpenTable(ctx, lanceTableName)
-	if err != nil {
-		table, err = store.createTable(ctx, lanceTableName)
-	}
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("open or create %s: %w", lanceTableName, err)
-	}
-	store.legacy = table
-	if _, ok := table.(lanceFragmentCounter); !ok {
-		store.Close()
-		return nil, fmt.Errorf("patched lancedb-go FragmentCount capability is unavailable")
+	if !store.split || store.dualWrite {
+		store.legacy, err = store.openOrCreateTable(ctx, lanceTableName)
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
 	}
 	if store.split || store.dualWrite {
 		store.chunks, err = store.openOrCreateTable(ctx, lanceChunksTable)
@@ -101,6 +95,12 @@ func openLanceStore(ctx context.Context, cfg runtimeConfig) (lanceStore, error) 
 		if err != nil {
 			store.Close()
 			return nil, err
+		}
+	}
+	for name, table := range store.activeTables() {
+		if _, ok := table.(lanceFragmentCounter); !ok {
+			store.Close()
+			return nil, fmt.Errorf("patched lancedb-go FragmentCount capability is unavailable for %s", name)
 		}
 	}
 	if err := store.ensureIndexes(ctx); err != nil {
