@@ -41,6 +41,7 @@ type cgoLanceStore struct {
 	messages  contracts.ITable
 	dims      int
 	nprobes   int
+	exact     bool
 	split     bool
 	dualWrite bool
 }
@@ -79,7 +80,7 @@ func openLanceStore(ctx context.Context, cfg runtimeConfig) (lanceStore, error) 
 	if nprobes <= 0 {
 		nprobes = lanceVectorNProbes
 	}
-	store := &cgoLanceStore{conn: conn, dims: cfg.Dimensions, nprobes: nprobes, split: cfg.SplitTables, dualWrite: cfg.DualWriteSplit || cfg.MigrateSplit}
+	store := &cgoLanceStore{conn: conn, dims: cfg.Dimensions, nprobes: nprobes, exact: cfg.ExactVectorSearch, split: cfg.SplitTables, dualWrite: cfg.DualWriteSplit || cfg.MigrateSplit}
 	if !store.split || store.dualWrite {
 		store.legacy, err = store.openOrCreateTable(ctx, lanceTableName)
 		if err != nil {
@@ -510,7 +511,10 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	case hasVector:
 		config.Limit = &limit
 		nprobes := s.nprobes
-		config.VectorSearch = &contracts.VectorSearch{Column: "vector", Vector: req.Vector, K: limit, Nprobes: &nprobes}
+		config.VectorSearch = &contracts.VectorSearch{
+			Column: "vector", Vector: req.Vector, K: limit, Nprobes: &nprobes,
+			BypassVectorIndex: s.exact,
+		}
 		if hasText {
 			if req.BM25.Field != "" && req.BM25.Field != "forward_content" {
 				return nil, fmt.Errorf("unsupported BM25 field %q", req.BM25.Field)

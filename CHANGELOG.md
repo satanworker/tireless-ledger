@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Exact vector serving (2026-08-25)
+
+- Vector and hybrid queries now default to Lance's exhaustive flat scan via
+  `PI_MEMORYD_EXACT_VECTOR_SEARCH=true`. At roughly 116,000 searchable chunks,
+  this was faster over R2 than probing every partition of IVF_FLAT and provides
+  exact nearest-neighbor recall.
+- Production's derived 170 MiB IVF index was dropped; source vectors, indexed
+  text, canonical messages, and raw session files were not removed. The index
+  remains recreatable with `--create-vector-index` if future corpus growth and
+  measured recall justify approximate search.
+- The first post-restart vector query fell from roughly 11 seconds to 2.04
+  seconds. Idle production measured 1.11–1.48 seconds for vector and 1.15–1.55
+  seconds for hybrid, with occasional 5–6 second R2 outliers still observed.
+
 ### Decisions (2026-08-18) — session recall
 
 **Goal**

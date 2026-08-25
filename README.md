@@ -69,11 +69,16 @@ make install-optimize-timer
 The timer uses a non-blocking runtime lock, so delayed timer invocations cannot
 overlap an optimization already in progress.
 
-For corpora above roughly 10,000 rows, an explicitly reversible IVF-Flat index can reduce dense-search latency while retaining full-precision vectors:
+Exact flat vector search is the production default. An IVF-Flat index is an
+optional, reversible mode for a materially larger corpus, but enable it only
+after measuring representative recall and latency with fewer than all 64
+partitions. Searching all partitions was slower than a flat scan over R2 at
+116,000 rows.
 
 ```sh
-docker compose run --rm --no-deps pi-memoryd --create-vector-index --optimize
-# Roll back to exhaustive vector scans:
+docker compose run --rm --no-deps pi-memoryd --create-vector-index
+# Then set PI_MEMORYD_EXACT_VECTOR_SEARCH=false and tune PI_MEMORYD_VECTOR_NPROBES.
+# Return to exhaustive vector scans and remove the derived index:
 docker compose run --rm --no-deps pi-memoryd --drop-vector-index
 ```
 
@@ -95,22 +100,23 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 ## Lance behavior
 
 - Merge-insert on stable `id`; an ingest response is successful only after persistence.
-- ANN, BM25, and combined hybrid search with LanceDB RRF.
+- Exact vector, BM25, and combined hybrid search with LanceDB RRF. At the current corpus size, exact flat vector scans outperform all-partition IVF_FLAT queries over R2.
 - Search reads only the `chunks` table; session walking reads only `messages`.
 - Session walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
-- FTS/vector indexes exist only on searchable chunks; messages use scalar `session_id` and `id` indexes.
+- Searchable chunks use FTS and scalar `id` indexes. The production IVF vector index is absent while exact search is enabled; messages use scalar `session_id` and `id` indexes.
 - One-row scan and dummy FTS warmup during startup.
 - Concurrent native searches are bounded and timed out at the HTTP boundary; a timed-out CGO call keeps its slot until native work actually returns, preventing orphan-query pileups.
 - Writes never run compaction or index refresh inline. Offline maintenance
   compacts fragments, refreshes indexes, and prunes obsolete versions after
   bulk ingestion and through the scheduled threshold-based optimizer.
 
-The 2026-08-25 production baseline was 0.51–0.67 seconds for warm BM25 and
-3.92 seconds for warm hybrid recall. The first hybrid request after loading a
-fresh process took 10.9 seconds; legacy warm hybrid recall was approximately
-9 seconds. Four concurrent BM25 requests completed in 1.10–1.50 seconds, while
-four concurrent hybrid requests completed in two bounded pairs at roughly 10
-and 19 seconds. These are operational baselines, not hard performance targets.
+Before exact mode, 64-probe IVF measured 5.94 seconds median for vector search,
+6.28 seconds median for hybrid search, and about 11 seconds on the first vector
+request from a fresh process. After exact mode was deployed, the first
+post-restart vector request took 2.04 seconds; idle production samples were
+1.11–1.48 seconds for vector and 1.15–1.55 seconds for hybrid. Repeated R2 scans
+still showed occasional 5–6 second network/storage outliers, so these are
+operational baselines rather than a latency guarantee.
 
 ## HTTP API
 
@@ -200,7 +206,8 @@ It uploads the VPS's untouched session trees every minute; extraction and embedd
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
 | `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-token-chunks-v4` |
-| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to all 64 for exhaustive coverage |
+| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned when exact mode is disabled; defaults to all 64 |
+| `PI_MEMORYD_EXACT_VECTOR_SEARCH` | Bypass IVF and scan all vectors exactly; defaults to `true` because this is faster over R2 at the current corpus size and guarantees 100% vector recall |
 | `PI_MEMORYD_SPLIT_TABLES` | Read/write separate `chunks` and `messages` tables; production default `true` |
 | `PI_MEMORYD_DUAL_WRITE_SPLIT` | Write both legacy and split layouts during migration/observation; production default `false` |
 | `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable legacy-to-split copy batch; default `1024` |

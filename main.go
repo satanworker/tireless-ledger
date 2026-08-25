@@ -144,6 +144,7 @@ type runtimeConfig struct {
 	S3Endpoint        string
 	Dimensions        int
 	VectorNProbes     int
+	ExactVectorSearch bool
 	SplitTables       bool
 	DualWriteSplit    bool
 	MigrateSplit      bool
@@ -354,6 +355,7 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.S3Endpoint, "s3-endpoint", env("PI_MEMORYD_S3_ENDPOINT", env("AWS_ENDPOINT_URL", env("AWS_ENDPOINT", ""))), "S3-compatible endpoint URL")
 	flag.IntVar(&cfg.Dimensions, "dimensions", envInt("PI_MEMORYD_DIMENSIONS", 384), "vector dimensions")
 	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 64), "IVF partitions scanned per vector query")
+	flag.BoolVar(&cfg.ExactVectorSearch, "exact-vector-search", envBool("PI_MEMORYD_EXACT_VECTOR_SEARCH", true), "bypass ANN and exhaustively scan vectors for exact recall")
 	flag.BoolVar(&cfg.SplitTables, "split-tables", envBool("PI_MEMORYD_SPLIT_TABLES", false), "serve separate messages and chunks tables")
 	flag.BoolVar(&cfg.DualWriteSplit, "dual-write-split", envBool("PI_MEMORYD_DUAL_WRITE_SPLIT", false), "write both legacy and split tables")
 	flag.BoolVar(&cfg.MigrateSplit, "migrate-split", false, "copy legacy turns into split tables and exit")
