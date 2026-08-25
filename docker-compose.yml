@@ -10,7 +10,7 @@ services:
       - "100.127.82.49:8090:8090"
     environment:
       PI_MEMORYD_LISTEN: ":8090"
-      PI_MEMORYD_STORAGE_URL: "s3://${PI_MEMORYD_S3_BUCKET:?set PI_MEMORYD_S3_BUCKET}/${PI_MEMORYD_S3_PREFIX:-session-recall-lance-payload-id-v3}"
+      PI_MEMORYD_STORAGE_URL: "s3://${PI_MEMORYD_S3_BUCKET:?set PI_MEMORYD_S3_BUCKET}/${PI_MEMORYD_S3_PREFIX:-session-recall-lance-token-chunks-v4}"
       PI_MEMORYD_RAW_URL: "s3://${PI_MEMORYD_S3_BUCKET:?set PI_MEMORYD_S3_BUCKET}/${PI_MEMORYD_RAW_PREFIX:-session-recall-raw-v1}"
       PI_MEMORYD_EMBED_URL: "http://llama-embed:8091"
       PI_MEMORYD_RAW_POLL_INTERVAL: "${PI_MEMORYD_RAW_POLL_INTERVAL:-30s}"
@@ -22,7 +22,7 @@ services:
       AWS_ACCESS_KEY_ID: "${PI_MEMORYD_KEY_ID:?set PI_MEMORYD_KEY_ID}"
       AWS_SECRET_ACCESS_KEY: "${PI_MEMORYD_APPLICATION_KEY:?set PI_MEMORYD_APPLICATION_KEY}"
     volumes:
-      - pi-memoryd-data:/data
+      - pi-memoryd-chunks-v4-data:/data
     depends_on:
       llama-embed:
         condition: service_healthy
@@ -66,3 +66,4 @@ services:
 
 volumes:
   pi-memoryd-data:
+  pi-memoryd-chunks-v4-data:

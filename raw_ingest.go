@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-const embedMaxChars = 800
+const (
+	embedChunkTokens  = 384
+	embedChunkOverlap = 64
+)
 
 type rawObject struct {
 	Key, ETag string
@@ -326,29 +330,21 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 	}
 	pending := items[:0]
 	for _, item := range items {
-		if !r.server.dedup.Seen(item.Metadata.FilePath, item.Metadata.FileHash) {
+		if !r.server.dedup.Seen(rawDerivedPath(item.Metadata.FilePath), item.Metadata.FileHash) {
 			pending = append(pending, item)
 		}
 	}
-	batchSize := r.server.cfg.EmbedBatchSize
-	if batchSize <= 0 {
-		batchSize = 32
+	messageBatch := r.server.cfg.EmbedBatchSize
+	if messageBatch <= 0 {
+		messageBatch = 32
 	}
-	for start := 0; start < len(pending); start += batchSize {
-		end := start + batchSize
+	for start := 0; start < len(pending); start += messageBatch {
+		end := start + messageBatch
 		if end > len(pending) {
 			end = len(pending)
 		}
-		batch := pending[start:end]
-		vectors, err := r.embed(ctx, batch)
-		if err != nil {
+		if err := r.indexMessages(ctx, pending[start:end]); err != nil {
 			return err
-		}
-		for i := range batch {
-			batch[i].Vector = vectors[i]
-		}
-		if err := r.server.flushBatch(batch); err != nil {
-			return fmt.Errorf("index: %w", err)
 		}
 	}
 	if err := r.registry.set(obj, "indexed", len(items), nil); err != nil {
@@ -358,11 +354,78 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 	return nil
 }
 
-func (r *rawIngestor) embed(ctx context.Context, items []MemoryItem) ([][]float32, error) {
-	texts := make([]string, len(items))
-	for i, item := range items {
-		texts[i] = truncateRunes(item.ForwardContent, embedMaxChars)
+func rawDerivedPath(filePath string) string {
+	return filePath + "|" + rawParserVersion
+}
+
+func (r *rawIngestor) indexMessages(ctx context.Context, messages []MemoryItem) error {
+	type prepared struct {
+		message MemoryItem
+		chunks  []MemoryItem
 	}
+	preparedMessages := make([]prepared, 0, len(messages))
+	flat := make([]MemoryItem, 0, len(messages))
+	for _, message := range messages {
+		texts, err := r.splitTokenChunks(ctx, message.ForwardContent)
+		if err != nil {
+			return fmt.Errorf("tokenize message %s: %w", message.ID, err)
+		}
+		chunks := make([]MemoryItem, len(texts))
+		for i, text := range texts {
+			chunk := message
+			chunk.ID = hashText(message.ID + "|token-chunk-v1|" + strconv.Itoa(i))
+			chunk.ForwardContent = text
+			chunk.Metadata.RecordKind = "chunk"
+			chunk.Metadata.ParentID = message.ID
+			chunk.Metadata.ChunkIndex = int64(i)
+			chunk.Metadata.ChunkCount = int64(len(texts))
+			chunks[i] = chunk
+			flat = append(flat, chunk)
+		}
+		message.Metadata.RecordKind = "message"
+		message.Metadata.ParentID = message.ID
+		message.Metadata.ChunkCount = int64(len(chunks))
+		preparedMessages = append(preparedMessages, prepared{message: message, chunks: chunks})
+	}
+	texts := make([]string, len(flat))
+	for i := range flat {
+		texts[i] = flat[i].ForwardContent
+	}
+	vectors := make([][]float32, 0, len(texts))
+	batchSize := r.server.cfg.EmbedBatchSize
+	if batchSize <= 0 {
+		batchSize = 32
+	}
+	for start := 0; start < len(texts); start += batchSize {
+		end := start + batchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		batch, err := r.embedTexts(ctx, texts[start:end])
+		if err != nil {
+			return err
+		}
+		vectors = append(vectors, batch...)
+	}
+	for i := range flat {
+		flat[i].Vector = vectors[i]
+	}
+	records := make([]MemoryItem, 0, len(messages)+len(flat))
+	flatIndex := 0
+	for i := range preparedMessages {
+		count := len(preparedMessages[i].chunks)
+		preparedMessages[i].message.Vector = flat[flatIndex].Vector
+		records = append(records, preparedMessages[i].message)
+		records = append(records, flat[flatIndex:flatIndex+count]...)
+		flatIndex += count
+	}
+	if err := r.server.flushDerived(messages, records); err != nil {
+		return fmt.Errorf("index: %w", err)
+	}
+	return nil
+}
+
+func (r *rawIngestor) embedTexts(ctx context.Context, texts []string) ([][]float32, error) {
 	payload, _ := json.Marshal(map[string]interface{}{"input": texts, "model": "bge-small-en-v1.5"})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(r.server.cfg.EmbedURL, "/")+"/v1/embeddings", bytes.NewReader(payload))
 	if err != nil {
@@ -387,7 +450,7 @@ func (r *rawIngestor) embed(ctx context.Context, items []MemoryItem) ([][]float3
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode embeddings: %w", err)
 	}
-	vectors := make([][]float32, len(items))
+	vectors := make([][]float32, len(texts))
 	for _, row := range out.Data {
 		if row.Index >= 0 && row.Index < len(vectors) {
 			vectors[row.Index] = row.Embedding
@@ -401,12 +464,100 @@ func (r *rawIngestor) embed(ctx context.Context, items []MemoryItem) ([][]float3
 	return vectors, nil
 }
 
-func truncateRunes(text string, max int) string {
-	runes := []rune(text)
-	if len(runes) <= max {
-		return text
+func (r *rawIngestor) tokenCount(ctx context.Context, text string) (int, error) {
+	payload, _ := json.Marshal(map[string]interface{}{"content": text, "add_special": false})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(r.server.cfg.EmbedURL, "/")+"/tokenize", bytes.NewReader(payload))
+	if err != nil {
+		return 0, err
 	}
-	return string(runes[:max])
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.http.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("tokenize request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return 0, fmt.Errorf("tokenize HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Tokens []json.RawMessage `json:"tokens"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, fmt.Errorf("decode tokens: %w", err)
+	}
+	return len(out.Tokens), nil
+}
+
+func (r *rawIngestor) splitTokenChunks(ctx context.Context, text string) ([]string, error) {
+	count, err := r.tokenCount(ctx, text)
+	if err != nil {
+		return nil, err
+	}
+	if count <= embedChunkTokens {
+		return []string{text}, nil
+	}
+	runes := []rune(text)
+	chunks := make([]string, 0, count/(embedChunkTokens-embedChunkOverlap)+1)
+	start := 0
+	for start < len(runes) {
+		remaining := string(runes[start:])
+		remainingCount, err := r.tokenCount(ctx, remaining)
+		if err != nil {
+			return nil, err
+		}
+		if remainingCount <= embedChunkTokens {
+			chunks = append(chunks, remaining)
+			break
+		}
+		lo, hi := start+1, len(runes)
+		best := start + 1
+		for lo <= hi {
+			mid := lo + (hi-lo)/2
+			n, err := r.tokenCount(ctx, string(runes[start:mid]))
+			if err != nil {
+				return nil, err
+			}
+			if n <= embedChunkTokens {
+				best = mid
+				lo = mid + 1
+			} else {
+				hi = mid - 1
+			}
+		}
+		end := preferTextBoundary(runes, start, best)
+		chunks = append(chunks, string(runes[start:end]))
+		overlapStart := end
+		lo, hi = start, end
+		for lo <= hi {
+			mid := lo + (hi-lo)/2
+			n, err := r.tokenCount(ctx, string(runes[mid:end]))
+			if err != nil {
+				return nil, err
+			}
+			if n <= embedChunkOverlap {
+				overlapStart = mid
+				hi = mid - 1
+			} else {
+				lo = mid + 1
+			}
+		}
+		if overlapStart <= start {
+			overlapStart = end
+		}
+		start = overlapStart
+	}
+	return chunks, nil
+}
+
+func preferTextBoundary(runes []rune, start, end int) int {
+	minimum := start + (end-start)*3/4
+	for i := end - 1; i >= minimum; i-- {
+		if runes[i] == '\n' {
+			return i + 1
+		}
+	}
+	return end
 }
 
 func (s *server) rawStatus(w http.ResponseWriter, _ *http.Request) {

@@ -49,6 +49,10 @@ type Metadata struct {
 	Host        string      `json:"host,omitempty"`
 	Harness     string      `json:"harness,omitempty"`
 	Role        string      `json:"role,omitempty"`
+	RecordKind  string      `json:"record_kind,omitempty"`
+	ParentID    string      `json:"parent_id,omitempty"`
+	ChunkIndex  int64       `json:"chunk_index,omitempty"`
+	ChunkCount  int64       `json:"chunk_count,omitempty"`
 }
 
 type MemoryItem struct {
@@ -402,7 +406,20 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
 		pending[rec.ID] = rec.Metadata.FileHash
 		todo = append(todo, rec)
 	}
-	if err := s.flushBatch(todo); err != nil {
+	derived := make([]MemoryItem, 0, len(todo)*2)
+	for _, rec := range todo {
+		message := rec
+		message.Metadata.RecordKind = "message"
+		message.Metadata.ParentID = rec.ID
+		message.Metadata.ChunkCount = 1
+		chunk := rec
+		chunk.ID = hashText(rec.ID + "|token-chunk-v1|0")
+		chunk.Metadata.RecordKind = "chunk"
+		chunk.Metadata.ParentID = rec.ID
+		chunk.Metadata.ChunkCount = 1
+		derived = append(derived, message, chunk)
+	}
+	if err := s.flushBatch(derived); err != nil {
 		resp.Errors = append(resp.Errors, err.Error())
 		writeJSON(w, http.StatusBadGateway, resp)
 		return
@@ -434,9 +451,12 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 	if req.Limit <= 0 {
 		req.Limit = 5
 	}
-	filter := queryFilter(req)
-	include := []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role"}
-	fetchK := req.Limit
+	filter := appendFilter(queryFilter(req), vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "chunk"}})
+	include := []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role", "record_kind", "parent_id", "chunk_index", "chunk_count"}
+	fetchK := req.Limit * 8
+	if fetchK < 50 {
+		fetchK = 50
+	}
 	if hasVec && hasText && fetchK < 20 {
 		fetchK = 20
 	}
@@ -450,10 +470,9 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 		}
 		out := queryResponse{Results: lists[0]}
 		if len(lists) == 2 {
-			out.Results = rrfMerge(lists[0], lists[1], req.Limit)
-		} else if len(out.Results) > req.Limit {
-			out.Results = out.Results[:req.Limit]
+			out.Results = rrfMerge(lists[0], lists[1], fetchK)
 		}
+		out.Results = collapseChunkHits(out.Results, req.Limit)
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
@@ -469,10 +488,7 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 		errorJSON(w, http.StatusBadGateway, err)
 		return
 	}
-	out := queryResponse{Results: hits}
-	if len(out.Results) > req.Limit {
-		out.Results = out.Results[:req.Limit]
-	}
+	out := queryResponse{Results: collapseChunkHits(hits, req.Limit)}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -501,13 +517,13 @@ func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, queryResponse{Results: s.mem.bySession(sid, host, harness, afterTS, afterID, limit)})
 		return
 	}
-	filter := sessionWalkFilter(sid, host, harness)
+	filter := appendFilter(sessionWalkFilter(sid, host, harness), vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "message"}})
 	hits, err := s.vectorSearch(vectorSearchRequest{
 		K:             limit,
 		Filter:        filter,
 		AfterTS:       afterTS,
 		AfterID:       afterID,
-		IncludeFields: []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role"},
+		IncludeFields: []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role", "record_kind", "parent_id", "chunk_index", "chunk_count"},
 	})
 	if err != nil {
 		errorJSON(w, http.StatusBadGateway, err)
@@ -591,6 +607,40 @@ func queryFilter(req queryRequest) *vectorFilter {
 	}
 }
 
+func appendFilter(base *vectorFilter, extra vectorFilter) *vectorFilter {
+	if base == nil {
+		return &extra
+	}
+	if len(base.And) > 0 {
+		parts := append([]vectorFilter{}, base.And...)
+		parts = append(parts, extra)
+		return &vectorFilter{And: parts}
+	}
+	return &vectorFilter{And: []vectorFilter{*base, extra}}
+}
+
+func collapseChunkHits(hits []queryResult, limit int) []queryResult {
+	seen := make(map[string]bool, len(hits))
+	out := make([]queryResult, 0, len(hits))
+	for _, hit := range hits {
+		parent, _ := hit.Metadata["parent_id"].(string)
+		if parent == "" {
+			parent = hit.ID
+		}
+		if seen[parent] {
+			continue
+		}
+		seen[parent] = true
+		hit.Metadata["matched_chunk_id"] = hit.ID
+		hit.ID = parent
+		out = append(out, hit)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out
+}
+
 func rrfMerge(a, b []queryResult, limit int) []queryResult {
 	const k = 60
 	score := map[string]float64{}
@@ -649,6 +699,32 @@ func (s *server) flushBatch(items []MemoryItem) error {
 		return err
 	}
 	slog.Info("flushed lance batch", "records", len(items))
+	return nil
+}
+
+func (s *server) flushDerived(messages, records []MemoryItem) error {
+	if len(records) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.mem != nil {
+		s.mem.upsert(records)
+	} else {
+		if s.lance == nil {
+			return errors.New("lance store is not initialized")
+		}
+		if err := s.lance.Upsert(context.Background(), records); err != nil {
+			return err
+		}
+	}
+	for _, message := range messages {
+		s.dedup.Mark(rawDerivedPath(message.Metadata.FilePath), message.Metadata.FileHash)
+	}
+	if err := s.dedup.Save(); err != nil {
+		return err
+	}
+	slog.Info("flushed derived lance batch", "messages", len(messages), "records", len(records))
 	return nil
 }
 

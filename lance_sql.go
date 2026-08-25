@@ -8,6 +8,7 @@ import (
 var lanceStringFields = map[string]bool{
 	"scope": true, "project_name": true, "file_path": true, "file_hash": true,
 	"session_id": true, "host": true, "harness": true, "role": true,
+	"record_kind": true, "parent_id": true,
 }
 
 func lanceQuote(value string) string {

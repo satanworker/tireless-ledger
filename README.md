@@ -6,7 +6,7 @@
 Mac JSONL -> R2 raw prefix -> pi-memoryd -> VPS llama.cpp -> R2 Lance table `turns`
 ```
 
-The live source of truth defaults to `s3://<bucket>/session-recall-lance-payload-id-v3/`. Set `PI_MEMORYD_S3_PREFIX` to select a different prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+The live source of truth defaults to `s3://<bucket>/session-recall-lance-token-chunks-v4/`. Set `PI_MEMORYD_S3_PREFIX` to select a different prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
 
 ## Builds
 
@@ -14,9 +14,18 @@ Production Linux/ARM64 builds use Docker. The image pins `lancedb-go` main, adva
 
 ```bash
 make secrets-decrypt
-docker compose build pi-memoryd
-docker compose up -d pi-memoryd
+make docker-build
+make up
 ```
+
+`make docker-build` always uses the persistent `tireless-limited` BuildKit
+builder. Its named Docker volume retains the Cargo registry, compiled Lance
+target, Go modules, and Go build cache across builder stops and VPS reboots.
+The builder is capped at 1 CPU, 3 GiB RAM, and 4 GiB including swap, then
+stopped after loading `pi-memoryd:local` into Docker. Normal deployment uses
+that saved image and does not rebuild it; run `make docker-build` only after
+source or dependency changes. Do not prune the builder cache volume unless a
+deliberate cold rebuild is acceptable.
 
 After a bulk ingest, run one offline maintenance pass to compact the final
 fragment tail and fold newly written rows into the existing FTS and scalar
@@ -67,7 +76,9 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 - Session walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
 - FTS index on `forward_content` and B-tree index on `session_id`.
 - One-row scan and dummy FTS warmup during startup.
-- Compact at 16 data fragments, then prune obsolete versions immediately.
+- Writes never run compaction or index refresh inline. Offline maintenance
+  compacts fragments, refreshes indexes, and prunes obsolete versions after
+  bulk ingestion and through the scheduled quiet-hours optimizer.
 
 ## HTTP API
 
@@ -99,7 +110,9 @@ The raw object layout is deliberately the only contract:
 <host>/codex/<any subdirectories>/<file>.jsonl
 ```
 
-Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, extracts user/assistant messages, embeds them through the local llama.cpp container, and merge-inserts stable message IDs. An object is recorded as indexed only after every batch is persisted. On a crash, the object is retried; already persisted messages are harmlessly skipped or upserted. Failed objects retry with bounded exponential backoff. Parser-version changes automatically reprocess the derived data.
+Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages. Every logical message is stored once, in full, as a canonical `message` row. The daemon uses llama.cpp's tokenizer to split the same text into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent message ID. Search runs over chunks and collapses hits by parent; session walking runs only over canonical messages, so reconstruction never contains chunk overlap or loses the tail of a long message.
+
+An object is recorded as indexed only after every derived row is persisted. On a crash, the object is retried; stable parent and chunk IDs make replay harmless. Failed objects retry with bounded exponential backoff. Parser/chunker-version changes automatically reprocess the derived data. The raw JSONL remains the source of truth for clean reindexing.
 
 The durable registry is `/data/raw_registry.json`. Inspect progress with:
 
@@ -129,7 +142,7 @@ It uploads the VPS's untouched session trees every minute; extraction and embedd
 | Variable | Purpose |
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
-| `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-payload-id-v3` |
+| `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-token-chunks-v4` |
 | `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to all 64 for exhaustive coverage |
 | `PI_MEMORYD_S3_BUCKET` | Compose bucket interpolation |
 | `PI_MEMORYD_S3_ENDPOINT` | R2 S3 endpoint; passed as Lance `aws_endpoint` |

@@ -20,7 +20,6 @@ import (
 
 const (
 	lanceTableName        = "turns"
-	lanceCompactFragments = 16
 	lanceVectorIndexName  = "vector_ivf_flat"
 	lanceVectorPartitions = uint32(64)
 	lanceVectorNProbes    = 64
@@ -28,7 +27,7 @@ const (
 
 var lanceOutputColumns = []string{
 	"id", "forward_content", "timestamp", "scope", "project_name", "file_path",
-	"file_hash", "session_id", "host", "harness", "role",
+	"file_hash", "session_id", "host", "harness", "role", "record_kind", "parent_id", "chunk_index", "chunk_count",
 }
 
 type cgoLanceStore struct {
@@ -108,6 +107,10 @@ func (s *cgoLanceStore) createTable(ctx context.Context) (contracts.ITable, erro
 		{Name: "host", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "harness", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "role", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "record_kind", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "parent_id", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "chunk_index", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
 	}
 	schema, err := lancedb.NewSchema(arrow.NewSchema(fields, nil))
 	if err != nil {
@@ -281,42 +284,11 @@ func (s *cgoLanceStore) DeleteHost(ctx context.Context, host string) (int, error
 }
 
 func (s *cgoLanceStore) Upsert(ctx context.Context, items []MemoryItem) error {
-	counter := s.table.(lanceFragmentCounter)
-	_, err := counter.FragmentCount(ctx)
-	if err != nil {
-		return fmt.Errorf("count fragments before write: %w", err)
-	}
 	rec := lanceRecord(items, s.dims)
 	defer rec.Release()
 	if _, err := s.table.MergeInsert([]string{"id"}).WhenMatchedUpdateAll(nil).WhenNotMatchedInsertAll().Execute(ctx, []arrow.Record{rec}); err != nil {
 		return fmt.Errorf("merge insert: %w", err)
 	}
-	fragments, err := counter.FragmentCount(ctx)
-	if err != nil {
-		slog.Warn("lance fragment count failed; write is persisted", "err", err)
-		return nil
-	}
-	if fragments < lanceCompactFragments {
-		return nil
-	}
-	stats, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{Kind: contracts.OptimizeCompact})
-	if err != nil {
-		slog.Warn("lance compaction failed; write is persisted", "fragments", fragments, "err", err)
-		return nil
-	}
-	if _, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{Kind: contracts.OptimizeIndex}); err != nil {
-		slog.Warn("lance index refresh failed; write is persisted", "err", err)
-		return nil
-	}
-	deleteUnverified := true
-	if _, err := s.table.OptimizeWithAction(ctx, contracts.OptimizeAction{
-		Kind:  contracts.OptimizePrune,
-		Prune: contracts.PruneParams{OlderThan: 0, DeleteUnverified: &deleteUnverified},
-	}); err != nil {
-		slog.Warn("lance prune failed; write is persisted", "err", err)
-		return nil
-	}
-	slog.Info("compacted lance fragments", "before", fragments, "stats", stats)
 	return nil
 }
 
@@ -335,7 +307,11 @@ func lanceRecord(items []MemoryItem, dims int) arrow.Record {
 	host := array.NewStringBuilder(pool)
 	harness := array.NewStringBuilder(pool)
 	role := array.NewStringBuilder(pool)
-	builders := []array.Builder{id, vector, content, scope, project, path, hash, timestamp, session, host, harness, role}
+	kind := array.NewStringBuilder(pool)
+	parent := array.NewStringBuilder(pool)
+	chunkIndex := array.NewInt64Builder(pool)
+	chunkCount := array.NewInt64Builder(pool)
+	builders := []array.Builder{id, vector, content, scope, project, path, hash, timestamp, session, host, harness, role, kind, parent, chunkIndex, chunkCount}
 	defer func() {
 		for _, builder := range builders {
 			builder.Release()
@@ -355,6 +331,10 @@ func lanceRecord(items []MemoryItem, dims int) arrow.Record {
 		host.Append(item.Metadata.Host)
 		harness.Append(item.Metadata.Harness)
 		role.Append(item.Metadata.Role)
+		kind.Append(item.Metadata.RecordKind)
+		parent.Append(item.Metadata.ParentID)
+		chunkIndex.Append(item.Metadata.ChunkIndex)
+		chunkCount.Append(item.Metadata.ChunkCount)
 	}
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.BinaryTypes.String, Nullable: true},
@@ -369,10 +349,15 @@ func lanceRecord(items []MemoryItem, dims int) arrow.Record {
 		{Name: "host", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "harness", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "role", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "record_kind", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "parent_id", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "chunk_index", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
 	}, nil)
 	arrays := []arrow.Array{
 		id.NewArray(), vector.NewArray(), content.NewArray(), scope.NewArray(), project.NewArray(), path.NewArray(),
 		hash.NewArray(), timestamp.NewArray(), session.NewArray(), host.NewArray(), harness.NewArray(), role.NewArray(),
+		kind.NewArray(), parent.NewArray(), chunkIndex.NewArray(), chunkCount.NewArray(),
 	}
 	record := array.NewRecord(schema, arrays, int64(len(items)))
 	for _, values := range arrays {

@@ -49,6 +49,9 @@ func (m *memStore) bySession(sessionID, host, harness string, afterTS int64, aft
 		if it.Metadata.SessionID != sessionID {
 			continue
 		}
+		if it.Metadata.RecordKind != "" && it.Metadata.RecordKind != "message" {
+			continue
+		}
 		if host != "" && it.Metadata.Host != host {
 			continue
 		}
@@ -72,6 +75,10 @@ func (m *memStore) bySession(sessionID, host, harness string, afterTS int64, aft
 				"host":         it.Metadata.Host,
 				"harness":      it.Metadata.Harness,
 				"role":         it.Metadata.Role,
+				"record_kind":  it.Metadata.RecordKind,
+				"parent_id":    it.Metadata.ParentID,
+				"chunk_index":  it.Metadata.ChunkIndex,
+				"chunk_count":  it.Metadata.ChunkCount,
 			},
 		})
 	}
@@ -153,6 +160,10 @@ func (m *memStore) search(req vectorSearchRequest) []queryResult {
 				"host":         h.item.Metadata.Host,
 				"harness":      h.item.Metadata.Harness,
 				"role":         h.item.Metadata.Role,
+				"record_kind":  h.item.Metadata.RecordKind,
+				"parent_id":    h.item.Metadata.ParentID,
+				"chunk_index":  h.item.Metadata.ChunkIndex,
+				"chunk_count":  h.item.Metadata.ChunkCount,
 			},
 		})
 	}
@@ -191,6 +202,8 @@ func memMatch(it MemoryItem, f *vectorFilter) bool {
 		got = it.Metadata.Role
 	case "file_path":
 		got = it.Metadata.FilePath
+	case "record_kind":
+		got = it.Metadata.RecordKind
 	default:
 		return true
 	}

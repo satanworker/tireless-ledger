@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const rawParserVersion = "session-jsonl-v1"
+const rawParserVersion = "session-jsonl-v2-token-chunks-384-64"
 
 var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", "<INSTRUCTIONS>"}
 
@@ -115,6 +115,7 @@ func rawTurn(host, harness, sessionID, turnID, role, text string, timestamp int6
 		Metadata: Metadata{
 			Scope: ScopeSession, ProjectName: project, FilePath: host + "/" + harness + "/" + sessionID + "/" + turnID,
 			FileHash: hashText(text), Timestamp: timestamp, SessionID: sessionID, Host: host, Harness: harness, Role: role,
+			RecordKind: "message",
 		},
 	}
 }

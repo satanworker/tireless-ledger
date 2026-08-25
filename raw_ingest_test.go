@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -25,6 +28,34 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
+func testTokenResponse(req *http.Request) (*http.Response, error) {
+	var in struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
+		return nil, err
+	}
+	tokens := make([]int, len(strings.Fields(in.Content)))
+	b, _ := json.Marshal(map[string]interface{}{"tokens": tokens})
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(b)), Header: make(http.Header)}, nil
+}
+
+func testEmbeddingResponse(req *http.Request, dims int) (*http.Response, error) {
+	var in struct {
+		Input []string `json:"input"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
+		return nil, err
+	}
+	data := make([]map[string]interface{}, len(in.Input))
+	for i := range data {
+		vector := make([]float32, dims)
+		data[i] = map[string]interface{}{"index": i, "embedding": vector}
+	}
+	b, _ := json.Marshal(map[string]interface{}{"data": data})
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(b)), Header: make(http.Header)}, nil
+}
+
 func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	body := []byte("{\"type\":\"session\",\"id\":\"s1\",\"cwd\":\"/repo/project\"}\n" +
 		"{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Remember the exact original text.\"}]}}\n")
@@ -38,8 +69,11 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &rawIngestor{server: s, store: store, registry: registry, http: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"index":0,"embedding":[0.1,0.2]}]}`)), Header: make(http.Header)}, nil
+	r := &rawIngestor{server: s, store: store, registry: registry, http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/tokenize" {
+			return testTokenResponse(req)
+		}
+		return testEmbeddingResponse(req, 2)
 	})}}
 	s.raw = r
 	r.scan(context.Background())
@@ -49,14 +83,14 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	if store.gets != 1 {
 		t.Fatalf("gets=%d", store.gets)
 	}
-	if len(s.mem.items) != 1 {
+	if len(s.mem.items) != 2 {
 		t.Fatalf("indexed=%d", len(s.mem.items))
 	}
 	r.scan(context.Background())
 	if store.gets != 1 {
 		t.Fatalf("completed object downloaded again: gets=%d", store.gets)
 	}
-	if len(s.mem.items) != 1 {
+	if len(s.mem.items) != 2 {
 		t.Fatalf("duplicate rows=%d", len(s.mem.items))
 	}
 
@@ -68,14 +102,71 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	if store.gets != 2 {
 		t.Fatalf("parser upgrade was not replayed: gets=%d", store.gets)
 	}
-	if len(s.mem.items) != 1 {
+	if len(s.mem.items) != 2 {
 		t.Fatalf("replay duplicated rows=%d", len(s.mem.items))
 	}
 }
 
-func TestTruncateRunesDoesNotSplitUTF8(t *testing.T) {
-	if got := truncateRunes("ab🙂cd", 3); got != "ab🙂" {
-		t.Fatalf("got=%q", got)
+func TestTokenChunksCoverEntireMessageWithOverlap(t *testing.T) {
+	words := make([]string, 900)
+	for i := range words {
+		words[i] = fmt.Sprintf("word%04d", i)
+	}
+	words[len(words)-1] = "TAIL_SENTINEL"
+	text := strings.Join(words, " ")
+	r := &rawIngestor{server: testServer(), http: &http.Client{Transport: roundTripFunc(testTokenResponse)}}
+	chunks, err := r.splitTokenChunks(context.Background(), text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 3 {
+		t.Fatalf("chunks=%d", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if got := len(strings.Fields(chunk)); got > embedChunkTokens {
+			t.Fatalf("chunk[%d] tokens=%d", i, got)
+		}
+	}
+	if !strings.Contains(chunks[len(chunks)-1], "TAIL_SENTINEL") {
+		t.Fatalf("tail missing from final chunk")
+	}
+	if !strings.Contains(chunks[0], strings.Fields(chunks[1])[0]) {
+		t.Fatalf("expected overlap between first two chunks")
+	}
+}
+
+func TestLongMessageTailIsSearchableAndSessionKeepsOriginal(t *testing.T) {
+	words := make([]string, 900)
+	for i := range words {
+		words[i] = fmt.Sprintf("detail%04d", i)
+	}
+	words[len(words)-1] = "TAIL_SEMANTIC_FACT"
+	text := strings.Join(words, " ")
+	s := testServer()
+	s.dedup.Path = t.TempDir() + "/dedup.json"
+	s.cfg.EmbedURL, s.cfg.EmbedBatchSize = "http://embed", 32
+	r := &rawIngestor{server: s, http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/tokenize" {
+			return testTokenResponse(req)
+		}
+		return testEmbeddingResponse(req, 2)
+	})}}
+	message := rawTurn("mbp14", "pi", "session-long", "turn-long", "assistant", text, 123, "project")
+	if err := r.indexMessages(context.Background(), []MemoryItem{message}); err != nil {
+		t.Fatal(err)
+	}
+	hits := s.mem.search(vectorSearchRequest{
+		BM25:   &bm25Query{Field: "forward_content", Query: "TAIL_SEMANTIC_FACT"},
+		K:      10,
+		Filter: &vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "chunk"}},
+	})
+	hits = collapseChunkHits(hits, 5)
+	if len(hits) != 1 || hits[0].ID != message.ID {
+		t.Fatalf("tail hits=%+v", hits)
+	}
+	walk := s.mem.bySession("session-long", "mbp14", "pi", 0, "", 10)
+	if len(walk) != 1 || walk[0].ForwardContent != text {
+		t.Fatalf("session reconstruction changed: rows=%d", len(walk))
 	}
 }
 
@@ -102,13 +193,16 @@ func TestRawIngestRetriesFailedEmbedding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls := 0
-	r := &rawIngestor{server: s, store: store, registry: registry, http: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		calls++
-		if calls == 1 {
+	embedCalls := 0
+	r := &rawIngestor{server: s, store: store, registry: registry, http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/tokenize" {
+			return testTokenResponse(req)
+		}
+		embedCalls++
+		if embedCalls == 1 {
 			return &http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader("not ready")), Header: make(http.Header)}, nil
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"index":0,"embedding":[0.1,0.2]}]}`)), Header: make(http.Header)}, nil
+		return testEmbeddingResponse(req, 2)
 	})}}
 	r.scan(context.Background())
 	entry := registry.Objects[obj.Key]
@@ -118,7 +212,7 @@ func TestRawIngestRetriesFailedEmbedding(t *testing.T) {
 	entry.UpdatedAt = entry.UpdatedAt.Add(-time.Minute)
 	registry.Objects[obj.Key] = entry
 	r.scan(context.Background())
-	if !registry.Done(obj) || len(s.mem.items) != 1 || calls != 2 {
-		t.Fatalf("entry=%+v rows=%d calls=%d", registry.Objects[obj.Key], len(s.mem.items), calls)
+	if !registry.Done(obj) || len(s.mem.items) != 2 || embedCalls != 2 {
+		t.Fatalf("entry=%+v rows=%d calls=%d", registry.Objects[obj.Key], len(s.mem.items), embedCalls)
 	}
 }

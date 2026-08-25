@@ -6,6 +6,8 @@ UPLOAD_BIN     ?= $(BIN_DIR)/tireless-upload
 INSTALL_DIR    ?= $(HOME)/.local/bin
 DATA_DIR       ?= $(HOME)/.local/share/pi-memoryd
 PREFIX         ?= $(HOME)/.local
+BUILDX_BUILDER ?= tireless-limited
+DOCKER_IMAGE   ?= pi-memoryd:local
 
 # Native Mac (or host) build: static-ish, stripped, reproducible paths.
 GO_ENV         ?= CGO_ENABLED=0
@@ -97,10 +99,14 @@ doctor:
 
 ## Optional: Linux/server only. Not the Mac path.
 docker-build:
-	docker compose build
+	@docker buildx inspect $(BUILDX_BUILDER) >/dev/null 2>&1 || \
+		docker buildx create --name $(BUILDX_BUILDER) --driver docker-container \
+			--driver-opt memory=3g,memory-swap=4g,cpu-quota=100000,cpu-period=100000
+	docker buildx build --builder $(BUILDX_BUILDER) --load --tag $(DOCKER_IMAGE) .
+	docker buildx stop $(BUILDX_BUILDER) >/dev/null
 
 up: secrets-decrypt
-	docker compose up -d --build
+	docker compose up -d --no-build
 
 down:
 	docker compose down
