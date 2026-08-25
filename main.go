@@ -100,6 +100,7 @@ type bm25Query struct {
 }
 
 type vectorSearchRequest struct {
+	Table         string        `json:"-"`
 	Vector        []float32     `json:"vector,omitempty"`
 	BM25          *bm25Query    `json:"bm25,omitempty"`
 	K             int           `json:"k"`
@@ -129,6 +130,7 @@ type server struct {
 	cfg        runtimeConfig
 	dedup      *dedupState
 	writeMu    sync.Mutex
+	querySlots chan struct{}
 	mem        *memStore
 	lance      lanceStore
 	readyCheck func(context.Context) error
@@ -142,6 +144,13 @@ type runtimeConfig struct {
 	S3Endpoint        string
 	Dimensions        int
 	VectorNProbes     int
+	SplitTables       bool
+	DualWriteSplit    bool
+	MigrateSplit      bool
+	PrintFragments    bool
+	MigrationBatch    int
+	MaxConcurrent     int
+	QueryTimeout      time.Duration
 	StatePath         string
 	DryRunS3          bool
 	Optimize          bool
@@ -151,6 +160,7 @@ type runtimeConfig struct {
 	DeleteHost        string
 	RawURL            string
 	RawPollInterval   time.Duration
+	RawWriteInterval  time.Duration
 	RawMaxObjectBytes int64
 	EmbedURL          string
 	EmbedBatchSize    int
@@ -171,6 +181,8 @@ type lanceStore interface {
 	DropVectorIndex(context.Context) error
 	AuditDuplicates(context.Context) (duplicateAudit, error)
 	DeleteHost(context.Context, string) (int, error)
+	MigrateSplit(context.Context, int, string) error
+	FragmentCounts(context.Context) (map[string]int, error)
 }
 
 func main() {
@@ -193,8 +205,9 @@ func main() {
 	}
 
 	s := &server{
-		cfg:   cfg,
-		dedup: state,
+		cfg:        cfg,
+		dedup:      state,
+		querySlots: make(chan struct{}, cfg.MaxConcurrent),
 	}
 	if local {
 		s.mem = newMemStore(cfg.Dimensions)
@@ -209,9 +222,10 @@ func main() {
 		}
 		defer s.lance.Close()
 		s.readyCheck = func(ctx context.Context) error {
-			_, err := s.lance.Search(ctx, vectorSearchRequest{
-				BM25: &bm25Query{Field: "forward_content", Query: "warmup"},
-				K:    1,
+			_, err := s.runSearch(ctx, vectorSearchRequest{
+				Table: "chunks",
+				BM25:  &bm25Query{Field: "forward_content", Query: "warmup"},
+				K:     1,
 			})
 			return err
 		}
@@ -285,7 +299,25 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		if cfg.Optimize || cfg.CreateVectorIndex || cfg.DropVectorIndex || cfg.AuditDuplicates || cfg.DeleteHost != "" {
+		if cfg.MigrateSplit {
+			checkpoint := filepath.Join(filepath.Dir(cfg.StatePath), "split_migration.json")
+			if err := s.lance.MigrateSplit(context.Background(), cfg.MigrationBatch, checkpoint); err != nil {
+				slog.Error("migrate split tables", "err", err)
+				os.Exit(1)
+			}
+		}
+		if cfg.PrintFragments {
+			counts, err := s.lance.FragmentCounts(context.Background())
+			if err != nil {
+				slog.Error("count fragments", "err", err)
+				os.Exit(1)
+			}
+			if err := json.NewEncoder(os.Stdout).Encode(counts); err != nil {
+				slog.Error("encode fragment counts", "err", err)
+				os.Exit(1)
+			}
+		}
+		if cfg.Optimize || cfg.CreateVectorIndex || cfg.DropVectorIndex || cfg.AuditDuplicates || cfg.DeleteHost != "" || cfg.MigrateSplit || cfg.PrintFragments {
 			return
 		}
 	}
@@ -322,6 +354,13 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.S3Endpoint, "s3-endpoint", env("PI_MEMORYD_S3_ENDPOINT", env("AWS_ENDPOINT_URL", env("AWS_ENDPOINT", ""))), "S3-compatible endpoint URL")
 	flag.IntVar(&cfg.Dimensions, "dimensions", envInt("PI_MEMORYD_DIMENSIONS", 384), "vector dimensions")
 	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 64), "IVF partitions scanned per vector query")
+	flag.BoolVar(&cfg.SplitTables, "split-tables", envBool("PI_MEMORYD_SPLIT_TABLES", false), "serve separate messages and chunks tables")
+	flag.BoolVar(&cfg.DualWriteSplit, "dual-write-split", envBool("PI_MEMORYD_DUAL_WRITE_SPLIT", false), "write legacy and split tables while serving legacy")
+	flag.BoolVar(&cfg.MigrateSplit, "migrate-split", false, "copy legacy turns into split tables and exit")
+	flag.BoolVar(&cfg.PrintFragments, "fragment-counts", false, "print active table fragment counts and exit")
+	flag.IntVar(&cfg.MigrationBatch, "migration-batch", envInt("PI_MEMORYD_MIGRATION_BATCH", 1024), "rows per resumable split migration batch")
+	flag.IntVar(&cfg.MaxConcurrent, "max-concurrent-queries", envInt("PI_MEMORYD_MAX_CONCURRENT_QUERIES", 2), "maximum in-flight Lance searches")
+	flag.DurationVar(&cfg.QueryTimeout, "query-timeout", envDuration("PI_MEMORYD_QUERY_TIMEOUT", 30*time.Second), "server-side recall query timeout")
 	flag.StringVar(&cfg.StatePath, "state", env("PI_MEMORYD_STATE", "./data/dedup_state.json"), "dedup state path")
 	flag.BoolVar(&cfg.DryRunS3, "dry-run-s3", envBool("PI_MEMORYD_DRY_RUN_S3", false), "skip AWS SDK S3 validation")
 	flag.BoolVar(&cfg.Optimize, "optimize", false, "compact data, refresh indexes, prune old versions, and exit")
@@ -331,10 +370,17 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.DeleteHost, "delete-host", "", "delete every row and dedup entry for exactly this host, then exit")
 	flag.StringVar(&cfg.RawURL, "raw-url", env("PI_MEMORYD_RAW_URL", ""), "optional S3 prefix containing raw session files")
 	flag.DurationVar(&cfg.RawPollInterval, "raw-poll-interval", envDuration("PI_MEMORYD_RAW_POLL_INTERVAL", 30*time.Second), "raw S3 polling interval")
+	flag.DurationVar(&cfg.RawWriteInterval, "raw-write-interval", envDuration("PI_MEMORYD_RAW_WRITE_INTERVAL", 5*time.Minute), "minimum interval between reindexing successive versions of a growing raw object")
 	flag.Int64Var(&cfg.RawMaxObjectBytes, "raw-max-object-bytes", envInt64("PI_MEMORYD_RAW_MAX_OBJECT_BYTES", 128<<20), "largest raw object accepted")
 	flag.StringVar(&cfg.EmbedURL, "embed-url", env("PI_MEMORYD_EMBED_URL", "http://llama-embed:8091"), "OpenAI-compatible embedding server")
 	flag.IntVar(&cfg.EmbedBatchSize, "embed-batch-size", envInt("PI_MEMORYD_EMBED_BATCH_SIZE", 32), "texts per embedding request")
 	flag.Parse()
+	if cfg.MaxConcurrent <= 0 {
+		cfg.MaxConcurrent = 1
+	}
+	if cfg.MigrationBatch <= 0 {
+		cfg.MigrationBatch = 1024
+	}
 	return cfg
 }
 
@@ -451,7 +497,10 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 	if req.Limit <= 0 {
 		req.Limit = 5
 	}
-	filter := appendFilter(queryFilter(req), vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "chunk"}})
+	filter := queryFilter(req)
+	if !s.cfg.SplitTables || s.mem != nil {
+		filter = appendFilter(filter, vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "chunk"}})
+	}
 	include := []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role", "record_kind", "parent_id", "chunk_index", "chunk_count"}
 	fetchK := req.Limit * 8
 	if fetchK < 50 {
@@ -476,16 +525,20 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	searchReq := vectorSearchRequest{K: fetchK, Filter: filter, IncludeFields: include}
+	searchReq := vectorSearchRequest{Table: "chunks", K: fetchK, Filter: filter, IncludeFields: include}
 	if hasVec {
 		searchReq.Vector = req.QueryVector
 	}
 	if hasText {
 		searchReq.BM25 = &bm25Query{Field: "forward_content", Query: req.QueryText}
 	}
-	hits, err := s.vectorSearch(searchReq)
+	hits, err := s.runSearch(r.Context(), searchReq)
 	if err != nil {
-		errorJSON(w, http.StatusBadGateway, err)
+		status := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		errorJSON(w, status, err)
 		return
 	}
 	out := queryResponse{Results: collapseChunkHits(hits, req.Limit)}
@@ -517,8 +570,12 @@ func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, queryResponse{Results: s.mem.bySession(sid, host, harness, afterTS, afterID, limit)})
 		return
 	}
-	filter := appendFilter(sessionWalkFilter(sid, host, harness), vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "message"}})
-	hits, err := s.vectorSearch(vectorSearchRequest{
+	filter := sessionWalkFilter(sid, host, harness)
+	if !s.cfg.SplitTables {
+		filter = appendFilter(filter, vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "message"}})
+	}
+	hits, err := s.runSearch(r.Context(), vectorSearchRequest{
+		Table:         "messages",
 		K:             limit,
 		Filter:        filter,
 		AfterTS:       afterTS,
@@ -526,7 +583,11 @@ func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
 		IncludeFields: []string{"forward_content", "scope", "project_name", "file_path", "file_hash", "timestamp", "session_id", "host", "harness", "role", "record_kind", "parent_id", "chunk_index", "chunk_count"},
 	})
 	if err != nil {
-		errorJSON(w, http.StatusBadGateway, err)
+		status := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		errorJSON(w, status, err)
 		return
 	}
 	sort.Slice(hits, func(i, j int) bool {
@@ -570,14 +631,55 @@ func metaTS(r queryResult) int64 {
 	}
 }
 
-func (s *server) vectorSearch(searchReq vectorSearchRequest) ([]queryResult, error) {
+func (s *server) vectorSearch(ctx context.Context, searchReq vectorSearchRequest) ([]queryResult, error) {
 	if s.mem != nil {
 		return s.mem.search(searchReq), nil
 	}
 	if s.lance == nil {
 		return nil, errors.New("lance store is not initialized")
 	}
-	return s.lance.Search(context.Background(), searchReq)
+	return s.lance.Search(ctx, searchReq)
+}
+
+type searchOutcome struct {
+	hits []queryResult
+	err  error
+}
+
+// runSearch bounds abandoned CGO searches. The current lancedb-go FFI does
+// not propagate Context cancellation into Rust, so a timed-out request keeps
+// its slot until the native operation actually returns instead of allowing an
+// unbounded pile-up of orphaned queries.
+func (s *server) runSearch(parent context.Context, req vectorSearchRequest) ([]queryResult, error) {
+	if s.querySlots == nil {
+		return s.vectorSearch(parent, req)
+	}
+	ctx := parent
+	cancel := func() {}
+	if s.cfg.QueryTimeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, s.cfg.QueryTimeout)
+	}
+	defer cancel()
+	select {
+	case s.querySlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	started := time.Now()
+	done := make(chan searchOutcome, 1)
+	go func() {
+		hits, err := s.vectorSearch(ctx, req)
+		<-s.querySlots
+		done <- searchOutcome{hits: hits, err: err}
+	}()
+	select {
+	case out := <-done:
+		slog.Info("recall query complete", "table", req.Table, "elapsed", time.Since(started), "fetch_k", req.K, "results", len(out.hits), "err", out.err)
+		return out.hits, out.err
+	case <-ctx.Done():
+		slog.Warn("recall query timed out; native work remains bounded", "table", req.Table, "elapsed", time.Since(started), "fetch_k", req.K)
+		return nil, ctx.Err()
+	}
 }
 
 func queryFilter(req queryRequest) *vectorFilter {

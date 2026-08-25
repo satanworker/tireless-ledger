@@ -14,6 +14,15 @@ fi
 cd "${project_dir}"
 
 service="pi-memoryd"
+fragment_threshold="${PI_MEMORYD_OPTIMIZE_FRAGMENT_THRESHOLD:-20}"
+fragment_json="$(docker compose run --rm --no-deps --no-TTY "${service}" --fragment-counts | tail -n 1)"
+max_fragments="$(python3 -c 'import json,sys; values=json.loads(sys.argv[1]).values(); print(max(values, default=0))' "${fragment_json}")"
+if (( max_fragments <= fragment_threshold )); then
+  echo "tireless-ledger fragments=${max_fragments}; threshold=${fragment_threshold}; skipping optimization"
+  exit 0
+fi
+
+echo "tireless-ledger fragments=${max_fragments}; threshold=${fragment_threshold}; optimizing"
 container_id="$(docker compose ps -q "${service}")"
 was_running=false
 if [[ -n "${container_id}" ]] && [[ "$(docker inspect --format '{{.State.Running}}' "${container_id}")" == "true" ]]; then

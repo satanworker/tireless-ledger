@@ -19,7 +19,8 @@ GOARCH         ?= $(shell go env GOARCH)
 .PHONY: all build build-native release test clean \
 	install uninstall run secrets-decrypt secrets-edit render-config \
 	docker-build up down doctor recall-local embed-local mac-test \
-	install-optimize-timer install-upload-timer build-uploader install-uploader-bin install-raw-uploader
+	install-optimize-timer install-upload-timer build-uploader install-uploader-bin install-raw-uploader \
+	fragment-counts migrate-split
 
 all: build
 
@@ -110,6 +111,14 @@ up: secrets-decrypt
 
 down:
 	docker compose down
+
+fragment-counts:
+	docker compose run --rm --no-deps --no-TTY pi-memoryd --fragment-counts
+
+# Resumable and idempotent: progress is checkpointed in the daemon data volume.
+# Production should be dual-writing before this copy begins.
+migrate-split:
+	docker compose run --rm --no-deps --no-TTY pi-memoryd --migrate-split
 
 install-optimize-timer:
 	./scripts/install-optimize-timer.sh

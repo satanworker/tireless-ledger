@@ -182,6 +182,38 @@ func TestRawRegistryRemoveHost(t *testing.T) {
 	}
 }
 
+func TestRawRegistryCoalescesGrowingIndexedObjects(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	old := rawObject{Key: "mac/codex/rollout.jsonl", ETag: "etag-1", Size: 100}
+	grown := rawObject{Key: old.Key, ETag: "etag-2", Size: 200}
+	r := &rawRegistry{Objects: map[string]rawRegistryEntry{
+		old.Key: {
+			ETag:          old.ETag,
+			Size:          old.Size,
+			Status:        "indexed",
+			ParserVersion: rawParserVersion,
+			UpdatedAt:     now,
+		},
+	}}
+
+	if r.Due(grown, now.Add(4*time.Minute), 5*time.Minute) {
+		t.Fatal("growing indexed object was due before the coalescing interval")
+	}
+	if !r.Due(grown, now.Add(5*time.Minute), 5*time.Minute) {
+		t.Fatal("growing indexed object was not due at the coalescing boundary")
+	}
+	if !r.Due(rawObject{Key: "mac/codex/new.jsonl", ETag: "new", Size: 1}, now, 5*time.Minute) {
+		t.Fatal("new objects must be indexed immediately")
+	}
+
+	entry := r.Objects[old.Key]
+	entry.ParserVersion = "previous-parser"
+	r.Objects[old.Key] = entry
+	if !r.Due(grown, now.Add(time.Second), 5*time.Minute) {
+		t.Fatal("parser upgrades must bypass write coalescing")
+	}
+}
+
 func TestRawIngestRetriesFailedEmbedding(t *testing.T) {
 	body := []byte("{\"type\":\"session\",\"id\":\"s1\"}\n" +
 		"{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"A retry must eventually succeed.\"}}\n")

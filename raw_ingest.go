@@ -146,11 +146,20 @@ func (r *rawRegistry) Done(obj rawObject) bool {
 	return ok && e.Status == "indexed" && e.ETag == obj.ETag && e.Size == obj.Size && e.ParserVersion == rawParserVersion
 }
 
-func (r *rawRegistry) Due(obj rawObject, now time.Time) bool {
+func (r *rawRegistry) Due(obj rawObject, now time.Time, writeInterval time.Duration) bool {
 	r.mu.RLock()
 	e, ok := r.Objects[obj.Key]
 	r.mu.RUnlock()
-	if !ok || e.ETag != obj.ETag || e.Size != obj.Size || e.ParserVersion != rawParserVersion {
+	if !ok || e.ParserVersion != rawParserVersion {
+		return true
+	}
+	if e.ETag != obj.ETag || e.Size != obj.Size {
+		// Growing rollout files may change every minute. Coalesce those
+		// versions so a handful of new turns do not create a new Lance
+		// fragment and invalidate caches on every raw-object scan.
+		if e.Status == "indexed" && writeInterval > 0 && now.Before(e.UpdatedAt.Add(writeInterval)) {
+			return false
+		}
 		return true
 	}
 	if e.Status == "indexed" {
@@ -303,7 +312,7 @@ func (r *rawIngestor) scan(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !r.registry.Due(obj, time.Now()) {
+		if !r.registry.Due(obj, time.Now(), r.server.cfg.RawWriteInterval) {
 			continue
 		}
 		if err := r.process(ctx, obj); err != nil {

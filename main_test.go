@@ -1,9 +1,41 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type blockingLanceStore struct {
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (b *blockingLanceStore) Close() error                               { return nil }
+func (b *blockingLanceStore) Upsert(context.Context, []MemoryItem) error { return nil }
+func (b *blockingLanceStore) Search(context.Context, vectorSearchRequest) ([]queryResult, error) {
+	b.calls.Add(1)
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+	<-b.release
+	return nil, nil
+}
+func (b *blockingLanceStore) Optimize(context.Context) error          { return nil }
+func (b *blockingLanceStore) CreateVectorIndex(context.Context) error { return nil }
+func (b *blockingLanceStore) DropVectorIndex(context.Context) error   { return nil }
+func (b *blockingLanceStore) AuditDuplicates(context.Context) (duplicateAudit, error) {
+	return duplicateAudit{}, nil
+}
+func (b *blockingLanceStore) DeleteHost(context.Context, string) (int, error) { return 0, nil }
+func (b *blockingLanceStore) MigrateSplit(context.Context, int, string) error { return nil }
+func (b *blockingLanceStore) FragmentCounts(context.Context) (map[string]int, error) {
+	return nil, nil
+}
 
 func TestParseS3URL(t *testing.T) {
 	bucket, prefix, err := parseS3URL("s3://prod-bucket/vector-index")
@@ -89,5 +121,39 @@ func TestQueryFilter(t *testing.T) {
 	f = queryFilter(queryRequest{Scope: "session_memory", SessionID: "abc"})
 	if f == nil || len(f.And) != 2 {
 		t.Fatalf("and=%+v", f)
+	}
+}
+
+func TestTimedOutNativeSearchKeepsConcurrencySlot(t *testing.T) {
+	store := &blockingLanceStore{started: make(chan struct{}, 2), release: make(chan struct{})}
+	s := &server{
+		cfg:        runtimeConfig{QueryTimeout: 20 * time.Millisecond},
+		querySlots: make(chan struct{}, 1),
+		lance:      store,
+	}
+
+	if _, err := s.runSearch(context.Background(), vectorSearchRequest{Table: "chunks", K: 1}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first search error=%v", err)
+	}
+	if got := store.calls.Load(); got != 1 {
+		t.Fatalf("native calls after first timeout=%d", got)
+	}
+	if _, err := s.runSearch(context.Background(), vectorSearchRequest{Table: "chunks", K: 1}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued search error=%v", err)
+	}
+	if got := store.calls.Load(); got != 1 {
+		t.Fatalf("queued timeout launched another native call: calls=%d", got)
+	}
+
+	close(store.release)
+	deadline := time.Now().Add(time.Second)
+	for len(s.querySlots) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(s.querySlots) != 0 {
+		t.Fatal("native slot was not released after the underlying call returned")
+	}
+	if _, err := s.runSearch(context.Background(), vectorSearchRequest{Table: "chunks", K: 1}); err != nil {
+		t.Fatalf("search after release=%v", err)
 	}
 }

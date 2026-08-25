@@ -3,7 +3,7 @@
 `pi-memoryd` is the single recall service for indexed Pi and Codex sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
 
 ```text
-Mac JSONL -> R2 raw prefix -> pi-memoryd -> VPS llama.cpp -> R2 Lance table `turns`
+Mac JSONL -> R2 raw prefix -> pi-memoryd -> VPS llama.cpp -> R2 Lance `chunks` + `messages`
 ```
 
 The live source of truth defaults to `s3://<bucket>/session-recall-lance-token-chunks-v4/`. Set `PI_MEMORYD_S3_PREFIX` to select a different prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
@@ -35,9 +35,10 @@ indexes:
 docker compose run --rm --no-deps pi-memoryd --optimize
 ```
 
-On the VPS this is automated by a persistent user timer. It runs daily at
-04:30 UTC with up to 15 minutes of randomized delay and catches up after
-downtime. Install or refresh it with:
+On the VPS this is automated by a persistent user timer. It checks every four
+hours (at `00,04,08,12,16,20:30` UTC, with up to 15 minutes of randomized
+delay) and catches up after downtime. The check is cheap and skips maintenance
+unless an active table has more than 20 fragments. Install or refresh it with:
 
 ```bash
 make install-optimize-timer
@@ -71,11 +72,13 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 
 ## Lance behavior
 
-- Merge-insert on `id`; an ingest response is successful only after persistence.
+- Merge-insert on stable `id`; an ingest response is successful only after persistence.
 - ANN, BM25, and combined hybrid search with LanceDB RRF.
+- Search reads only the `chunks` table; session walking reads only `messages`.
 - Session walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
-- FTS index on `forward_content` and B-tree index on `session_id`.
+- FTS/vector indexes exist only on searchable chunks; messages use scalar `session_id` and `id` indexes.
 - One-row scan and dummy FTS warmup during startup.
+- Concurrent native searches are bounded and timed out at the HTTP boundary; a timed-out CGO call keeps its slot until native work actually returns, preventing orphan-query pileups.
 - Writes never run compaction or index refresh inline. Offline maintenance
   compacts fragments, refreshes indexes, and prunes obsolete versions after
   bulk ingestion and through the scheduled quiet-hours optimizer.
@@ -112,7 +115,26 @@ The raw object layout is deliberately the only contract:
 
 Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages. Every logical message is stored once, in full, as a canonical `message` row. The daemon uses llama.cpp's tokenizer to split the same text into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent message ID. Search runs over chunks and collapses hits by parent; session walking runs only over canonical messages, so reconstruction never contains chunk overlap or loses the tail of a long message.
 
-An object is recorded as indexed only after every derived row is persisted. On a crash, the object is retried; stable parent and chunk IDs make replay harmless. Failed objects retry with bounded exponential backoff. Parser/chunker-version changes automatically reprocess the derived data. The raw JSONL remains the source of truth for clean reindexing.
+An object is recorded as indexed only after every derived row is persisted. On a crash, the object is retried; stable parent and chunk IDs make replay harmless. Growing files are coalesced for five minutes before their next derived write, reducing tiny Lance fragments without delaying new files. Failed objects retry with bounded exponential backoff. Parser/chunker-version changes automatically reprocess the derived data. The raw JSONL remains the source of truth for clean reindexing.
+
+## Split-table migration
+
+Existing `turns` rows can be copied into the split layout without downloading
+raw files or recomputing embeddings. The rollout is deliberately reversible:
+
+1. Run the new image with `PI_MEMORYD_DUAL_WRITE_SPLIT=true` and
+   `PI_MEMORYD_SPLIT_TABLES=false`. Reads stay on `turns`, while new writes also
+   land in `chunks` and `messages`.
+2. Run `make migrate-split`. It copies in 1,024-row batches with merge-insert on
+   stable IDs and saves `/data/split_migration.json` after every batch. Re-running
+   the command resumes the checkpoint and is safe after interruption.
+3. Create/refresh the chunk indexes, validate the shadow service, then set
+   `PI_MEMORYD_SPLIT_TABLES=true` while leaving dual-write enabled for the
+   rollback observation window. Disable dual-write only after that window.
+
+Keep the old `turns` table and previous image during the observation window;
+rolling back is an environment toggle and container restart, not another data
+rebuild.
 
 The durable registry is `/data/raw_registry.json`. Inspect progress with:
 
@@ -144,6 +166,11 @@ It uploads the VPS's untouched session trees every minute; extraction and embedd
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
 | `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-token-chunks-v4` |
 | `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned per dense query; defaults to all 64 for exhaustive coverage |
+| `PI_MEMORYD_SPLIT_TABLES` | Read/write separate `chunks` and `messages` tables; production default `true` |
+| `PI_MEMORYD_DUAL_WRITE_SPLIT` | Write both legacy and split layouts regardless of which layout serves reads; production default `true` for rollback safety |
+| `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable legacy-to-split copy batch; default `1024` |
+| `PI_MEMORYD_MAX_CONCURRENT_QUERIES` | Maximum native Lance searches in flight; default `2` |
+| `PI_MEMORYD_QUERY_TIMEOUT` | HTTP-side query deadline; default `30s` |
 | `PI_MEMORYD_S3_BUCKET` | Compose bucket interpolation |
 | `PI_MEMORYD_S3_ENDPOINT` | R2 S3 endpoint; passed as Lance `aws_endpoint` |
 | `PI_MEMORYD_KEY_ID` | R2 access key ID |
@@ -153,6 +180,7 @@ It uploads the VPS's untouched session trees every minute; extraction and embedd
 | `PI_MEMORYD_STATE` | Local dedup registry path |
 | `PI_MEMORYD_RAW_URL` | Raw session prefix, e.g. `s3://bucket/session-recall-raw-v1` |
 | `PI_MEMORYD_RAW_POLL_INTERVAL` | Raw object scan interval, default `30s` |
+| `PI_MEMORYD_RAW_WRITE_INTERVAL` | Minimum rewrite interval for an already-indexed growing object, default `5m` |
 | `PI_MEMORYD_RAW_MAX_OBJECT_BYTES` | Per-object safety limit, default `128 MiB` |
 | `PI_MEMORYD_EMBED_URL` | VPS embedding service, default `http://llama-embed:8091` |
 
