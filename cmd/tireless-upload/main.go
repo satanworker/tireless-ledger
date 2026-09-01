@@ -16,7 +16,7 @@ import (
 )
 
 type settings struct {
-	rawURL, endpoint, region, host, piRoot, codexRoot string
+	rawURL, endpoint, region, host, piRoot, codexRoot, ompRoot string
 }
 
 func main() {
@@ -29,6 +29,7 @@ func main() {
 	flag.StringVar(&cfg.host, "host", env("TIRELESS_UPLOAD_HOST", hostname), "stable device name")
 	flag.StringVar(&cfg.piRoot, "pi", env("TIRELESS_PI_SESSIONS", filepath.Join(home, ".pi", "agent", "sessions")), "Pi sessions directory")
 	flag.StringVar(&cfg.codexRoot, "codex", env("TIRELESS_CODEX_SESSIONS", filepath.Join(home, ".codex", "sessions")), "Codex sessions directory")
+	flag.StringVar(&cfg.ompRoot, "omp", env("TIRELESS_OMP_SESSIONS", filepath.Join(home, ".omp", "agent", "sessions")), "OMP sessions directory")
 	flag.Parse()
 	if err := run(context.Background(), cfg); err != nil {
 		log.Fatal(err)
@@ -57,7 +58,7 @@ func run(ctx context.Context, cfg settings) error {
 		}
 	})
 	totalScanned, totalUploaded := 0, 0
-	for _, source := range []struct{ harness, root string }{{"pi", cfg.piRoot}, {"codex", cfg.codexRoot}} {
+	for _, source := range []struct{ harness, root string }{{"pi", cfg.piRoot}, {"codex", cfg.codexRoot}, {"omp", cfg.ompRoot}} {
 		scanned, uploaded, err := syncTree(ctx, client, bucket, prefix, cfg.host, source.harness, source.root)
 		if err != nil {
 			return err

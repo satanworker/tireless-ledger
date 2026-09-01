@@ -107,6 +107,39 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestRawIngestScanIndexesOmpObject(t *testing.T) {
+	body := []byte("{\"type\":\"session\",\"id\":\"omp-s1\",\"cwd\":\"/repo/omp-project\"}\n" +
+		"{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Index this OMP user turn.\"}]}}\n")
+	obj := rawObject{Key: "mac/omp/s1.jsonl", ETag: "etag-omp", Size: int64(len(body))}
+	store := &fakeRawStore{objects: []rawObject{obj}, bodies: map[string][]byte{obj.Key: body}}
+	s := testServer()
+	s.cfg.RawMaxObjectBytes = 1 << 20
+	s.cfg.EmbedBatchSize = 32
+	s.cfg.EmbedURL = "http://embed"
+	registry, err := loadRawRegistry(t.TempDir() + "/raw.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &rawIngestor{server: s, store: store, registry: registry, http: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"index":0,"embedding":[0.1,0.2]}]}`)), Header: make(http.Header)}, nil
+	})}}
+	s.raw = r
+	r.scan(context.Background())
+	if !registry.Done(obj) {
+		t.Fatalf("registry=%+v", registry.Objects[obj.Key])
+	}
+	var found bool
+	for _, item := range s.mem.items {
+		if item.Metadata.Harness == "omp" && item.Metadata.SessionID == "omp-s1" && item.Metadata.ProjectName == "omp-project" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing OMP item in indexed metadata: %+v", s.mem.items)
+	}
+}
+
 func TestTokenChunksCoverEntireMessageWithOverlap(t *testing.T) {
 	words := make([]string, 900)
 	for i := range words {

@@ -1,6 +1,6 @@
 # pi-memoryd
 
-`pi-memoryd` is the single recall service for indexed Pi and Codex sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
+`pi-memoryd` is the single recall service for indexed Pi, Codex, and OMP sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
 
 ```text
 Mac JSONL -> R2 raw prefix -> pi-memoryd -> VPS llama.cpp -> R2 Lance `chunks` + `messages`
@@ -146,6 +146,7 @@ The raw object layout is deliberately the only contract:
 ```text
 <host>/pi/<any subdirectories>/<file>.jsonl
 <host>/codex/<any subdirectories>/<file>.jsonl
+<host>/omp/<any subdirectories>/<file>.jsonl
 ```
 
 Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages. Every logical message is stored once, in full, as a canonical `message` row. The daemon uses llama.cpp's tokenizer to split the same text into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent message ID. Search runs over chunks and collapses hits by parent; session walking runs only over canonical messages, so reconstruction never contains chunk overlap or loses the tail of a long message.

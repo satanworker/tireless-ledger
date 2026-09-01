@@ -19,14 +19,14 @@ var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", 
 func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 	host, harness, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp>/<path>.jsonl")
 	}
 	return parseSessionJSONL(body, host, harness, key)
 }
 
 func rawObjectIdentity(key string) (host, harness string, ok bool) {
 	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
-	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
+	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
 		return "", "", false
 	}
 	return parts[0], parts[1], true
@@ -50,7 +50,7 @@ func parseSessionJSONL(body []byte, host, harness, source string) ([]MemoryItem,
 		if json.Unmarshal(line, &obj) != nil {
 			continue
 		}
-		if harness == "pi" {
+		if harness == "pi" || harness == "omp" {
 			if stringField(obj, "type") == "session" {
 				sessionID = valueOr(stringField(obj, "id"), sessionID)
 				project = projectFromCWD(stringField(obj, "cwd"))
