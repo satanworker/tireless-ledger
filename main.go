@@ -568,6 +568,17 @@ func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
 	afterID := q.Get("after_id")
 	host := strings.TrimSpace(q.Get("host"))
 	harness := strings.TrimSpace(q.Get("harness"))
+	if s.raw != nil {
+		results, ok, err := s.raw.sessionWalk(r.Context(), sid, host, harness, afterTS, afterID, limit)
+		if err != nil {
+			errorJSON(w, http.StatusBadGateway, err)
+			return
+		}
+		if ok {
+			writeJSON(w, http.StatusOK, queryResponse{Results: results})
+			return
+		}
+	}
 	if s.mem != nil {
 		writeJSON(w, http.StatusOK, queryResponse{Results: s.mem.bySession(sid, host, harness, afterTS, afterID, limit)})
 		return

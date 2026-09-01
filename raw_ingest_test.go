@@ -140,6 +140,47 @@ func TestRawIngestScanIndexesOmpObject(t *testing.T) {
 	}
 }
 
+func TestRawSessionWalkUsesUntouchedObject(t *testing.T) {
+	body := []byte("{\"type\":\"session\",\"id\":\"omp-walk\",\"cwd\":\"/repo/raw-walk\"}\n" +
+		"{\"type\":\"message\",\"id\":\"u1\",\"timestamp\":\"2026-09-01T18:20:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"First raw message stays exact.\"}]}}\n" +
+		"{\"type\":\"message\",\"id\":\"a1\",\"timestamp\":\"2026-09-01T18:20:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Second raw message stays exact.\"}]}}\n")
+	obj := rawObject{Key: "mac/omp/raw-walk.jsonl", ETag: "etag-walk", Size: int64(len(body))}
+	store := &fakeRawStore{objects: []rawObject{obj}, bodies: map[string][]byte{obj.Key: body}}
+	s := testServer()
+	s.cfg.RawMaxObjectBytes = 1 << 20
+	s.cfg.EmbedBatchSize = 32
+	s.cfg.EmbedURL = "http://embed"
+	registry, err := loadRawRegistry(t.TempDir() + "/raw.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &rawIngestor{server: s, store: store, registry: registry, http: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"index":0,"embedding":[0.1,0.2]},{"index":1,"embedding":[0.2,0.1]}]}`)), Header: make(http.Header)}, nil
+	})}}
+	r.scan(context.Background())
+	if got := registry.Objects[obj.Key].SessionIDs; len(got) != 1 || got[0] != "omp-walk" {
+		t.Fatalf("session ids=%v", got)
+	}
+	s.mem.items = map[string]MemoryItem{}
+	results, ok, err := r.sessionWalk(context.Background(), "omp-walk", "mac", "omp", 0, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(results) != 2 {
+		t.Fatalf("ok=%v results=%+v", ok, results)
+	}
+	if results[0].ForwardContent != "First raw message stays exact." || results[1].ForwardContent != "Second raw message stays exact." {
+		t.Fatalf("results=%+v", results)
+	}
+	page, ok, err := r.sessionWalk(context.Background(), "omp-walk", "mac", "omp", metaTS(results[0]), results[0].ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(page) != 1 || page[0].ID != results[1].ID {
+		t.Fatalf("page=%+v ok=%v", page, ok)
+	}
+}
+
 func TestTokenChunksCoverEntireMessageWithOverlap(t *testing.T) {
 	words := make([]string, 900)
 	for i := range words {

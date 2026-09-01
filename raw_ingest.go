@@ -113,6 +113,7 @@ type rawRegistryEntry struct {
 	Attempts      int       `json:"attempts,omitempty"`
 	Error         string    `json:"error,omitempty"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	SessionIDs    []string  `json:"session_ids,omitempty"`
 }
 
 type rawRegistry struct {
@@ -178,7 +179,7 @@ func (r *rawRegistry) Due(obj rawObject, now time.Time, writeInterval time.Durat
 	return !now.Before(e.UpdatedAt.Add(delay))
 }
 
-func (r *rawRegistry) set(obj rawObject, status string, records int, setErr error) error {
+func (r *rawRegistry) set(obj rawObject, status string, records int, setErr error, sessionIDs []string) error {
 	r.mu.Lock()
 	entry := r.Objects[obj.Key]
 	if entry.ETag != obj.ETag || entry.Size != obj.Size || entry.ParserVersion != rawParserVersion {
@@ -186,6 +187,9 @@ func (r *rawRegistry) set(obj rawObject, status string, records int, setErr erro
 		entry.Records = 0
 	}
 	entry.ETag, entry.Size, entry.Status, entry.ParserVersion = obj.ETag, obj.Size, status, rawParserVersion
+	if len(sessionIDs) > 0 {
+		entry.SessionIDs = uniqueStrings(sessionIDs)
+	}
 	entry.Records, entry.UpdatedAt = records, time.Now().UTC()
 	if status == "processing" {
 		entry.Attempts++
@@ -245,6 +249,151 @@ func (r *rawRegistry) RemoveHost(host string) int {
 		}
 	}
 	return removed
+}
+
+func (r *rawRegistry) keysForSession(sessionID, host, harness string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	keys := make([]string, 0)
+	for key, entry := range r.Objects {
+		if entry.Status != "indexed" {
+			continue
+		}
+		keyHost, keyHarness, ok := rawObjectIdentity(key)
+		if !ok {
+			continue
+		}
+		if host != "" && keyHost != host {
+			continue
+		}
+		if harness != "" && keyHarness != harness {
+			continue
+		}
+		for _, id := range entry.SessionIDs {
+			if id == sessionID {
+				keys = append(keys, key)
+				break
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sessionIDs(items []MemoryItem) []string {
+	ids := make([]string, 0, 1)
+	for _, item := range items {
+		if item.Metadata.SessionID != "" {
+			ids = append(ids, item.Metadata.SessionID)
+		}
+	}
+	return uniqueStrings(ids)
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (r *rawIngestor) sessionWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int) ([]queryResult, bool, error) {
+	keys := r.registry.keysForSession(sessionID, host, harness)
+	if len(keys) == 0 {
+		objects, err := r.store.List(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, obj := range objects {
+			keyHost, keyHarness, ok := rawObjectIdentity(obj.Key)
+			if !ok {
+				continue
+			}
+			if host != "" && keyHost != host {
+				continue
+			}
+			if harness != "" && keyHarness != harness {
+				continue
+			}
+			if strings.Contains(obj.Key, sessionID) {
+				keys = append(keys, obj.Key)
+			}
+		}
+		sort.Strings(keys)
+	}
+	results := make([]queryResult, 0, limit)
+	for _, key := range keys {
+		body, err := r.store.Get(ctx, key, r.server.cfg.RawMaxObjectBytes)
+		if err != nil {
+			return nil, true, err
+		}
+		items, err := parseRawSession(key, body)
+		if err != nil {
+			return nil, true, err
+		}
+		for _, item := range items {
+			if item.Metadata.SessionID != sessionID {
+				continue
+			}
+			if host != "" && item.Metadata.Host != host {
+				continue
+			}
+			if harness != "" && item.Metadata.Harness != harness {
+				continue
+			}
+			if !afterCursor(item.Metadata.Timestamp, item.ID, afterTS, afterID) {
+				continue
+			}
+			results = append(results, rawQueryResult(item))
+		}
+	}
+	if len(results) == 0 {
+		return nil, false, nil
+	}
+	sort.Slice(results, func(i, j int) bool {
+		ti, tj := metaTS(results[i]), metaTS(results[j])
+		if ti == tj {
+			return results[i].ID < results[j].ID
+		}
+		return ti < tj
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results, true, nil
+}
+
+func rawQueryResult(item MemoryItem) queryResult {
+	return queryResult{
+		ID:             item.ID,
+		Score:          float64(item.Metadata.Timestamp),
+		ForwardContent: item.ForwardContent,
+		Metadata: map[string]interface{}{
+			"scope":        string(item.Metadata.Scope),
+			"project_name": item.Metadata.ProjectName,
+			"file_path":    item.Metadata.FilePath,
+			"file_hash":    item.Metadata.FileHash,
+			"timestamp":    item.Metadata.Timestamp,
+			"session_id":   item.Metadata.SessionID,
+			"host":         item.Metadata.Host,
+			"harness":      item.Metadata.Harness,
+			"role":         item.Metadata.Role,
+			"record_kind":  item.Metadata.RecordKind,
+			"parent_id":    item.Metadata.ParentID,
+			"chunk_index":  item.Metadata.ChunkIndex,
+			"chunk_count":  item.Metadata.ChunkCount,
+		},
+	}
 }
 
 type rawStatusResponse struct {
@@ -316,14 +465,14 @@ func (r *rawIngestor) scan(ctx context.Context) {
 			continue
 		}
 		if err := r.process(ctx, obj); err != nil {
-			_ = r.registry.set(obj, "failed", 0, err)
+			_ = r.registry.set(obj, "failed", 0, err, nil)
 			slog.Error("raw object ingestion failed", "key", obj.Key, "err", err)
 		}
 	}
 }
 
 func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
-	if err := r.registry.set(obj, "processing", 0, nil); err != nil {
+	if err := r.registry.set(obj, "processing", 0, nil, nil); err != nil {
 		return fmt.Errorf("save processing state: %w", err)
 	}
 	if obj.Size > r.server.cfg.RawMaxObjectBytes {
@@ -356,7 +505,7 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 			return err
 		}
 	}
-	if err := r.registry.set(obj, "indexed", len(items), nil); err != nil {
+	if err := r.registry.set(obj, "indexed", len(items), nil, sessionIDs(items)); err != nil {
 		return fmt.Errorf("save indexed state: %w", err)
 	}
 	slog.Info("raw object indexed", "key", obj.Key, "records", len(items), "new_records", len(pending))
