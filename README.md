@@ -123,7 +123,7 @@ operational baselines rather than a latency guarantee.
 - `GET /-/ready`
 - `POST /v1/memory/ingest`
 - `POST /v1/memory/query`
-- `GET /v1/memory/session?session_id=...&after_ts=...&after_id=...`
+- `GET /v1/memory/session?session_id=...&after_ts=...&after_id=...[&include=todos|tasks|titles|state]`
 - `GET /v1/raw/status`
 
 Example hybrid query:
@@ -149,7 +149,7 @@ The raw object layout is deliberately the only contract:
 <host>/omp/<any subdirectories>/<file>.jsonl
 ```
 
-Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages. Every logical message is stored once, in full, as a canonical `message` row. The daemon uses llama.cpp's tokenizer to split the same text into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent message ID. Search runs over chunks and collapses hits by parent. Session walking prefers the untouched raw JSONL archive and falls back to the derived `messages` table, so reconstruction is not limited by chunk overlap, embedding truncation, or quantized search indexes.
+Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages plus important session state: titles, todo snapshots, and task/subagent tool results. Every logical message is stored once, in full, as a canonical `message` row. Important state rows use `record_kind` values `title`, `todo`, or `task` so normal recall can find them without reading a local session file. The daemon uses llama.cpp's tokenizer to split each searchable row into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent row ID. Search runs over chunks and collapses hits by parent. Session walking prefers the untouched raw JSONL archive and falls back to the derived `messages` table; `include=todos`, `include=tasks`, `include=titles`, or `include=state` reads those exact records from raw when available, so reconstruction is not limited by chunk overlap, embedding truncation, or quantized search indexes.
 
 An object is recorded as indexed only after every derived row is persisted. On a crash, the object is retried; stable parent and chunk IDs make replay harmless. Growing files are coalesced for five minutes before their next derived write, reducing tiny Lance fragments without delaying new files. Failed objects retry with bounded exponential backoff. Parser/chunker-version changes automatically reprocess the derived data. The raw JSONL remains the source of truth for clean reindexing.
 

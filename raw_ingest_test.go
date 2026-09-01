@@ -181,6 +181,34 @@ func TestRawSessionWalkUsesUntouchedObject(t *testing.T) {
 	}
 }
 
+func TestRawSessionImportantStateWalkUsesUntouchedObject(t *testing.T) {
+	body := []byte("{\"type\":\"session\",\"id\":\"omp-state\",\"cwd\":\"/repo/raw-state\",\"title\":\"Stateful OMP session\"}\n" +
+		"{\"type\":\"message\",\"id\":\"todo-1\",\"timestamp\":\"2026-09-01T18:20:00Z\",\"message\":{\"role\":\"toolResult\",\"toolName\":\"todo\",\"details\":{\"phases\":[{\"phase\":\"Remote todo retrieval\",\"items\":[{\"content\":\"Expose todo session entries\",\"status\":\"in_progress\"}]}]}}}\n" +
+		"{\"type\":\"message\",\"id\":\"task-1\",\"timestamp\":\"2026-09-01T18:20:01Z\",\"message\":{\"role\":\"toolResult\",\"toolName\":\"task\",\"content\":[{\"type\":\"text\",\"text\":\"Subagent found task output worth searching.\"}]}}\n")
+	obj := rawObject{Key: "mac/omp/2026_omp-state.jsonl", ETag: "etag-state", Size: int64(len(body))}
+	store := &fakeRawStore{objects: []rawObject{obj}, bodies: map[string][]byte{obj.Key: body}}
+	s := testServer()
+	s.cfg.RawMaxObjectBytes = 1 << 20
+	registry, err := loadRawRegistry(t.TempDir() + "/raw.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &rawIngestor{server: s, store: store, registry: registry}
+	results, ok, err := r.sessionImportantStateWalk(context.Background(), "omp-state", "mac", "omp", 0, "", 10, map[string]bool{"todo": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(results) != 1 {
+		t.Fatalf("ok=%v results=%+v", ok, results)
+	}
+	if got := results[0].Metadata["record_kind"]; got != "todo" {
+		t.Fatalf("kind=%v", got)
+	}
+	if !strings.Contains(results[0].ForwardContent, "Expose todo session entries") {
+		t.Fatalf("todo=%q", results[0].ForwardContent)
+	}
+}
+
 func TestTokenChunksCoverEntireMessageWithOverlap(t *testing.T) {
 	words := make([]string, 900)
 	for i := range words {

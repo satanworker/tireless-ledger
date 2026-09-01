@@ -568,7 +568,19 @@ func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
 	afterID := q.Get("after_id")
 	host := strings.TrimSpace(q.Get("host"))
 	harness := strings.TrimSpace(q.Get("harness"))
+	includeKinds, includeState := sessionIncludeKinds(q.Get("include"))
 	if s.raw != nil {
+		if includeState {
+			results, ok, err := s.raw.sessionImportantStateWalk(r.Context(), sid, host, harness, afterTS, afterID, limit, includeKinds)
+			if err != nil {
+				errorJSON(w, http.StatusBadGateway, err)
+				return
+			}
+			if ok {
+				writeJSON(w, http.StatusOK, queryResponse{Results: results})
+				return
+			}
+		}
 		results, ok, err := s.raw.sessionWalk(r.Context(), sid, host, harness, afterTS, afterID, limit)
 		if err != nil {
 			errorJSON(w, http.StatusBadGateway, err)
@@ -584,8 +596,10 @@ func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter := sessionWalkFilter(sid, host, harness)
-	if !s.cfg.SplitTables {
+	if !s.cfg.SplitTables || !includeState {
 		filter = appendFilter(filter, vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "message"}})
+	} else if includeFilter := sessionIncludeFilter(includeKinds); includeFilter != nil {
+		filter = appendFilter(filter, *includeFilter)
 	}
 	hits, err := s.runSearch(r.Context(), vectorSearchRequest{
 		Table:         "messages",
@@ -614,6 +628,30 @@ func (s *server) sessionWalk(w http.ResponseWriter, r *http.Request) {
 		hits = hits[:limit]
 	}
 	writeJSON(w, http.StatusOK, queryResponse{Results: hits})
+}
+
+func sessionIncludeKinds(include string) (map[string]bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(include)) {
+	case "todo", "todos":
+		return map[string]bool{"todo": true}, true
+	case "task", "tasks":
+		return map[string]bool{"task": true}, true
+	case "title", "titles":
+		return map[string]bool{"title": true}, true
+	case "state", "important":
+		return map[string]bool{"todo": true, "task": true, "title": true}, true
+	default:
+		return map[string]bool{"message": true}, false
+	}
+}
+func sessionIncludeFilter(kinds map[string]bool) *vectorFilter {
+	if len(kinds) != 1 {
+		return nil
+	}
+	for kind := range kinds {
+		return &vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: kind}}
+	}
+	return nil
 }
 
 func sessionWalkFilter(sid, host, harness string) *vectorFilter {
