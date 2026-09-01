@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseRawPiPreservesText(t *testing.T) {
 	body := []byte(`{"type":"session","id":"pi-session","cwd":"/Users/me/project"}
@@ -47,6 +50,32 @@ func TestParseRawOmpKeepsHarnessAndTitlelessMessages(t *testing.T) {
 	}
 	if items[1].ForwardContent != "Backend now accepts OMP JSONL." {
 		t.Fatalf("assistant=%q", items[1].ForwardContent)
+	}
+}
+
+func TestParseRawOmpIndexesImportantState(t *testing.T) {
+	body := []byte(`{"type":"title","id":"title-1","title":"Serving table people search"}
+{"type":"session","id":"omp-session","timestamp":"2026-09-01T18:19:23Z","cwd":"/repo/brimstone","title":"Serving table people search"}
+{"type":"message","id":"todo-1","timestamp":"2026-09-01T18:20:00Z","message":{"role":"toolResult","toolName":"todo","details":{"phases":[{"phase":"Remote todo retrieval","items":[{"content":"Index todo snapshots for search","status":"pending"}]}]}}}
+{"type":"custom","id":"edit-1","timestamp":"2026-09-01T18:20:01Z","customType":"user_todo_edit","data":{"phases":[{"phase":"Remote todo retrieval","items":[{"content":"Expose todo session entries","status":"in_progress"}]}]}}
+{"type":"message","id":"task-1","timestamp":"2026-09-01T18:20:02Z","message":{"role":"toolResult","toolName":"task","content":[{"type":"text","text":"Subagent found serving.person_search rebuild notes."}]}}
+`)
+	items, err := parseRawSessionForIndex("mbp14/omp/-repo-brimstone/2026_omp-session.jsonl", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]int{}
+	for _, item := range items {
+		kinds[item.Metadata.RecordKind]++
+		if item.Metadata.ProjectName != "brimstone" {
+			t.Fatalf("project=%q", item.Metadata.ProjectName)
+		}
+	}
+	if kinds["title"] != 2 || kinds["todo"] != 2 || kinds["task"] != 1 {
+		t.Fatalf("kinds=%v", kinds)
+	}
+	if !strings.Contains(items[2].ForwardContent, "Index todo snapshots for search") {
+		t.Fatalf("todo text=%q", items[2].ForwardContent)
 	}
 }
 

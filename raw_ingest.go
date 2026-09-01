@@ -307,37 +307,66 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
-func (r *rawIngestor) sessionWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int) ([]queryResult, bool, error) {
+func (r *rawIngestor) sessionKeys(ctx context.Context, sessionID, host, harness string) ([]string, error) {
 	keys := r.registry.keysForSession(sessionID, host, harness)
-	if len(keys) == 0 {
-		objects, err := r.store.List(ctx)
-		if err != nil {
-			return nil, false, err
+	if len(keys) > 0 {
+		return keys, nil
+	}
+	objects, err := r.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, obj := range objects {
+		keyHost, keyHarness, ok := rawObjectIdentity(obj.Key)
+		if !ok {
+			continue
 		}
-		for _, obj := range objects {
-			keyHost, keyHarness, ok := rawObjectIdentity(obj.Key)
-			if !ok {
-				continue
-			}
-			if host != "" && keyHost != host {
-				continue
-			}
-			if harness != "" && keyHarness != harness {
-				continue
-			}
-			if strings.Contains(obj.Key, sessionID) {
-				keys = append(keys, obj.Key)
-			}
+		if host != "" && keyHost != host {
+			continue
 		}
-		sort.Strings(keys)
+		if harness != "" && keyHarness != harness {
+			continue
+		}
+		if strings.Contains(obj.Key, sessionID) {
+			keys = append(keys, obj.Key)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+func (r *rawIngestor) sessionWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int) ([]queryResult, bool, error) {
+	return r.sessionRecordWalk(ctx, sessionID, host, harness, afterTS, afterID, limit, map[string]bool{"message": true})
+}
+
+func (r *rawIngestor) sessionImportantStateWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int, kinds map[string]bool) ([]queryResult, bool, error) {
+	return r.sessionRecordWalk(ctx, sessionID, host, harness, afterTS, afterID, limit, kinds)
+}
+
+func (r *rawIngestor) sessionRecordWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int, kinds map[string]bool) ([]queryResult, bool, error) {
+	keys, err := r.sessionKeys(ctx, sessionID, host, harness)
+	if err != nil {
+		return nil, false, err
 	}
 	results := make([]queryResult, 0, limit)
+	includeState := false
+	for kind := range kinds {
+		if kind != "message" {
+			includeState = true
+			break
+		}
+	}
 	for _, key := range keys {
 		body, err := r.store.Get(ctx, key, r.server.cfg.RawMaxObjectBytes)
 		if err != nil {
 			return nil, true, err
 		}
-		items, err := parseRawSession(key, body)
+		var items []MemoryItem
+		if includeState {
+			items, err = parseRawSessionForIndex(key, body)
+		} else {
+			items, err = parseRawSession(key, body)
+		}
 		if err != nil {
 			return nil, true, err
 		}
@@ -349,6 +378,9 @@ func (r *rawIngestor) sessionWalk(ctx context.Context, sessionID, host, harness 
 				continue
 			}
 			if harness != "" && item.Metadata.Harness != harness {
+				continue
+			}
+			if !kinds[item.Metadata.RecordKind] {
 				continue
 			}
 			if !afterCursor(item.Metadata.Timestamp, item.ID, afterTS, afterID) {
@@ -482,7 +514,7 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
-	items, err := parseRawSession(obj.Key, body)
+	items, err := parseRawSessionForIndex(obj.Key, body)
 	if err != nil {
 		return fmt.Errorf("extract: %w", err)
 	}

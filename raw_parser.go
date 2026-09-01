@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const rawParserVersion = "session-jsonl-v2-token-chunks-384-64"
+const rawParserVersion = "session-jsonl-v3-important-state"
 
 var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", "<INSTRUCTIONS>"}
 
@@ -21,7 +21,15 @@ func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 	if !ok {
 		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp>/<path>.jsonl")
 	}
-	return parseSessionJSONL(body, host, harness, key)
+	return parseSessionJSONL(body, host, harness, key, false)
+}
+
+func parseRawSessionForIndex(key string, body []byte) ([]MemoryItem, error) {
+	host, harness, ok := rawObjectIdentity(key)
+	if !ok {
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp>/<path>.jsonl")
+	}
+	return parseSessionJSONL(body, host, harness, key, true)
 }
 
 func rawObjectIdentity(key string) (host, harness string, ok bool) {
@@ -32,11 +40,20 @@ func rawObjectIdentity(key string) (host, harness string, ok bool) {
 	return parts[0], parts[1], true
 }
 
-func parseSessionJSONL(body []byte, host, harness, source string) ([]MemoryItem, error) {
+type pendingRawState struct {
+	id        string
+	role      string
+	text      string
+	timestamp int64
+	kind      string
+}
+
+func parseSessionJSONL(body []byte, host, harness, source string, includeState bool) ([]MemoryItem, error) {
 	sessionID := strings.TrimSuffix(filepath.Base(source), filepath.Ext(source))
 	project := "unknown"
 	seen := map[string]bool{}
 	items := make([]MemoryItem, 0)
+	pendingState := make([]pendingRawState, 0)
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64*1024), 64<<20)
 	lineNo := 0
@@ -51,29 +68,77 @@ func parseSessionJSONL(body []byte, host, harness, source string) ([]MemoryItem,
 			continue
 		}
 		if harness == "pi" || harness == "omp" {
-			if stringField(obj, "type") == "session" {
+			entryID := valueOr(stringField(obj, "id"), fmt.Sprintf("line-%d", lineNo))
+			switch stringField(obj, "type") {
+			case "session":
 				sessionID = valueOr(stringField(obj, "id"), sessionID)
 				project = projectFromCWD(stringField(obj, "cwd"))
+				for _, pending := range pendingState {
+					items = append(items, rawRecord(host, harness, sessionID, pending.id, pending.role, pending.text, pending.timestamp, project, pending.kind))
+				}
+				pendingState = pendingState[:0]
+				if includeState {
+					if text := titleText(obj, "session"); text != "" {
+						items = append(items, rawRecord(host, harness, sessionID, entryID+"-session", "system", text, parseRawTimestamp(firstValue(obj["updatedAt"], obj["timestamp"])), project, "title"))
+					}
+				}
+				continue
+			case "title", "title_change":
+				if includeState {
+					if text := titleText(obj, stringField(obj, "type")); text != "" {
+						ts := parseRawTimestamp(firstValue(obj["updatedAt"], obj["timestamp"]))
+						if project == "unknown" {
+							pendingState = append(pendingState, pendingRawState{id: entryID, role: "system", text: text, timestamp: ts, kind: "title"})
+						} else {
+							items = append(items, rawRecord(host, harness, sessionID, entryID, "system", text, ts, project, "title"))
+						}
+					}
+				}
+				continue
+			case "custom":
+				if includeState && stringField(obj, "customType") == "user_todo_edit" {
+					if text := todoTextFromSessionRecord(obj, "user_todo_edit"); text != "" {
+						items = append(items, rawRecord(host, harness, sessionID, entryID, "user_todo_edit", text, parseRawTimestamp(obj["timestamp"]), project, "todo"))
+					}
+				}
+				continue
+			case "message":
+				msg, _ := obj["message"].(map[string]interface{})
+				role := stringField(msg, "role")
+				if includeState && role == "toolResult" {
+					toolName := stringField(msg, "toolName")
+					switch toolName {
+					case "todo":
+						if text := todoTextFromSessionRecord(msg, "todo"); text != "" {
+							items = append(items, rawRecord(host, harness, sessionID, entryID, role, text, parseRawTimestamp(firstValue(obj["timestamp"], msg["timestamp"])), project, "todo"))
+						}
+					case "task":
+						if text := toolResultText(msg, "task"); text != "" {
+							items = append(items, rawRecord(host, harness, sessionID, entryID, role, text, parseRawTimestamp(firstValue(obj["timestamp"], msg["timestamp"])), project, "task"))
+						}
+					}
+					continue
+				}
+				text := contentText(msg["content"])
+				if !indexableMessage(role, text) || entryID == "" {
+					continue
+				}
+				items = append(items, rawRecord(host, harness, sessionID, entryID, role, text, parseRawTimestamp(firstValue(obj["timestamp"], msg["timestamp"])), project, "message"))
+				continue
+			default:
 				continue
 			}
-			if stringField(obj, "type") != "message" {
-				continue
-			}
-			msg, _ := obj["message"].(map[string]interface{})
-			role := stringField(msg, "role")
-			text := contentText(msg["content"])
-			turnID := stringField(obj, "id")
-			if !indexableMessage(role, text) || turnID == "" {
-				continue
-			}
-			items = append(items, rawTurn(host, harness, sessionID, turnID, role, text, parseRawTimestamp(firstValue(obj["timestamp"], msg["timestamp"])), project))
-			continue
 		}
 
 		payload, _ := obj["payload"].(map[string]interface{})
 		if stringField(obj, "type") == "session_meta" {
 			sessionID = valueOr(stringField(payload, "id"), sessionID)
 			project = projectFromCWD(stringField(payload, "cwd"))
+			if includeState {
+				if text := titleText(payload, "session"); text != "" {
+					items = append(items, rawRecord(host, harness, sessionID, stringField(payload, "id")+"-session", "system", text, parseRawTimestamp(obj["timestamp"]), project, "title"))
+				}
+			}
 			continue
 		}
 		if stringField(obj, "type") != "response_item" || stringField(payload, "type") != "message" {
@@ -97,7 +162,7 @@ func parseSessionJSONL(body []byte, host, harness, source string) ([]MemoryItem,
 		if turnID == "" {
 			turnID = fmt.Sprintf("line-%d", lineNo-1)
 		}
-		items = append(items, rawTurn(host, harness, sessionID, turnID, role, text, parseRawTimestamp(obj["timestamp"]), project))
+		items = append(items, rawRecord(host, harness, sessionID, turnID, role, text, parseRawTimestamp(obj["timestamp"]), project, "message"))
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scan JSONL: %w", err)
@@ -106,16 +171,20 @@ func parseSessionJSONL(body []byte, host, harness, source string) ([]MemoryItem,
 }
 
 func rawTurn(host, harness, sessionID, turnID, role, text string, timestamp int64, project string) MemoryItem {
+	return rawRecord(host, harness, sessionID, turnID, role, text, timestamp, project, "message")
+}
+
+func rawRecord(host, harness, sessionID, turnID, role, text string, timestamp int64, project, kind string) MemoryItem {
 	if timestamp == 0 {
 		timestamp = 1
 	}
 	return MemoryItem{
-		ID:             hashText(host + "|" + harness + "|" + sessionID + "|" + turnID),
+		ID:             hashText(host + "|" + harness + "|" + sessionID + "|" + kind + "|" + turnID),
 		ForwardContent: text,
 		Metadata: Metadata{
-			Scope: ScopeSession, ProjectName: project, FilePath: host + "/" + harness + "/" + sessionID + "/" + turnID,
+			Scope: ScopeSession, ProjectName: project, FilePath: host + "/" + harness + "/" + sessionID + "/" + kind + "/" + turnID,
 			FileHash: hashText(text), Timestamp: timestamp, SessionID: sessionID, Host: host, Harness: harness, Role: role,
-			RecordKind: "message",
+			RecordKind: kind,
 		},
 	}
 }
@@ -139,6 +208,61 @@ func contentText(v interface{}) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+func titleText(m map[string]interface{}, source string) string {
+	title := strings.TrimSpace(firstStringField(m, "title", "name", "summary"))
+	if title == "" {
+		return ""
+	}
+	return "TITLE " + source + ": " + title
+}
+
+func toolResultText(m map[string]interface{}, toolName string) string {
+	text := contentText(m["content"])
+	if text == "" {
+		text = compactJSON(firstValue(m["details"], m["data"], m["result"]))
+	}
+	if text == "" {
+		return ""
+	}
+	return "TOOL " + toolName + " RESULT:\n" + text
+}
+
+func todoTextFromSessionRecord(m map[string]interface{}, source string) string {
+	for _, candidate := range []interface{}{m["details"], m["data"], m} {
+		cm, ok := candidate.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		state := firstValue(cm["phases"], cm["items"], cm["todos"], cm["tasks"])
+		if state == nil {
+			continue
+		}
+		text := compactJSON(state)
+		if text != "" {
+			return "TODO " + source + ":\n" + text
+		}
+	}
+	text := compactJSON(firstValue(m["details"], m["data"]))
+	if text == "" {
+		text = contentText(m["content"])
+	}
+	if text == "" {
+		return ""
+	}
+	return "TODO " + source + ":\n" + text
+}
+
+func compactJSON(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return ""
+	}
+	return string(b)
 }
 
 func indexableMessage(role, text string) bool {
@@ -198,6 +322,15 @@ func stringField(m map[string]interface{}, key string) string {
 	}
 	s, _ := m[key].(string)
 	return s
+}
+
+func firstStringField(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(stringField(m, key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func valueOr(value, fallback string) string {
