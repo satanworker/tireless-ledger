@@ -10,9 +10,13 @@ ARG LANCEDB_GO_COMMIT=fa14ce29c7724354f2cea630a1d3488b56bbd64b
 RUN git clone https://github.com/lancedb/lancedb-go.git /opt/lancedb-go \
   && git -C /opt/lancedb-go checkout "$LANCEDB_GO_COMMIT"
 COPY docker/lancedb-go-session-cache.patch /tmp/lancedb-go-session-cache.patch
+COPY docker/lancedb-go-disk-cache.patch /tmp/lancedb-go-disk-cache.patch
+COPY docker/lancedb-go-disk-cache.rs /tmp/disk_cache.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/opt/lancedb-go/rust/target \
     git -C /opt/lancedb-go apply /tmp/lancedb-go-session-cache.patch \
+  && git -C /opt/lancedb-go apply /tmp/lancedb-go-disk-cache.patch \
+  && cp /tmp/disk_cache.rs /opt/lancedb-go/rust/src/disk_cache.rs \
   && CARGO_BUILD_JOBS=1 cargo build --manifest-path /opt/lancedb-go/rust/Cargo.toml --release --features aws \
   && mkdir -p /opt/lancedb-go/lib/linux_arm64 \
   && cp /opt/lancedb-go/rust/target/release/liblancedb_go.a /opt/lancedb-go/lib/linux_arm64/

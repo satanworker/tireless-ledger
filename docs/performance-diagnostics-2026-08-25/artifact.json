@@ -1,0 +1,635 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Tireless Recall Latency Diagnosis",
+    "description": "Controlled production diagnosis of vector, hybrid, BM25, and session-walk latency on 25 August 2026.",
+    "generatedAt": "2026-08-25T14:41:00Z",
+    "sources": [
+      {
+        "id": "baseline_http",
+        "label": "Live Tireless HTTP latency probe",
+        "query": {
+          "engine": "pi-memoryd HTTP API",
+          "id": "baseline-sops-secrets-5-rounds",
+          "description": "Five sequential requests per operation against production using the SOPS secrets query and a fixed 50-row session walk.",
+          "executed_at": "2026-08-25T14:17:00Z",
+          "language": "python",
+          "filters": [
+            "scope=session_memory",
+            "query=SOPS secrets",
+            "five samples per operation",
+            "no concurrent requests"
+          ],
+          "metric_definitions": [
+            "Latency is client-observed wall-clock time from request start through complete JSON response.",
+            "Median and range use five sequential samples."
+          ],
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance",
+            "session-recall-lance-token-chunks-v4/messages.lance"
+          ]
+        }
+      },
+      {
+        "id": "nprobe_sweep",
+        "label": "Read-only IVF probe-count canary sweep",
+        "query": {
+          "engine": "SQLite",
+          "id": "nprobes-8-16-32-64-five-query-sweep",
+          "description": "Four isolated split-only canaries queried the same production chunks table with 8, 16, 32, and 64 probes. Five unrelated query embeddings were executed sequentially with rotating endpoint order.",
+          "executed_at": "2026-08-25T14:24:00Z",
+          "language": "sql",
+          "sql": "SELECT 8 AS probes, 1.088 AS median_s, 0.787 AS min_s, 1.970 AS max_s, 0.680 AS top5_overlap, 0.675 AS top8_overlap, 0.350 AS exact_position_rate_top8, 5 AS query_count UNION ALL SELECT 16, 1.719, 1.083, 2.943, 0.880, 0.850, 0.700, 5 UNION ALL SELECT 32, 2.355, 1.176, 3.938, 1.000, 1.000, 1.000, 5 UNION ALL SELECT 64, 6.680, 6.213, 7.759, 1.000, 1.000, 1.000, 5",
+          "filters": [
+            "five representative queries",
+            "limit=8 with server fetch_k=50",
+            "scope=session_memory",
+            "raw ingestion disabled in canaries",
+            "64-probe results used as the IVF_FLAT all-partition reference"
+          ],
+          "metric_definitions": [
+            "Top-k overlap is the mean share of IDs common with the corresponding 64-probe top-k result.",
+            "Exact-position rate is the mean share of top-eight ranks containing the same ID as the 64-probe result."
+          ],
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance"
+          ]
+        }
+      },
+      {
+        "id": "cache_sweep",
+        "label": "Read-only Lance index-cache sweep",
+        "query": {
+          "engine": "SQLite",
+          "id": "cache-256-512-1024-np64",
+          "description": "Fresh Lance sessions queried the current production chunks table with 64 probes and 256, 512, or 1024 MiB index caches. Each run used one cold warm-up followed by five measured requests.",
+          "executed_at": "2026-08-25T14:38:20Z",
+          "language": "sql",
+          "sql": "SELECT 256 AS cache_mb, 11.894 AS cold_s, 4.159 AS warm_median_s, 3.031 AS min_s, 6.539 AS max_s, 5 AS samples, 'identical' AS result_set UNION ALL SELECT 512, 9.881, 0.535, 0.487, 0.660, 5, 'identical' UNION ALL SELECT 1024, 10.979, 0.552, 0.476, 0.622, 5, 'identical'",
+          "filters": [
+            "query=SOPS secrets",
+            "nprobes=64",
+            "limit=50",
+            "five warm samples after one cold request",
+            "metadata cache fixed at 64 MiB"
+          ],
+          "metric_definitions": [
+            "Warm median excludes the first cold request in each fresh process.",
+            "Result identity was checked across all cache sizes."
+          ],
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance"
+          ]
+        }
+      },
+      {
+        "id": "index_stats",
+        "label": "Production chunks index statistics",
+        "query": {
+          "engine": "SQLite",
+          "id": "chunks-index-stats-v212",
+          "description": "Read-only row and index coverage statistics for the production chunks table.",
+          "executed_at": "2026-08-25T14:27:30Z",
+          "language": "sql",
+          "sql": "SELECT 'Total chunks rows' AS metric, 116004 AS value, 'rows' AS unit UNION ALL SELECT 'IVF_FLAT indexed rows', 115494, 'rows' UNION ALL SELECT 'IVF_FLAT unindexed rows', 510, 'rows' UNION ALL SELECT 'Indexed coverage', 99.56, '%' UNION ALL SELECT 'Table fragments at read', 18, 'fragments'",
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance"
+          ],
+          "metric_definitions": [
+            "Coverage is indexed rows divided by total table rows at measurement time."
+          ]
+        }
+      },
+      {
+        "id": "fragment_snapshot",
+        "label": "Historical one-fragment versus current snapshot probe",
+        "query": {
+          "engine": "SQLite",
+          "id": "fragment-sensitivity-v193-v67-current",
+          "description": "Read-only comparison of retained one-fragment chunks/messages snapshots with current multi-fragment snapshots using a 512 MiB index cache.",
+          "executed_at": "2026-08-25T14:40:30Z",
+          "language": "sql",
+          "sql": "SELECT 'BM25' AS operation, 'One-fragment chunks v193' AS snapshot, 1 AS fragments, 0.183 AS median_s, 0.170 AS min_s, 0.212 AS max_s, 5 AS samples UNION ALL SELECT 'BM25', 'Current chunks', 27, 0.619, 0.384, 0.633, 5 UNION ALL SELECT 'Session walk', 'One-fragment messages v67', 1, 1.838, 1.321, 2.168, 5 UNION ALL SELECT 'Session walk', 'Current messages', 27, 1.750, 1.653, 2.068, 5",
+          "filters": [
+            "BM25 query=SOPS secrets",
+            "session walk limit=50",
+            "five warm samples after one warm-up",
+            "chunks historical version=193",
+            "messages historical version=67"
+          ],
+          "metric_definitions": [
+            "Fragment sensitivity compares median wall-clock latency between retained compact and current snapshots."
+          ],
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance",
+            "session-recall-lance-token-chunks-v4/messages.lance"
+          ]
+        }
+      },
+      {
+        "id": "lancedb_docs",
+        "label": "LanceDB vector-search documentation",
+        "href": "https://docs.lancedb.com/search/vector-search",
+        "query": {
+          "engine": "LanceDB official documentation",
+          "description": "Official guidance on nprobes, partition search, recall, and latency trade-offs.",
+          "executed_at": "2026-08-25T14:29:00Z"
+        }
+      }
+    ],
+    "charts": [
+      {
+        "id": "nprobe_latency",
+        "title": "Warm vector latency by IVF probe count",
+        "subtitle": "Five representative queries; 64 probes search every partition",
+        "showDescription": true,
+        "intent": "comparison",
+        "question": "How does vector latency change as more IVF partitions are searched?",
+        "rationale": "An ordered bar comparison makes the nonlinear latency increase across four discrete probe settings explicit.",
+        "comparisonContext": {
+          "baseline": "64 probes",
+          "grain": "probe setting",
+          "unit": "seconds"
+        },
+        "type": "bar",
+        "dataset": "nprobe_results",
+        "sourceId": "nprobe_sweep",
+        "encodings": {
+          "x": {
+            "field": "probes",
+            "type": "ordinal",
+            "label": "IVF probes"
+          },
+          "y": {
+            "field": "median_s",
+            "type": "quantitative",
+            "format": "number",
+            "label": "Median latency",
+            "unit": "s"
+          },
+          "tooltip": [
+            {
+              "field": "top5_overlap",
+              "type": "quantitative",
+              "format": "percent",
+              "label": "Top-5 overlap vs 64"
+            },
+            {
+              "field": "top8_overlap",
+              "type": "quantitative",
+              "format": "percent",
+              "label": "Top-8 overlap vs 64"
+            }
+          ]
+        },
+        "yAxisTitle": "Median latency (s)",
+        "valueFormat": "number",
+        "unit": "s",
+        "layout": "full",
+        "labels": {
+          "values": "all"
+        },
+        "palette": {
+          "kind": "sequential",
+          "name": "blue"
+        },
+        "settings": {
+          "showValues": true,
+          "sort": "custom"
+        },
+        "surface": {
+          "surface": "export",
+          "viewMode": "both"
+        }
+      },
+      {
+        "id": "cache_latency",
+        "title": "Warm 64-probe latency by index-cache capacity",
+        "subtitle": "Same table, engine, query, and result IDs; five warm samples per fresh process",
+        "showDescription": true,
+        "intent": "comparison",
+        "question": "Does the production 256 MiB cache retain the current IVF_FLAT working set?",
+        "rationale": "A bar comparison directly shows the threshold effect between a thrashing cache and a cache large enough to retain the working set.",
+        "comparisonContext": {
+          "baseline": "256 MiB production cache",
+          "grain": "fresh Lance session cache size",
+          "unit": "seconds"
+        },
+        "type": "bar",
+        "dataset": "cache_results",
+        "sourceId": "cache_sweep",
+        "encodings": {
+          "x": {
+            "field": "cache_mb",
+            "type": "ordinal",
+            "label": "Index cache",
+            "unit": "MiB"
+          },
+          "y": {
+            "field": "warm_median_s",
+            "type": "quantitative",
+            "format": "number",
+            "label": "Warm median latency",
+            "unit": "s"
+          },
+          "tooltip": [
+            {
+              "field": "cold_s",
+              "type": "quantitative",
+              "format": "number",
+              "label": "Cold first request",
+              "unit": "s"
+            }
+          ]
+        },
+        "yAxisTitle": "Warm median latency (s)",
+        "valueFormat": "number",
+        "unit": "s",
+        "layout": "full",
+        "labels": {
+          "values": "all"
+        },
+        "palette": {
+          "kind": "sequential",
+          "name": "orange"
+        },
+        "settings": {
+          "showValues": true,
+          "sort": "custom"
+        },
+        "surface": {
+          "surface": "export",
+          "viewMode": "both"
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "index_coverage",
+        "title": "Chunks index coverage",
+        "subtitle": "Read-only production statistics at table version 212",
+        "dataset": "index_coverage",
+        "defaultSort": {
+          "field": "metric",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "sourceId": "index_stats",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "metric",
+            "label": "Metric",
+            "type": "text"
+          },
+          {
+            "field": "value",
+            "label": "Value",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "unit",
+            "label": "Unit",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "fragment_sensitivity",
+        "title": "Fragment sensitivity checks",
+        "subtitle": "Five warm samples; exact historical and current snapshots",
+        "dataset": "fragment_results",
+        "defaultSort": {
+          "field": "median_s",
+          "direction": "desc"
+        },
+        "density": "spacious",
+        "sourceId": "fragment_snapshot",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "operation",
+            "label": "Operation",
+            "type": "text"
+          },
+          {
+            "field": "snapshot",
+            "label": "Snapshot",
+            "type": "text"
+          },
+          {
+            "field": "fragments",
+            "label": "Fragments",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "median_s",
+            "label": "Median",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "min_s",
+            "label": "Min",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "max_s",
+            "label": "Max",
+            "type": "number",
+            "format": "number"
+          }
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# Tireless Recall Latency Diagnosis",
+        "layout": "full"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "body": "## Technical summary\n\n**The reported regression is real and reproduced.** Production vector recall measured 5.94 seconds median and hybrid recall 6.28 seconds median across five controlled requests; embedding itself was only 15 milliseconds.\n\n**The primary cause is verified cache thrashing.** Production's Lance session cache is hard-coded to 256 MiB. With the same current table, 64 probes, engine, query, and result IDs, warm median latency was 4.16 seconds at 256 MiB but 0.54 seconds at 512 MiB. Increasing to 1024 MiB produced no further material improvement.\n\n**Scanning all 64 IVF partitions magnifies the miss cost.** Five-query canaries measured 1.09, 1.72, 2.36, and 6.68 seconds at 8, 16, 32, and 64 probes. The index is present and covers more than 99.5% of rows, so this is not a missing-index fallback.\n\n**Fragment accumulation is a secondary BM25 issue.** BM25 rose from 0.18 seconds on the retained one-fragment snapshot to 0.62 seconds on the current multi-fragment snapshot. Session-walk latency did not improve on the compact snapshot in the matched Python test.",
+        "layout": "full"
+      },
+      {
+        "id": "probe_finding",
+        "type": "markdown",
+        "body": "## Searching every IVF partition makes remote-cache misses expensive\n\nLatency increased sharply with the number of IVF partitions searched. This is the expected qualitative behavior of `nprobes`, but production currently forces all 64 partitions, converting an approximate nearest-neighbor index into an all-partition IVF_FLAT scan. In the five-query diagnostic sample, 32 probes reproduced every top-eight ID and rank from 64 probes; 16 probes retained 88% mean top-five overlap and 8 probes retained 68%.\n\nThe overlap sample is sufficient to diagnose the latency mechanism, not sufficient by itself to approve a production recall trade-off.",
+        "layout": "full",
+        "sourceId": "nprobe_sweep"
+      },
+      {
+        "id": "nprobe_chart_block",
+        "type": "chart",
+        "chartId": "nprobe_latency",
+        "layout": "full"
+      },
+      {
+        "id": "cache_finding",
+        "type": "markdown",
+        "body": "## The 256 MiB cache does not retain the current IVF_FLAT working set\n\nThe 64-probe canary transferred 615 MB during its diagnostic workload, compared with 218 MB at 32 probes. A fresh process with a 512 MiB index cache paid a roughly 10-second cold load once, then served five identical-result queries at 0.49–0.66 seconds. The 256 MiB control repeatedly returned to R2 and remained at 3.03–6.54 seconds.\n\nThe flat improvement between 512 and 1024 MiB identifies a capacity threshold rather than a general benefit from allocating arbitrary extra memory.",
+        "layout": "full",
+        "sourceId": "cache_sweep"
+      },
+      {
+        "id": "cache_chart_block",
+        "type": "chart",
+        "chartId": "cache_latency",
+        "layout": "full"
+      },
+      {
+        "id": "index_finding",
+        "type": "markdown",
+        "body": "## The vector index exists and is nearly current\n\nThe production `chunks` table held 116,004 rows at the index-stat measurement. Its IVF_FLAT, FTS, and ID indexes each covered 115,494 rows, leaving 510 rows unindexed. That 0.44% tail rules out a missing vector index or a full unindexed-table fallback as the main cause.",
+        "layout": "full",
+        "sourceId": "index_stats"
+      },
+      {
+        "id": "index_table_block",
+        "type": "table",
+        "tableId": "index_coverage",
+        "layout": "full"
+      },
+      {
+        "id": "fragment_finding",
+        "type": "markdown",
+        "body": "## Fragment accumulation slows BM25 but does not explain the vector regression\n\nThe retained one-fragment `chunks` snapshot served the BM25 probe at 0.18 seconds median, while the current multi-fragment snapshot took 0.62 seconds. This supports earlier compaction/index refresh for keyword latency. The matched session-walk test was 1.84 seconds on the compact historical snapshot and 1.75 seconds on current data, so fragmentation did not explain walk latency in this sample.\n\nDuring diagnosis, ongoing ingestion increased the tables from 18 to more than 20 fragments before the next four-hour optimizer window.",
+        "layout": "full",
+        "sourceId": "fragment_snapshot"
+      },
+      {
+        "id": "fragment_table_block",
+        "type": "table",
+        "tableId": "fragment_sensitivity",
+        "layout": "full"
+      },
+      {
+        "id": "scope_definitions",
+        "type": "markdown",
+        "body": "## Scope and metric definitions\n\nThe controlling baseline is the live production daemon on 25 August 2026, reading the R2-backed split `chunks` and `messages` tables. Vector and hybrid API requests use `fetch_k=50`; production configures a 64-partition IVF_FLAT index with `nprobes=64`.\n\nLatency is end-to-end request wall time unless a table explicitly identifies a direct Lance snapshot probe. Warm medians exclude one explicit cold request in cache and snapshot sensitivity tests. Recall overlap compares returned IDs with the same query at 64 probes; it is not a human relevance judgment.",
+        "layout": "full"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "body": "## Methodology\n\nThe diagnosis proceeded from reproduction to controlled isolation: a five-round live HTTP baseline, read-only canaries varying only `nprobes`, direct `index_stats` coverage checks, fresh Lance sessions varying only cache capacity, and time-travel queries comparing retained compact snapshots with current versions. Canary requests were sequential and their order rotated in the five-query probe sweep to reduce ordering bias. Production data and configuration were not changed.",
+        "layout": "full"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## Limitations and robustness\n\nThe cache sweep used the Python LanceDB 0.37.1 client because the production Go bridge compiles its 256 MiB cache limit into the binary. Both use the same LanceDB/Lance engine generation and queried the same R2 table; result IDs were identical across cache sizes. A Go canary with a larger cache would require rebuilding the Rust bridge and was deliberately not attempted during diagnosis.\n\nThe five-query probe sweep is too small to establish a production recall target. Official LanceDB guidance recommends benchmarking `nprobes` against actual data and choosing the smallest value that meets the required recall. Current documentation also recommends leaving automatic probe tuning enabled where supported.",
+        "layout": "full",
+        "sourceId": "lancedb_docs"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## Recommended next steps\n\n1. Make the Lance session index-cache size runtime-configurable and validate a 512 MiB Go canary before production deployment. This is the lowest-risk fix because it preserves all 64-probe results.\n2. Run a broader recall-at-k evaluation before reducing `nprobes`. The five-query sample makes 32 probes promising, but not yet production-safe.\n3. Shorten or make ingestion-aware the fragment-maintenance trigger so sustained uploads do not wait up to four hours after crossing the threshold.\n4. Evaluate rebuilding the IVF index with a partition count sized for roughly 116k rows only after the cache fix is measured; that is a separate change with a separate benchmark.",
+        "layout": "full"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## Further questions\n\n- What recall-at-5 target is acceptable across a larger, representative query set?\n- Does a 512 MiB Go bridge reproduce the 0.5-second warm 64-probe result under production concurrency?\n- How much of session-walk latency is unavoidable R2 round-trip cost versus output-column fetching or scalar-index planning?",
+        "layout": "full"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-25T14:41:00Z",
+    "status": "ready",
+    "datasets": {
+      "baseline_results": [
+        {
+          "operation": "Embedding",
+          "median_s": 0.015,
+          "min_s": 0.014,
+          "max_s": 0.016
+        },
+        {
+          "operation": "BM25",
+          "median_s": 0.932,
+          "min_s": 0.643,
+          "max_s": 1.122
+        },
+        {
+          "operation": "Vector",
+          "median_s": 5.944,
+          "min_s": 5.034,
+          "max_s": 13.873
+        },
+        {
+          "operation": "Hybrid",
+          "median_s": 6.284,
+          "min_s": 4.284,
+          "max_s": 7.845
+        },
+        {
+          "operation": "50-row session walk",
+          "median_s": 1.056,
+          "min_s": 0.917,
+          "max_s": 1.472
+        }
+      ],
+      "nprobe_results": [
+        {
+          "probes": 8,
+          "median_s": 1.088,
+          "min_s": 0.787,
+          "max_s": 1.97,
+          "top5_overlap": 0.68,
+          "top8_overlap": 0.675,
+          "exact_position_rate_top8": 0.35,
+          "query_count": 5
+        },
+        {
+          "probes": 16,
+          "median_s": 1.719,
+          "min_s": 1.083,
+          "max_s": 2.943,
+          "top5_overlap": 0.88,
+          "top8_overlap": 0.85,
+          "exact_position_rate_top8": 0.7,
+          "query_count": 5
+        },
+        {
+          "probes": 32,
+          "median_s": 2.355,
+          "min_s": 1.176,
+          "max_s": 3.938,
+          "top5_overlap": 1.0,
+          "top8_overlap": 1.0,
+          "exact_position_rate_top8": 1.0,
+          "query_count": 5
+        },
+        {
+          "probes": 64,
+          "median_s": 6.68,
+          "min_s": 6.213,
+          "max_s": 7.759,
+          "top5_overlap": 1.0,
+          "top8_overlap": 1.0,
+          "exact_position_rate_top8": 1.0,
+          "query_count": 5
+        }
+      ],
+      "cache_results": [
+        {
+          "cache_mb": 256,
+          "cold_s": 11.894,
+          "warm_median_s": 4.159,
+          "min_s": 3.031,
+          "max_s": 6.539,
+          "samples": 5,
+          "result_set": "identical"
+        },
+        {
+          "cache_mb": 512,
+          "cold_s": 9.881,
+          "warm_median_s": 0.535,
+          "min_s": 0.487,
+          "max_s": 0.66,
+          "samples": 5,
+          "result_set": "identical"
+        },
+        {
+          "cache_mb": 1024,
+          "cold_s": 10.979,
+          "warm_median_s": 0.552,
+          "min_s": 0.476,
+          "max_s": 0.622,
+          "samples": 5,
+          "result_set": "identical"
+        }
+      ],
+      "index_coverage": [
+        {
+          "metric": "Total chunks rows",
+          "value": 116004,
+          "unit": "rows"
+        },
+        {
+          "metric": "IVF_FLAT indexed rows",
+          "value": 115494,
+          "unit": "rows"
+        },
+        {
+          "metric": "IVF_FLAT unindexed rows",
+          "value": 510,
+          "unit": "rows"
+        },
+        {
+          "metric": "Indexed coverage",
+          "value": 99.56,
+          "unit": "%"
+        },
+        {
+          "metric": "Table fragments at read",
+          "value": 18,
+          "unit": "fragments"
+        }
+      ],
+      "fragment_results": [
+        {
+          "operation": "BM25",
+          "snapshot": "One-fragment chunks v193",
+          "fragments": 1,
+          "median_s": 0.183,
+          "min_s": 0.17,
+          "max_s": 0.212,
+          "samples": 5
+        },
+        {
+          "operation": "BM25",
+          "snapshot": "Current chunks",
+          "fragments": 27,
+          "median_s": 0.619,
+          "min_s": 0.384,
+          "max_s": 0.633,
+          "samples": 5
+        },
+        {
+          "operation": "Session walk",
+          "snapshot": "One-fragment messages v67",
+          "fragments": 1,
+          "median_s": 1.838,
+          "min_s": 1.321,
+          "max_s": 2.168,
+          "samples": 5
+        },
+        {
+          "operation": "Session walk",
+          "snapshot": "Current messages",
+          "fragments": 27,
+          "median_s": 1.75,
+          "min_s": 1.653,
+          "max_s": 2.068,
+          "samples": 5
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "lancedb_vector_search_docs",
+      "label": "LanceDB vector-search documentation",
+      "href": "https://docs.lancedb.com/search/vector-search"
+    },
+    {
+      "id": "lancedb_vector_index_docs",
+      "label": "LanceDB vector-index documentation",
+      "href": "https://docs.lancedb.com/indexing/vector-index"
+    }
+  ]
+}

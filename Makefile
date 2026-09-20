@@ -19,7 +19,8 @@ GOARCH         ?= $(shell go env GOARCH)
 .PHONY: all build build-native release test clean \
 	install uninstall run secrets-decrypt secrets-edit render-config \
 	docker-build up down doctor recall-local embed-local mac-test \
-	install-optimize-timer install-upload-timer build-uploader install-uploader-bin install-raw-uploader \
+	install-startup-service install-optimize-timer install-server-uploader install-upload-timer \
+	build-uploader install-uploader-bin install-mac-uploader install-raw-uploader \
 	fragment-counts migrate-split
 
 all: build
@@ -123,12 +124,17 @@ migrate-split:
 install-optimize-timer:
 	./scripts/install-optimize-timer.sh
 
-install-upload-timer:
+install-startup-service:
+	./scripts/install-startup-service.sh
+
+# Fedora/VPS: install the uploader binary and its systemd user timer.
+install-server-uploader install-upload-timer:
 	./scripts/install-upload-timer.sh
 
 install-uploader-bin: $(UPLOAD_BIN)
 	@mkdir -p $(INSTALL_DIR)
 	install -m 0755 $(UPLOAD_BIN) $(INSTALL_DIR)/tireless-upload
 
-install-raw-uploader: install-uploader-bin
+# macOS: install the uploader binary and its launchd agent.
+install-mac-uploader install-raw-uploader: install-uploader-bin
 	./scripts/install-raw-upload-launchd.sh

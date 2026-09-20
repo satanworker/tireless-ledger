@@ -3,8 +3,22 @@
 `pi-memoryd` is the single recall service for indexed Pi, Codex, and OMP sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
 
 ```text
-Mac JSONL -> R2 raw prefix -> pi-memoryd -> VPS llama.cpp -> R2 Lance `chunks` + `messages`
+Mac launchd uploader -------\
+                             > R2 raw prefix -> VPS pi-memoryd + llama.cpp -> R2 Lance
+VPS systemd uploader -------/                         `chunks` + `messages`
 ```
+
+There are two installations of the same small `tireless-upload` binary, plus
+the central ingester:
+
+| Component | Runs on | Reads | Responsibility |
+|---|---|---|---|
+| Mac uploader (`launchd`) | Each Mac | That Mac's Pi, Codex, and OMP session directories | Copies untouched JSONL to R2 every minute |
+| Server uploader (`systemd --user`) | VPS | The VPS's Pi, Codex, and OMP session directories | Copies untouched JSONL to R2 every minute |
+| Central ingester (`pi-memoryd` in Docker) | VPS | All raw JSONL already uploaded to R2 | Parses, embeds, and writes the shared Lance recall index |
+
+Uploaders never parse or index sessions. `pi-memoryd` does not discover local
+session directories; it only ingests objects that an uploader has copied to R2.
 
 The live derived recall store defaults to `s3://<bucket>/session-recall-lance-token-chunks-v4/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
 
@@ -32,13 +46,23 @@ choice, not data recovery.
 
 ## Builds
 
-Production Linux/ARM64 builds use Docker. The image pins `lancedb-go` main, advances its Rust engine to stable LanceDB 0.37.1 / Lance 10, builds `liblancedb_go.a` with AWS support, applies the checked-in 256 MiB index / 64 MiB metadata session-cache overlay, and links it into the Go 1.24 daemon.
+Production Linux/ARM64 builds use Docker. The image pins a `lancedb-go` commit, advances its Rust engine to stable LanceDB 0.37.1 / Lance 10, builds `liblancedb_go.a` with AWS support, applies the checked-in 256 MiB index / 64 MiB metadata session-cache overlay and bounded disk range-cache overlay, and links it into the Go 1.24 daemon.
 
 ```bash
 make secrets-decrypt
 make docker-build
 make up
 ```
+
+On the VPS, install the user startup service once so Compose is retried only
+after the Tailscale address is available:
+
+```bash
+make install-startup-service
+```
+
+The unit waits for `tailscale` before running `docker compose up`, avoiding a
+boot race when the service ports are bound directly to the Tailscale address.
 
 `make docker-build` always uses the persistent `tireless-limited` BuildKit
 builder. Its named Docker volume retains the Cargo registry, compiled Lance
@@ -105,6 +129,11 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 - Session walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
 - Searchable chunks use FTS and scalar `id` indexes. The production IVF vector index is absent while exact search is enabled; messages use scalar `session_id` and `id` indexes.
 - One-row scan and dummy FTS warmup during startup.
+- R2-backed data, index, and deletion-object range reads use a persistent local
+  read-through cache. Compose enables a 2 GiB cap at `/data/lance-cache`; set
+  `PI_MEMORYD_LANCE_CACHE_BYTES=0` to disable it or provide another byte cap.
+  Manifests, listings, and writes always go to R2, and mutations invalidate any
+  cached ranges for their object.
 - Concurrent native searches are bounded and timed out at the HTTP boundary; a timed-out CGO call keeps its slot until native work actually returns, preventing orphan-query pileups.
 - Writes never run compaction or index refresh inline. Offline maintenance
   compacts fragments, refreshes indexes, and prunes obsolete versions after
@@ -188,18 +217,26 @@ On a Mac, copy `config/raw-upload.env.example` to `~/.config/tireless-ledger/raw
 
 ```bash
 scripts/upload-raw-sessions.sh
-make install-raw-uploader
+make install-mac-uploader
 ```
 
-The launch agent repeats the small `tireless-upload` sync every minute. It compares object sizes and uploads only new or growing JSONL files. There is no local parsing, formatting, deduplication, or embedding.
+The Mac launchd agent repeats the small `tireless-upload` sync every minute. It
+compares object sizes and uploads only new or growing JSONL files. There is no
+local parsing, formatting, deduplication, or embedding.
 
-The VPS uses the same uploader under a user systemd timer:
+The VPS must separately install the same uploader under a user systemd timer:
 
 ```bash
-make install-upload-timer
+make install-server-uploader
 ```
 
-It uploads the VPS's untouched session trees every minute; extraction and embeddings still run only in `pi-memoryd` and `llama-embed`.
+That target rebuilds and installs the uploader binary before refreshing the
+timer, so rerun it after pulling uploader changes. It uploads the VPS's
+untouched session trees every minute; extraction and embeddings still run only
+in `pi-memoryd` and `llama-embed`.
+
+The older target names remain as compatibility aliases:
+`install-raw-uploader` means Mac, and `install-upload-timer` means VPS/server.
 
 ## Production environment
 
@@ -214,6 +251,7 @@ It uploads the VPS's untouched session trees every minute; extraction and embedd
 | `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable legacy-to-split copy batch; default `1024` |
 | `PI_MEMORYD_MAX_CONCURRENT_QUERIES` | Maximum native Lance searches in flight; default `2` |
 | `PI_MEMORYD_QUERY_TIMEOUT` | HTTP-side query deadline; default `30s` |
+| `PI_MEMORYD_LANCE_CACHE_BYTES` | Persistent local cache cap for immutable Lance data/index ranges; Compose defaults to `2147483648` (2 GiB), and `0` disables it |
 | `PI_MEMORYD_S3_BUCKET` | Compose bucket interpolation |
 | `PI_MEMORYD_S3_ENDPOINT` | R2 S3 endpoint; passed as Lance `aws_endpoint` |
 | `PI_MEMORYD_KEY_ID` | R2 access key ID |

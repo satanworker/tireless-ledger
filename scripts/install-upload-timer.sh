@@ -4,6 +4,8 @@ set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 unit_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 
+# Server/VPS installation. This deliberately rebuilds the local binary so the
+# systemd service and the checked-out upload script cannot drift after a pull.
 GOCACHE="${GOCACHE:-/tmp/tireless-ledger-go-cache}" make -C "$project_dir" install-uploader-bin
 install -d -m 0755 "$unit_dir"
 install -m 0644 "$project_dir/systemd/tireless-ledger-upload.service" "$unit_dir/"

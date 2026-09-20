@@ -4,6 +4,8 @@
 <dict>
   <key>Label</key>
   <string>com.earendil.tireless-raw-upload</string>
+  <key>Description</key>
+  <string>Upload this Mac's Codex, Pi, and OMP sessions to Tireless Ledger</string>
   <key>ProgramArguments</key>
   <array><string>__UPLOAD_SCRIPT__</string></array>
   <key>RunAtLoad</key><true/>

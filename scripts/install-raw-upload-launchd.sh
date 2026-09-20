@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="com.earendil.tireless-raw-upload"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/tireless-ledger"
+
+# Mac installation only. The VPS uses install-upload-timer.sh and systemd.
 mkdir -p "$(dirname "$PLIST")" "$LOG_DIR"
 
 sed \

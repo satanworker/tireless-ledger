@@ -1,0 +1,629 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Tireless Recall Latency: Post-Optimization Diagnosis",
+    "description": "Live diagnosis of the September 3, 2026 project-filtered recall benchmark and optimizer state.",
+    "generatedAt": "2026-09-03T07:45:00Z",
+    "sources": [
+      {
+        "id": "user_benchmark",
+        "label": "User-provided Tireless recall benchmark",
+        "query": {
+          "engine": "SQLite snapshot of Tireless recall client benchmark",
+          "id": "project-filtered-limit-5-10-warm-calls",
+          "description": "One explicit cold/warm-up request followed by ten sequential project-filtered recall requests with limit five.",
+          "executed_at": "2026-09-03T07:35:00Z",
+          "language": "sql",
+          "sql": "SELECT 1 AS phase_order, 'Cold / warm-up' AS phase, 1 AS calls, 5.38 AS median_s, 5.38 AS mean_s, 5.38 AS p95_s, 5.38 AS min_s, 5.38 AS max_s UNION ALL SELECT 2, 'Sequential warm calls', 10, 2.82, 2.88, 3.69, 2.18, 3.86",
+          "filters": [
+            "project filter enabled",
+            "limit=5",
+            "10 sequential measured calls",
+            "cold/warm-up call reported separately"
+          ],
+          "metric_definitions": [
+            "Latency is end-to-end client-observed wall-clock time through receipt of the complete response.",
+            "Warm summary statistics exclude the first explicit cold/warm-up call."
+          ]
+        }
+      },
+      {
+        "id": "optimizer_journal",
+        "label": "Tireless optimizer systemd journal",
+        "query": {
+          "engine": "SQLite snapshot of systemd journal observations",
+          "id": "tireless-ledger-optimize-service-2026-09-03",
+          "description": "Execution history for the persistent Tireless Ledger optimization service and its latest maintenance pass.",
+          "executed_at": "2026-09-03T07:39:00Z",
+          "language": "sql",
+          "sql": "SELECT 1 AS step_order, 'Before scheduled optimization' AS step, '04:35' AS time_utc, 327 AS chunks_fragments, 327 AS messages_fragments UNION ALL SELECT 2, 'After scheduled optimization', '04:42', 2, 2",
+          "filters": [
+            "unit=tireless-ledger-optimize.service",
+            "latest completed run on September 3, 2026"
+          ],
+          "tables_used": [
+            "systemd user journal: tireless-ledger-optimize.service"
+          ]
+        }
+      },
+      {
+        "id": "live_fragment_probe",
+        "label": "Live Lance fragment-count probe",
+        "query": {
+          "engine": "pi-memoryd maintenance CLI",
+          "id": "fragment-counts-2026-09-03T07:40Z",
+          "description": "Read-only fragment count against the active R2-backed split tables after the scheduled optimizer completed.",
+          "executed_at": "2026-09-03T07:40:03Z",
+          "language": "shell",
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance",
+            "session-recall-lance-token-chunks-v4/messages.lance"
+          ]
+        }
+      },
+      {
+        "id": "daemon_benchmark_logs",
+        "label": "Production daemon timings for the reported benchmark",
+        "query": {
+          "engine": "pi-memoryd structured logs",
+          "id": "recall-query-complete-2026-09-03T07:35Z",
+          "description": "The daemon-side elapsed times corresponding to the reported cold call and ten sequential warm client requests.",
+          "executed_at": "2026-09-03T07:35:59Z",
+          "filters": [
+            "table=chunks",
+            "fetch_k=50",
+            "one cold call plus ten sequential warm calls"
+          ],
+          "metric_definitions": [
+            "Daemon latency starts after query-slot acquisition and ends when native Lance search returns.",
+            "Client overhead is the difference between matched client wall time and daemon search time."
+          ],
+          "tables_used": [
+            "Docker container log: tireless-ledger-pi-memoryd-1"
+          ]
+        }
+      },
+      {
+        "id": "mode_probe",
+        "label": "Live keyword, vector, hybrid, and embedding probes",
+        "query": {
+          "engine": "SQLite snapshot of Tireless HTTP API probes",
+          "id": "mode-decomposition-2026-09-03T07:43Z",
+          "description": "Three sequential calls per recall mode using the same query and project filter, plus three embedding-only requests.",
+          "executed_at": "2026-09-03T07:43:00Z",
+          "language": "sql",
+          "sql": "SELECT 'Hybrid recall' AS operation, 3 AS calls, 2.533 AS median_s, 2.307 AS min_s, 3.202 AS max_s UNION ALL SELECT 'Vector-only recall', 3, 2.551, 1.805, 3.014 UNION ALL SELECT 'Keyword-only recall', 3, 0.552, 0.382, 1.143 UNION ALL SELECT 'Query embedding', 3, 0.013, 0.012, 0.023",
+          "filters": [
+            "query=tireless recall latency",
+            "project_name=tireless-ledger",
+            "limit=5",
+            "three sequential calls per mode"
+          ],
+          "metric_definitions": [
+            "Mode median is the middle wall-clock latency of three sequential live HTTP requests.",
+            "Hybrid submits both the vector and full-text query and uses reciprocal-rank fusion."
+          ],
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance",
+            "llama-embed embeddings endpoint"
+          ]
+        }
+      },
+      {
+        "id": "corpus_comparison",
+        "label": "Current row audit compared with the August production audit",
+        "query": {
+          "engine": "SQLite snapshot of pi-memoryd audits",
+          "id": "active-row-growth-2026-08-25-to-2026-09-03",
+          "description": "The current duplicate-ID audit was compared with the reviewed August 25 production row total recorded in README.md. Growth is (375180 - 171517) / 171517.",
+          "executed_at": "2026-09-03T07:41:19Z",
+          "language": "sql",
+          "sql": "SELECT 1 AS period_order, 'August 25 reviewed audit' AS period, 171517 AS rows, 171517 AS unique_ids, 0.0 AS change_pct UNION ALL SELECT 2, 'September 3 live audit', 375180, 375180, 118.74",
+          "filters": [
+            "active split chunks and messages tables",
+            "current audit requires unique IDs",
+            "August baseline is the reviewed post-cutover production audit"
+          ],
+          "metric_definitions": [
+            "Active rows are the combined rows in the production chunks and messages tables.",
+            "Row growth compares the September 3 audit with the August 25 reviewed production audit."
+          ],
+          "tables_used": [
+            "session-recall-lance-token-chunks-v4/chunks.lance",
+            "session-recall-lance-token-chunks-v4/messages.lance",
+            "GitHub repository production-state documentation at commit 6df7824"
+          ]
+        }
+      },
+      {
+        "id": "search_path_diagnosis",
+        "label": "Production search path and current LanceDB guidance",
+        "href": "https://github.com/satanworker/tireless-ledger",
+        "query": {
+          "engine": "repository inspection and LanceDB documentation",
+          "id": "exact-filtered-search-path-2026-09-03",
+          "description": "Reviewed the active runtime settings, query construction, table indexes, startup warm-up, maintenance implementation, and current official LanceDB filtering and indexing guidance.",
+          "executed_at": "2026-09-03T07:45:00Z",
+          "language": "go",
+          "filters": [
+            "PI_MEMORYD_EXACT_VECTOR_SEARCH=true",
+            "PI_MEMORYD_SPLIT_TABLES=true",
+            "project-filtered limit=5 requests expand to fetch_k=50"
+          ],
+          "tables_used": [
+            "GitHub repository search implementation at commit 6df7824",
+            "GitHub repository HTTP query implementation at commit 6df7824",
+            "GitHub repository optimizer implementation at commit 6df7824",
+            "GitHub repository production configuration at commit 6df7824"
+          ]
+        }
+      }
+    ],
+    "charts": [
+      {
+        "id": "mode_latency_chart",
+        "title": "Median latency by operation",
+        "subtitle": "Three sequential project-filtered calls per mode; seconds",
+        "showDescription": true,
+        "intent": "comparison",
+        "question": "Which operation dominates project-filtered recall latency?",
+        "rationale": "A categorical bar comparison makes the vector-versus-keyword latency gap directly visible without implying a time trend from the small diagnostic sample.",
+        "comparisonContext": {
+          "baseline": "Keyword-only recall",
+          "grain": "operation",
+          "unit": "seconds"
+        },
+        "type": "bar",
+        "dataset": "mode_latency",
+        "sourceId": "mode_probe",
+        "encodings": {
+          "x": {
+            "field": "operation",
+            "type": "nominal",
+            "label": "Operation"
+          },
+          "y": {
+            "field": "median_s",
+            "type": "quantitative",
+            "format": "number",
+            "label": "Median latency",
+            "unit": "s"
+          },
+          "tooltip": [
+            {
+              "field": "calls",
+              "type": "quantitative",
+              "format": "number",
+              "label": "Calls"
+            },
+            {
+              "field": "min_s",
+              "type": "quantitative",
+              "format": "number",
+              "label": "Minimum",
+              "unit": "s"
+            },
+            {
+              "field": "max_s",
+              "type": "quantitative",
+              "format": "number",
+              "label": "Maximum",
+              "unit": "s"
+            }
+          ]
+        },
+        "yAxisTitle": "Median latency (s)",
+        "valueFormat": "number",
+        "unit": "s",
+        "layout": "full",
+        "labels": {
+          "values": "all"
+        },
+        "palette": {
+          "kind": "sequential",
+          "name": "blue"
+        },
+        "settings": {
+          "showValues": true,
+          "sort": "custom"
+        },
+        "surface": {
+          "surface": "export",
+          "viewMode": "both"
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "reported_latency",
+        "title": "Reported end-to-end latency",
+        "subtitle": "Project-filtered recall, limit five; cold request shown separately",
+        "dataset": "reported_latency",
+        "defaultSort": {
+          "field": "phase",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "sourceId": "user_benchmark",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "phase",
+            "label": "Phase",
+            "type": "text"
+          },
+          {
+            "field": "calls",
+            "label": "Calls",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "median_s",
+            "label": "Median (s)",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "mean_s",
+            "label": "Mean (s)",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "p95_s",
+            "label": "P95 (s)",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "min_s",
+            "label": "Min (s)",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "max_s",
+            "label": "Max (s)",
+            "type": "number",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "maintenance_state",
+        "title": "Latest optimizer state",
+        "subtitle": "Scheduled pass completed before the latency benchmark",
+        "dataset": "maintenance_state",
+        "defaultSort": {
+          "field": "time_utc",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "sourceId": "optimizer_journal",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "step",
+            "label": "Step",
+            "type": "text"
+          },
+          {
+            "field": "time_utc",
+            "label": "Time (UTC)",
+            "type": "text"
+          },
+          {
+            "field": "chunks_fragments",
+            "label": "Chunks fragments",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "messages_fragments",
+            "label": "Messages fragments",
+            "type": "number",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "mode_latency",
+        "title": "Live latency by operation",
+        "subtitle": "Same query and project filter; three sequential requests per mode",
+        "dataset": "mode_latency",
+        "defaultSort": {
+          "field": "median_s",
+          "direction": "desc"
+        },
+        "density": "spacious",
+        "sourceId": "mode_probe",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "operation",
+            "label": "Operation",
+            "type": "text"
+          },
+          {
+            "field": "calls",
+            "label": "Calls",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "median_s",
+            "label": "Median (s)",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "min_s",
+            "label": "Min (s)",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "max_s",
+            "label": "Max (s)",
+            "type": "number",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "corpus_growth",
+        "title": "Production corpus growth",
+        "subtitle": "Active chunks and messages rows after split-table cutover",
+        "dataset": "corpus_growth",
+        "defaultSort": {
+          "field": "period",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "sourceId": "corpus_comparison",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "period",
+            "label": "Audit",
+            "type": "text"
+          },
+          {
+            "field": "rows",
+            "label": "Active rows",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "unique_ids",
+            "label": "Unique IDs",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "change_pct",
+            "label": "Change vs baseline",
+            "type": "number",
+            "format": "number",
+            "unit": "%",
+            "movement": true
+          }
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# Tireless Recall Latency: Post-Optimization Diagnosis",
+        "layout": "full"
+      },
+      {
+        "id": "executive_summary",
+        "type": "markdown",
+        "body": "## Executive Summary\n\n- **The optimizer did run and worked.** Today's scheduled pass compacted both active tables from 327 fragments to 2 before the benchmark; a later read-only check still found 2 fragments.\n- **The remaining latency is vector-search cost.** Keyword-only recall is sub-second when warm, while vector-only and hybrid requests take roughly 2–3 seconds. Embedding takes only tens of milliseconds.\n- **The workload outgrew the old flat-scan decision.** Active rows increased from 171.5k to 375.2k, while production still forces exhaustive vector search over R2. The project filter is not scalar-indexed, and limit five is expanded to 50 candidates.\n- **Compaction cannot solve an O(n) search path.** The next targeted change is a `project_name` scalar-index canary, followed by a representative ANN recall/latency evaluation if exact filtered search remains above target.",
+        "layout": "full"
+      },
+      {
+        "id": "reported_latency_finding",
+        "type": "markdown",
+        "body": "## The reported regression is real\n\nThe ten measured warm calls had a 2.82-second median and 3.69-second p95. The separate cold request took 5.38 seconds. The matching daemon logs show that native Lance search accounts for about 2.38 seconds of the warm median, leaving roughly 0.44 seconds for client, transport, and response handling.",
+        "layout": "full"
+      },
+      {
+        "id": "reported_latency_table_block",
+        "type": "table",
+        "tableId": "reported_latency",
+        "layout": "full"
+      },
+      {
+        "id": "optimizer_finding",
+        "type": "markdown",
+        "body": "## The maintenance hook ran before the benchmark\n\nThe scheduled optimizer started at 04:35 UTC on September 3, detected 327 fragments, compacted `chunks` to 2 by 04:39, compacted `messages` to 2 by 04:42, refreshed indexes, pruned old versions, and restarted the daemon. The benchmark began around 07:35 UTC, almost three hours later. This rules out stale fragment buildup as the cause of this specific sample.",
+        "layout": "full",
+        "sourceId": "optimizer_journal"
+      },
+      {
+        "id": "maintenance_table_block",
+        "type": "table",
+        "tableId": "maintenance_state",
+        "layout": "full"
+      },
+      {
+        "id": "current_fragment_state",
+        "type": "markdown",
+        "body": "### The compact state persisted\n\nA read-only check at 07:40 UTC still reported exactly 2 fragments in each active table. The optimization was not merely scheduled; its output remained active when latency was measured.",
+        "layout": "full",
+        "sourceId": "live_fragment_probe"
+      },
+      {
+        "id": "vector_driver_finding",
+        "type": "markdown",
+        "body": "## Vector search is the long pole\n\nIn a same-query decomposition, warm keyword-only requests were 0.38–0.55 seconds after the first call. Vector-only requests were 1.80–3.01 seconds, and hybrid requests were 2.31–3.20 seconds. Embedding itself was 0.013–0.023 seconds. Hybrid tracking vector-only latency while BM25 remains sub-second isolates the vector path as the dominant driver.",
+        "layout": "full",
+        "sourceId": "mode_probe"
+      },
+      {
+        "id": "mode_chart_block",
+        "type": "chart",
+        "chartId": "mode_latency_chart",
+        "layout": "full"
+      },
+      {
+        "id": "mode_table_block",
+        "type": "table",
+        "tableId": "mode_latency",
+        "layout": "full"
+      },
+      {
+        "id": "corpus_growth_finding",
+        "type": "markdown",
+        "body": "## The flat scan now covers a corpus 119% larger\n\nThe active split tables contain 375,180 rows with 375,180 unique IDs and no duplicates. The reviewed August 25 audit contained 171,517 rows. That is a 203,663-row increase, or 119%, after session-state indexing changed the parser version and triggered raw-object reprocessing. The old decision that flat scans were faster was measured near 116k searchable chunks, not against today's corpus.",
+        "layout": "full",
+        "sourceId": "corpus_comparison"
+      },
+      {
+        "id": "corpus_table_block",
+        "type": "table",
+        "tableId": "corpus_growth",
+        "layout": "full"
+      },
+      {
+        "id": "search_path_finding",
+        "type": "markdown",
+        "body": "## The active query path bypasses the vector index\n\nProduction sets exact-vector mode, which tells Lance to bypass ANN and exhaustively compare vectors. A requested limit of five is expanded to 50 candidates so chunk hits can be collapsed to parent messages. The `project_name` predicate is applied, but the table creates scalar indexes only for IDs and session IDs; no project index exists. Startup warm-up touches one row and FTS, not the vector path, explaining why the first semantic request remains especially cold.\n\nCurrent LanceDB guidance describes flat search as O(n), recommends scalar indexes on frequently filtered columns, and recommends forced flat scans primarily for small datasets or recall measurement. That guidance now aligns with the measured production behavior.",
+        "layout": "full",
+        "sourceId": "search_path_diagnosis"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## Recommended next steps\n\n1. **Create a `project_name` scalar-index canary first.** Project is the filter in the reported workload, and this preserves exact-vector recall while testing whether prefiltering can materially shrink the scan. Consider indexes for other frequent filters only after measuring their workload.\n2. **Re-run ANN recall/latency evaluation at the current corpus size.** The earlier flat-versus-IVF conclusion was valid around 116k chunks, but the table has since expanded substantially. Compare exact results with auto-tuned or bounded-probe ANN across representative project-filtered queries before changing production recall.\n3. **Add vector warm-up if cold latency matters.** The current startup warm-up does not execute a vector query. A bounded warm-up can shift the first-read penalty into readiness, though it will not lower steady-state O(n) cost.\n4. **Reduce candidate overfetch only with a recall check.** The minimum `fetch_k=50` is ten times the requested limit. Lowering it may reduce result-materialization cost, but could lose distinct parent messages when several chunks from one message rank highly.\n5. **Treat host contention as secondary.** The host had material Chromium and `herdr` CPU activity during diagnosis. Repeat the canary under a quiet host window, but do not expect that alone to remove the vector-versus-BM25 gap.",
+        "layout": "full"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## Further questions\n\n- What warm and cold latency targets should recall meet?\n- What recall-at-5 loss, if any, is acceptable relative to exact search?\n- Which filter combinations dominate real traffic beyond `project_name`?",
+        "layout": "full"
+      },
+      {
+        "id": "caveats",
+        "type": "markdown",
+        "body": "## Caveats and assumptions\n\nThe reported client benchmark did not include its raw per-call series, so client-side median attribution uses the matching daemon sequence rather than request IDs. The three-call mode probe is diagnostic, not a production SLO sample. Current row count combines chunks and messages; vector search reads only chunks, so total-row growth is directional evidence rather than the exact vector-row denominator. The category chart compares observed operation medians only and should not be read as a stable time trend or SLO estimate.",
+        "layout": "full"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "status": "ready",
+    "generatedAt": "2026-09-03T07:45:00Z",
+    "datasets": {
+      "reported_latency": [
+        {
+          "phase_order": 1,
+          "phase": "Cold / warm-up",
+          "calls": 1,
+          "median_s": 5.38,
+          "mean_s": 5.38,
+          "p95_s": 5.38,
+          "min_s": 5.38,
+          "max_s": 5.38
+        },
+        {
+          "phase_order": 2,
+          "phase": "Sequential warm calls",
+          "calls": 10,
+          "median_s": 2.82,
+          "mean_s": 2.88,
+          "p95_s": 3.69,
+          "min_s": 2.18,
+          "max_s": 3.86
+        }
+      ],
+      "maintenance_state": [
+        {
+          "step_order": 1,
+          "step": "Before scheduled optimization",
+          "time_utc": "04:35",
+          "chunks_fragments": 327,
+          "messages_fragments": 327
+        },
+        {
+          "step_order": 2,
+          "step": "After scheduled optimization",
+          "time_utc": "04:42",
+          "chunks_fragments": 2,
+          "messages_fragments": 2
+        }
+      ],
+      "mode_latency": [
+        {
+          "operation": "Hybrid recall",
+          "calls": 3,
+          "median_s": 2.533,
+          "min_s": 2.307,
+          "max_s": 3.202
+        },
+        {
+          "operation": "Vector-only recall",
+          "calls": 3,
+          "median_s": 2.551,
+          "min_s": 1.805,
+          "max_s": 3.014
+        },
+        {
+          "operation": "Keyword-only recall",
+          "calls": 3,
+          "median_s": 0.552,
+          "min_s": 0.382,
+          "max_s": 1.143
+        },
+        {
+          "operation": "Query embedding",
+          "calls": 3,
+          "median_s": 0.013,
+          "min_s": 0.012,
+          "max_s": 0.023
+        }
+      ],
+      "corpus_growth": [
+        {
+          "period_order": 1,
+          "period": "August 25 reviewed audit",
+          "rows": 171517,
+          "unique_ids": 171517,
+          "change_pct": 0
+        },
+        {
+          "period_order": 2,
+          "period": "September 3 live audit",
+          "rows": 375180,
+          "unique_ids": 375180,
+          "change_pct": 118.74
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "lancedb_filtering_docs",
+      "label": "LanceDB metadata filtering documentation",
+      "href": "https://docs.lancedb.com/search/filtering"
+    },
+    {
+      "id": "lancedb_scalar_index_docs",
+      "label": "LanceDB scalar-index documentation",
+      "href": "https://docs.lancedb.com/indexing/scalar-index"
+    },
+    {
+      "id": "lancedb_vector_index_docs",
+      "label": "LanceDB vector-index documentation",
+      "href": "https://docs.lancedb.com/indexing/vector-index"
+    }
+  ]
+}

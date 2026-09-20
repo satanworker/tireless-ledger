@@ -1,0 +1,66 @@
+diff --git a/rust/Cargo.toml b/rust/Cargo.toml
+index bc94f05..9465011 100644
+--- a/rust/Cargo.toml
++++ b/rust/Cargo.toml
+@@ -18,6 +18,12 @@ path = "src/lib_simple.rs"
+ 
+ [dependencies]
+ lancedb = { git = "https://github.com/lancedb/lancedb.git", tag = "v0.37.1", default-features = false }
++lance = { version = "=10.0.0", default-features = false }
++object_store = "0.13.2"
++async-trait = "0.1"
++bytes = "1"
++futures = "0.3"
++sha2 = "0.10"
+ tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+ libc = "0.2"
+ log = "0.4"
+@@ -37,6 +43,9 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
+ [target.x86_64-apple-darwin.dependencies]
+ 
++[dev-dependencies]
++tempfile = "3"
++
+ [features]
+ default = []
+ remote = ["lancedb/remote"]
+ fp16kernels = ["lancedb/fp16kernels"]
+diff --git a/rust/src/lib_simple.rs b/rust/src/lib_simple.rs
+index 113371c..598af5e 100644
+--- a/rust/src/lib_simple.rs
++++ b/rust/src/lib_simple.rs
+@@ -5,6 +5,7 @@
+ pub mod connection;
+ pub mod conversion;
+ pub mod data;
++mod disk_cache;
+ pub mod database;
+ pub mod ffi;
+ pub mod index;
+diff --git a/rust/src/table.rs b/rust/src/table.rs
+index 5e34899..c76ca11 100644
+--- a/rust/src/table.rs
++++ b/rust/src/table.rs
+@@ -2,6 +2,7 @@
+ 
+ //! Table management operations
+ 
++use crate::disk_cache::table_read_params;
+ use crate::ffi::{from_c_str, SimpleResult};
+ use crate::runtime::get_simple_runtime;
+ use crate::schema::create_arrow_schema_from_json;
+@@ -170,7 +171,13 @@ pub extern "C" fn simple_lancedb_open_table(
+         let conn = unsafe { &*(handle as *const lancedb::Connection) };
+         let rt = get_simple_runtime();
+ 
+-        match rt.block_on(async { conn.open_table(&name).execute().await }) {
++        match rt.block_on(async {
++            let mut builder = conn.open_table(&name);
++            if let Some(params) = table_read_params() {
++                builder = builder.lance_read_params(params);
++            }
++            builder.execute().await
++        }) {
+             Ok(table) => {
+                 let boxed_table = Box::new(table);
+                 unsafe {

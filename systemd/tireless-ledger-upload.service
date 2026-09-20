@@ -1,5 +1,5 @@
 [Unit]
-Description=Upload original Codex and Pi sessions to Tireless Ledger raw storage
+Description=Upload this server's Codex, Pi, and OMP sessions to Tireless Ledger
 ConditionPathExists=%h/tireless-ledger/.env
 ConditionPathExists=%h/.local/bin/tireless-upload
 

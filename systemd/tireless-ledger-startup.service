@@ -1,0 +1,16 @@
+[Unit]
+Description=Start Tireless Ledger after Tailscale is online
+ConditionPathExists=%h/tireless-ledger/docker-compose.yml
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tireless-ledger
+ExecStartPre=/usr/bin/tailscale wait
+ExecStart=/usr/bin/docker compose up -d --no-build
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=default.target

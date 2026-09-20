@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Persistent Lance range cache (2026-09-03)
+
+- R2-backed Lance data, index, and deletion-object ranges now use a bounded,
+  persistent read-through cache on the daemon data volume. Mutable manifests,
+  listings, and writes continue to use R2 directly; object mutations invalidate
+  cached ranges.
+- Docker Compose enables a 2 GiB hard cap at `/data/lance-cache`. Set
+  `PI_MEMORYD_LANCE_CACHE_BYTES=0` to disable it or set another byte limit.
+- An unrestricted exact-vector benchmark (`limit=5`) populated 396 MiB across
+  271 cache files. Ten subsequent calls measured 0.37s median, 0.39s mean, and
+  0.51s p95, down from the earlier 2.82s median and 2.88s mean over R2.
+- After a daemon restart, the cache reopened all 396 MiB without fetching new
+  vector ranges. The first SSD scan took 2.83s; subsequent calls returned to
+  0.28–0.46s as the kernel page cache warmed.
+
 ### Exact vector serving (2026-08-25)
 
 - Vector and hybrid queries now default to Lance's exhaustive flat scan via
