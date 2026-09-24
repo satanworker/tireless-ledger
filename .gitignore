@@ -2,6 +2,7 @@
 /bin/
 /data/
 /models/
+/.mcp/
 /.env
 /config/vector.s3.yaml
 *.log
