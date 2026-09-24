@@ -178,11 +178,17 @@ func rawRecord(host, harness, sessionID, turnID, role, text string, timestamp in
 	if timestamp == 0 {
 		timestamp = 1
 	}
+	idInput := host + "|" + harness + "|" + sessionID + "|" + turnID
+	filePath := host + "/" + harness + "/" + sessionID + "/" + turnID
+	if kind != "message" {
+		idInput = host + "|" + harness + "|" + sessionID + "|" + kind + "|" + turnID
+		filePath = host + "/" + harness + "/" + sessionID + "/" + kind + "/" + turnID
+	}
 	return MemoryItem{
-		ID:             hashText(host + "|" + harness + "|" + sessionID + "|" + kind + "|" + turnID),
+		ID:             hashText(idInput),
 		ForwardContent: text,
 		Metadata: Metadata{
-			Scope: ScopeSession, ProjectName: project, FilePath: host + "/" + harness + "/" + sessionID + "/" + kind + "/" + turnID,
+			Scope: ScopeSession, ProjectName: project, FilePath: filePath,
 			FileHash: hashText(text), Timestamp: timestamp, SessionID: sessionID, Host: host, Harness: harness, Role: role,
 			RecordKind: kind,
 		},
