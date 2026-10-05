@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### IVF vector search at 32 probes (2026-10-05)
+
+- At 325,975 chunks the exact flat scan reads and decodes all 501 MB of
+  vectors per query (~0.45 CPU-s; the distance math itself is ~0.03 s), and
+  hybrid queries pay it about twice.
+- The 64-partition IVF-Flat index was recreated on production `chunks`
+  (35 s, 537 MiB under `_indices`); it survives `--optimize`.
+- Production config moves to `PI_MEMORYD_EXACT_VECTOR_SEARCH=false` and
+  `PI_MEMORYD_VECTOR_NPROBES=32`. Benchmarked over R2 with the production
+  binary (10 fresh + 10 repeated queries per mode): hybrid fresh median
+  0.93 s → 0.38 s, vector repeat 0.47 s → 0.17 s; recall@5 against exact on
+  20 queries was 0.98 (vector) and 0.93 (hybrid; 0.95 at 64 probes, so
+  roughly run-to-run noise). 16 probes dropped hybrid recall to 0.73.
+- home-satan's optimize timer now drops the IVF index, compacts, and rebuilds
+  it on every compaction run (drop 1 s, optimize 15 s, build 9 s on a local
+  copy), so centroids track corpus growth with no manual step. A failed build
+  leaves no index and queries fall back to an exact scan.
+- `pi-memoryd` start now runs one warm-up hybrid query (`ExecStartPost`); the
+  first cold query otherwise took 4.8–21.9 s loading the index from R2.
+
 ### Persistent Lance range cache (2026-09-03)
 
 - R2-backed Lance data, index, and deletion-object ranges now use a bounded,

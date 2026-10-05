@@ -93,11 +93,12 @@ make install-optimize-timer
 The timer uses a non-blocking runtime lock, so delayed timer invocations cannot
 overlap an optimization already in progress.
 
-Exact flat vector search is the production default. An IVF-Flat index is an
-optional, reversible mode for a materially larger corpus, but enable it only
-after measuring representative recall and latency with fewer than all 64
-partitions. Searching all partitions was slower than a flat scan over R2 at
-116,000 rows.
+Production runs IVF-Flat (64 partitions) with 32 probes: at 326,000 chunks the
+exact flat scan decodes all 501 MB of vectors per query, and 32 probes cut
+hybrid latency over R2 by about 2.4× at 0.98 vector recall@5. Probing all 64
+partitions leaves vector-only latency unchanged; 16 probes dropped hybrid
+recall@5 to 0.73.
+The index is derived and reversible:
 
 ```sh
 docker compose run --rm --no-deps pi-memoryd --create-vector-index
@@ -244,8 +245,8 @@ The older target names remain as compatibility aliases:
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
 | `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-token-chunks-v4` |
-| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned when exact mode is disabled; defaults to all 64 |
-| `PI_MEMORYD_EXACT_VECTOR_SEARCH` | Bypass IVF and scan all vectors exactly; defaults to `true` because this is faster over R2 at the current corpus size and guarantees 100% vector recall |
+| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned when exact mode is disabled; defaults to all 64, production uses 32 |
+| `PI_MEMORYD_EXACT_VECTOR_SEARCH` | Bypass IVF and scan all vectors exactly; code default `true`, production `false` with the IVF index present |
 | `PI_MEMORYD_SPLIT_TABLES` | Read/write separate `chunks` and `messages` tables; production default `true` |
 | `PI_MEMORYD_DUAL_WRITE_SPLIT` | Write both legacy and split layouts during migration/observation; production default `false` |
 | `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable legacy-to-split copy batch; default `1024` |
