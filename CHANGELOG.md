@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Block disk cache, table warm-up, 512 IVF partitions (2026-10-06)
+
+- Every immutable read now goes through the disk cache. Before, only batched
+  `get_ranges` reads with an exactly repeated range were cached; whole-file
+  GETs and single-range GETs went straight to R2. A read-only logging proxy
+  counted 45 R2 requests per repeated hybrid search and 140–200 per fresh one,
+  in up to 8 sequential round trips (0.64 s of a 0.82 s search).
+- The cache stores aligned 256 KiB blocks plus a small per-object metadata
+  record, so any read inside an already-fetched region is served locally.
+  Whole-object GETs up to 8 MiB are cached; conditional and versioned reads,
+  manifests, and listings still go to R2.
+- The first read of a table starts a background warm-up that copies its index
+  files, then its data files while indexes plus data fit in half the cache
+  cap; larger tables keep data on demand. Production's `chunks` table warms
+  1.78 GB in about 11 s.
+- Lance's in-memory index cache grows from 256 MiB to 1 GiB, so the 537 MiB
+  vector index stays resident.
+- The vector index uses 512 partitions (was 64); production searches 128.
+  Against numpy brute force on a local copy (30 queries), 512/128 matched the
+  previous 64/32 recall@5 (0.99) at about 60% of the vector time.
+- Measured over R2 from an empty cache with the 512/128 index, after warm-up:
+  0 R2 requests per search; fresh hybrid 0.06–0.09 s (was 0.63–0.67 s), fresh
+  keyword 0.029 s (0.40–0.45 s), fresh vector 0.048 s, repeated hybrid
+  0.055 s (0.27–0.30 s), 0.09 CPU-s per hybrid search (0.34–0.38).
+- `--exact-vector-search` is ignored once a vector index exists: Lance still
+  probes `PI_MEMORYD_VECTOR_NPROBES` partitions. With no index, searches are a
+  real flat scan.
+
 ### IVF vector search at 32 probes (2026-10-05)
 
 - At 325,975 chunks the exact flat scan reads and decodes all 501 MB of
@@ -14,10 +42,8 @@
   (10 fresh + 10 repeated queries per mode, three rounds): hybrid fresh median
   0.84 s → 0.63–0.67 s, hybrid repeat 0.56 s → 0.27–0.30 s, vector repeat
   0.38 s → 0.17–0.22 s, hybrid CPU per query 0.85 s → 0.34–0.38 s. Recall@5
-  against an exact-scan instance on 20 queries: 1.00 vector, 0.98 hybrid.
-  16 probes dropped hybrid recall to 0.73 in pre-deploy testing.
-- Fresh hybrid queries are now bounded by the R2-backed FTS path (text-only
-  fresh median 0.40–0.45 s; 0.02 s on a local copy of the same tables).
+  against an exact scan before the switch (20 queries): 0.98 vector, 0.93
+  hybrid. 16 probes dropped hybrid recall to 0.73.
 - home-satan's optimize timer now drops the IVF index, compacts, and rebuilds
   it on every compaction run (drop 1 s, optimize 15 s, build 9 s on a local
   copy), so centroids track corpus growth with no manual step. A failed build

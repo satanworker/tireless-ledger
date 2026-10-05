@@ -93,13 +93,13 @@ make install-optimize-timer
 The timer uses a non-blocking runtime lock, so delayed timer invocations cannot
 overlap an optimization already in progress.
 
-Production runs IVF-Flat (64 partitions) with 32 probes: at 326,000 chunks the
-exact flat scan decodes all 501 MB of vectors per query. 32 probes halved
-repeat hybrid latency (0.56 → 0.28 s), cut fresh hybrid from 0.84 to about
-0.65 s, and kept recall@5 at 1.00 vector / 0.98 hybrid against exact. Probing
-all 64 partitions leaves vector-only latency unchanged; 16 probes dropped
-hybrid recall@5 to 0.73.
-The index is derived and reversible:
+Production runs IVF-Flat with 512 partitions and searches 128 of them
+(`PI_MEMORYD_VECTOR_NPROBES=128`). At 326,000 chunks a flat scan decodes all
+501 MB of vectors per query; 512/128 kept recall@5 at 0.99 against numpy brute
+force (30 queries) while reading a quarter of the index. 16 of 512 probes
+dropped recall@5 to 0.53. `PI_MEMORYD_EXACT_VECTOR_SEARCH=true` does not
+bypass an existing index, so drop the index for exact scans. The index is
+derived and reversible:
 
 ```sh
 docker compose run --rm --no-deps pi-memoryd --create-vector-index
@@ -126,16 +126,22 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 ## Lance behavior
 
 - Merge-insert on stable `id`; an ingest response is successful only after persistence.
-- Exact vector, BM25, and combined hybrid search with LanceDB RRF. At the current corpus size, exact flat vector scans outperform all-partition IVF_FLAT queries over R2.
+- Vector (IVF-Flat, 512 partitions), BM25, and combined hybrid search with LanceDB RRF.
 - Search reads only the `chunks` table; session walking reads only `messages`.
 - Session walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
-- Searchable chunks use FTS and scalar `id` indexes. The production IVF vector index is absent while exact search is enabled; messages use scalar `session_id` and `id` indexes.
+- Searchable chunks use IVF-Flat vector, FTS, and scalar `id` indexes; messages use scalar `session_id` and `id` indexes.
 - One-row scan and dummy FTS warmup during startup.
-- R2-backed data, index, and deletion-object range reads use a persistent local
-  read-through cache. Compose enables a 2 GiB cap at `/data/lance-cache`; set
+- Every immutable read (data, index, and deletion files) goes through a
+  persistent local block cache: aligned 256 KiB blocks plus a per-object
+  metadata record, so any range inside an already-fetched region is served
+  from disk. The first read of a table copies its index files into the cache
+  in the background, then its data files while indexes plus data fit in half
+  the cap; larger tables fetch result rows on demand. Compose enables a 2 GiB
+  cap at `/data/lance-cache` (home-satan uses 6 GiB); set
   `PI_MEMORYD_LANCE_CACHE_BYTES=0` to disable it or provide another byte cap.
-  Manifests, listings, and writes always go to R2, and mutations invalidate any
-  cached ranges for their object.
+  Manifests, listings, conditional reads, and writes always go to R2, and
+  mutations invalidate any cached blocks for their object.
+- Lance's in-memory index cache is 1 GiB, enough to keep the vector index resident.
 - Concurrent native searches are bounded and timed out at the HTTP boundary; a timed-out CGO call keeps its slot until native work actually returns, preventing orphan-query pileups.
 - Writes never run compaction or index refresh inline. Offline maintenance
   compacts fragments, refreshes indexes, and prunes obsolete versions after
@@ -246,14 +252,14 @@ The older target names remain as compatibility aliases:
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
 | `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-token-chunks-v4` |
-| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions scanned when exact mode is disabled; defaults to all 64, production uses 32 |
-| `PI_MEMORYD_EXACT_VECTOR_SEARCH` | Bypass IVF and scan all vectors exactly; code default `true`, production `false` with the IVF index present |
+| `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions searched per vector query (of 512); default 64, production 128 |
+| `PI_MEMORYD_EXACT_VECTOR_SEARCH` | Intended to bypass IVF for an exact scan, but Lance ignores it while an index exists; code default `true`, production `false` |
 | `PI_MEMORYD_SPLIT_TABLES` | Read/write separate `chunks` and `messages` tables; production default `true` |
 | `PI_MEMORYD_DUAL_WRITE_SPLIT` | Write both legacy and split layouts during migration/observation; production default `false` |
 | `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable legacy-to-split copy batch; default `1024` |
 | `PI_MEMORYD_MAX_CONCURRENT_QUERIES` | Maximum native Lance searches in flight; default `2` |
 | `PI_MEMORYD_QUERY_TIMEOUT` | HTTP-side query deadline; default `30s` |
-| `PI_MEMORYD_LANCE_CACHE_BYTES` | Persistent local cache cap for immutable Lance data/index ranges; Compose defaults to `2147483648` (2 GiB), and `0` disables it |
+| `PI_MEMORYD_LANCE_CACHE_BYTES` | Persistent local block-cache cap for immutable Lance data/index files; Compose defaults to `2147483648` (2 GiB), and `0` disables it. Tables up to half the cap are warmed fully |
 | `PI_MEMORYD_S3_BUCKET` | Compose bucket interpolation |
 | `PI_MEMORYD_S3_ENDPOINT` | R2 S3 endpoint; passed as Lance `aws_endpoint` |
 | `PI_MEMORYD_KEY_ID` | R2 access key ID |

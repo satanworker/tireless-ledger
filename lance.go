@@ -25,7 +25,7 @@ const (
 	lanceChunksTable      = "chunks"
 	lanceMessagesTable    = "messages"
 	lanceVectorIndexName  = "vector_ivf_flat"
-	lanceVectorPartitions = uint32(64)
+	lanceVectorPartitions = uint32(512)
 	lanceVectorNProbes    = 64
 )
 

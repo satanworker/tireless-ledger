@@ -3,17 +3,18 @@
 // Bounded, persistent read-through cache for immutable Lance object ranges.
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{stream::BoxStream, StreamExt};
+use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use lance::dataset::ReadParams;
 use lance::io::{ObjectStoreParams, WrappingObjectStore};
 use object_store::{
-    path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result as ObjectStoreResult,
+    path::Path, Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload,
+    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::Write;
@@ -28,6 +29,17 @@ use std::time::UNIX_EPOCH;
 const CACHE_DIR_ENV: &str = "LANCE_DISK_CACHE_DIR";
 const CACHE_BYTES_ENV: &str = "LANCE_DISK_CACHE_MAX_BYTES";
 const DEFAULT_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Single-request reads (`get_opts`) are cached as aligned blocks, so any later
+/// read of an already-fetched region is served locally, not just identical ranges.
+#[cfg(not(test))]
+const BLOCK_BYTES: u64 = 256 * 1024;
+#[cfg(test)]
+const BLOCK_BYTES: u64 = 4;
+/// Whole-object GETs larger than this stream from R2 uncached.
+const WHOLE_OBJECT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Background warm-up copies each table's immutable files in chunks of this size.
+const WARM_CHUNK_BYTES: u64 = 64 * BLOCK_BYTES;
+const WARM_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -109,12 +121,16 @@ impl DiskRangeCache {
         let object_hash = object_hash(namespace, location);
         let path = self.range_path(&object_hash, range);
         let expected_len = range.end.checked_sub(range.start)? as usize;
+        self.read_entry(object_hash, path, Some(expected_len))
+    }
+
+    fn read_entry(&self, object_hash: String, path: PathBuf, expected_len: Option<usize>) -> Option<Bytes> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match fs::read(&path) {
-            Ok(data) if data.len() == expected_len => {
+            Ok(data) if expected_len.is_none_or(|len| data.len() == len) => {
                 state.clock = state.clock.saturating_add(1);
                 let access = state.clock;
                 if let Some(entry) = state.entries.get_mut(&path) {
@@ -139,6 +155,32 @@ impl DiskRangeCache {
                 None
             }
             Err(_) => None,
+        }
+    }
+
+    async fn get_meta(&self, namespace: String, location: Path) -> Option<ObjectMeta> {
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let object_hash = object_hash(&namespace, location.as_ref());
+            let path = cache.meta_path(&object_hash);
+            let data = cache.read_entry(object_hash, path, None)?;
+            decode_meta(location, &data)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn put_meta(&self, namespace: String, meta: ObjectMeta) {
+        let cache = self.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            let object_hash = object_hash(&namespace, meta.location.as_ref());
+            let path = cache.meta_path(&object_hash);
+            cache.write_entry(object_hash, path, &encode_meta(&meta));
+        })
+        .await
+        {
+            log::warn!("Lance disk cache metadata write task failed: {err}");
         }
     }
 
@@ -168,6 +210,10 @@ impl DiskRangeCache {
     ) {
         let object_hash = object_hash(namespace, location);
         let path = self.range_path(&object_hash, range);
+        self.write_entry(object_hash, path, bytes);
+    }
+
+    fn write_entry(&self, object_hash: String, path: PathBuf, bytes: &[u8]) {
         let mut state = self
             .state
             .lock()
@@ -273,6 +319,25 @@ impl DiskRangeCache {
         ))
     }
 
+    fn meta_path(&self, object_hash: &str) -> PathBuf {
+        self.root
+            .join(&object_hash[..2])
+            .join(format!("{object_hash}-meta.cache"))
+    }
+
+    async fn has_all(&self, namespace: String, location: String, ranges: Vec<Range<u64>>) -> bool {
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let object_hash = object_hash(&namespace, &location);
+            ranges.iter().all(|range| {
+                fs::metadata(cache.range_path(&object_hash, range))
+                    .is_ok_and(|metadata| metadata.len() == range.end - range.start)
+            })
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     #[cfg(test)]
     fn stats(&self) -> (u64, u64, u64, u64) {
         (
@@ -356,6 +421,38 @@ fn object_hash(namespace: &str, location: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+// Size, last-modified nanos, then the e-tag; enough to answer a cached GET.
+fn encode_meta(meta: &ObjectMeta) -> Vec<u8> {
+    let e_tag = meta.e_tag.as_deref().unwrap_or("");
+    let mut out = Vec::with_capacity(16 + e_tag.len());
+    out.extend_from_slice(&meta.size.to_le_bytes());
+    out.extend_from_slice(&meta.last_modified.timestamp_nanos_opt().unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(e_tag.as_bytes());
+    out
+}
+
+fn decode_meta(location: Path, data: &[u8]) -> Option<ObjectMeta> {
+    let size = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+    let nanos = i64::from_le_bytes(data.get(8..16)?.try_into().ok()?);
+    let e_tag = std::str::from_utf8(&data[16..]).ok()?;
+    Some(ObjectMeta {
+        location,
+        last_modified: DateTime::<Utc>::from_timestamp_nanos(nanos),
+        size,
+        e_tag: (!e_tag.is_empty()).then(|| e_tag.to_string()),
+        version: None,
+    })
+}
+
+fn bytes_result(meta: ObjectMeta, range: Range<u64>, attributes: Attributes, bytes: Bytes) -> GetResult {
+    GetResult {
+        payload: GetResultPayload::Stream(futures::stream::once(async move { Ok(bytes) }).boxed()),
+        meta,
+        range,
+        attributes,
+    }
+}
+
 fn cacheable(location: &Path) -> bool {
     location
         .as_ref()
@@ -363,9 +460,17 @@ fn cacheable(location: &Path) -> bool {
         .any(|part| matches!(part, "data" | "_indices" | "_deletions"))
 }
 
+/// `.../chunks.lance/data/x.lance` -> `.../chunks.lance`
+fn table_root(location: &Path) -> Option<Path> {
+    let parts: Vec<_> = location.parts().collect();
+    let end = parts.iter().position(|part| part.as_ref().ends_with(".lance"))?;
+    (end + 1 < parts.len()).then(|| Path::from_iter(parts[..=end].iter().cloned()))
+}
+
 #[derive(Debug)]
 struct DiskCacheWrapper {
     cache: DiskRangeCache,
+    warmed: Arc<Mutex<HashSet<String>>>,
 }
 
 impl WrappingObjectStore for DiskCacheWrapper {
@@ -374,20 +479,182 @@ impl WrappingObjectStore for DiskCacheWrapper {
             original,
             cache: self.cache.clone(),
             namespace: namespace.to_string(),
+            warmed: Some(self.warmed.clone()),
         })
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DiskCacheStore {
     original: Arc<dyn ObjectStore>,
     cache: DiskRangeCache,
     namespace: String,
+    /// Table roots already queued for warm-up; `None` disables warm-up.
+    warmed: Option<Arc<Mutex<HashSet<String>>>>,
 }
 
 impl Display for DiskCacheStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "DiskCacheStore({})", self.original)
+    }
+}
+
+impl DiskCacheStore {
+    /// The first read of a table starts copying its immutable files into the
+    /// block cache in the background. Index files always come first: every
+    /// search scans them. Data files are only read for result rows, so they are
+    /// copied only while indexes plus data fit in half the cache; otherwise
+    /// result rows are fetched on demand and kept by the LRU.
+    fn maybe_warm(&self, location: &Path) {
+        let (Some(warmed), Some(root)) = (&self.warmed, table_root(location)) else {
+            return;
+        };
+        let key = format!("{}\0{root}", self.namespace);
+        let first = warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key);
+        if first {
+            let store = self.clone();
+            tokio::spawn(async move { store.warm_root(root).await });
+        }
+    }
+
+    async fn warm_root(&self, root: Path) {
+        let started = std::time::Instant::now();
+        let mut objects = Vec::new();
+        let mut data = Vec::new();
+        for dir in ["_indices", "_deletions", "data"] {
+            let into = if dir == "data" { &mut data } else { &mut objects };
+            match self.original.list(Some(&root.clone().join(dir))).try_collect::<Vec<_>>().await {
+                Ok(found) => into.extend(found),
+                Err(err) => log::warn!("Lance disk cache warm-up could not list {root}/{dir}: {err}"),
+            }
+        }
+        let size = |metas: &[ObjectMeta]| metas.iter().map(|meta| meta.size).sum::<u64>();
+        let with_data = size(&objects) + size(&data) <= self.cache.max_bytes / 2;
+        if with_data {
+            objects.extend(data);
+        }
+        let files = objects.len();
+        let chunks: Vec<(ObjectMeta, Range<u64>)> = objects
+            .into_iter()
+            .flat_map(|meta| {
+                (0..meta.size)
+                    .step_by(WARM_CHUNK_BYTES as usize)
+                    .map(move |start| (meta.clone(), start..(start + WARM_CHUNK_BYTES).min(meta.size)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let fetched: u64 = futures::stream::iter(chunks)
+            .map(|(meta, range)| self.warm_chunk(meta, range))
+            .buffer_unordered(WARM_CONCURRENCY)
+            .fold(0, |total, bytes| async move { total + bytes })
+            .await;
+        eprintln!(
+            "lancedb-go disk cache warmed root={root} files={files} with_data={with_data} fetched_bytes={fetched} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+
+    /// Returns the bytes fetched from the remote store (0 when already cached).
+    async fn warm_chunk(&self, meta: ObjectMeta, range: Range<u64>) -> u64 {
+        let key = meta.location.as_ref().to_string();
+        let blocks = (range.start..range.end)
+            .step_by(BLOCK_BYTES as usize)
+            .map(|start| start..(start + BLOCK_BYTES).min(meta.size))
+            .collect();
+        if self.cache.has_all(self.namespace.clone(), key, blocks).await {
+            return 0;
+        }
+        if self.cache.get_meta(self.namespace.clone(), meta.location.clone()).await.is_none() {
+            self.cache.put_meta(self.namespace.clone(), meta.clone()).await;
+        }
+        let options = GetOptions::new().with_range(Some(range.clone()));
+        match self.get_blocks(&meta.location, range.clone(), options).await {
+            Ok(_) => range.end - range.start,
+            Err(err) => {
+                log::warn!("Lance disk cache warm-up could not read {}: {err}", meta.location);
+                0
+            }
+        }
+    }
+
+    /// Serves `range` from aligned cached blocks, fetching the missing span of
+    /// blocks in one request. Ranges past the end are clamped like S3 does.
+    async fn get_blocks(&self, location: &Path, range: Range<u64>, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        let mut meta = self.cache.get_meta(self.namespace.clone(), location.clone()).await;
+        if meta.as_ref().is_some_and(|meta| range.start >= meta.size) {
+            return self.original.get_opts(location, options).await;
+        }
+        let first = range.start / BLOCK_BYTES;
+        let last = (range.end - 1) / BLOCK_BYTES;
+        let key = location.as_ref().to_string();
+        let mut blocks: Vec<Option<Bytes>> = vec![None; (last - first + 1) as usize];
+        if let Some(meta) = &meta {
+            for (slot, block) in blocks.iter_mut().zip(first..=last) {
+                let start = block * BLOCK_BYTES;
+                if start >= meta.size {
+                    break;
+                }
+                let end = (start + BLOCK_BYTES).min(meta.size);
+                *slot = self.cache.get(self.namespace.clone(), key.clone(), start..end).await;
+            }
+        }
+        let size = meta.as_ref().map_or(u64::MAX, |meta| meta.size);
+        let needed = |block: u64| block * BLOCK_BYTES < size;
+        let missing: Vec<u64> = (first..=last)
+            .filter(|&block| needed(block) && blocks[(block - first) as usize].is_none())
+            .collect();
+        if let (Some(&lo), Some(&hi)) = (missing.first(), missing.last()) {
+            let fetch = GetOptions {
+                range: Some(GetRange::Bounded(lo * BLOCK_BYTES..(hi + 1) * BLOCK_BYTES)),
+                extensions: options.extensions,
+                ..Default::default()
+            };
+            let result = self.original.get_opts(location, fetch).await?;
+            let fetched = result.range.clone();
+            if meta.is_none() {
+                self.cache.put_meta(self.namespace.clone(), result.meta.clone()).await;
+                meta = Some(result.meta.clone());
+            }
+            let bytes = result.bytes().await?;
+            for block in lo..=hi {
+                let start = block * BLOCK_BYTES;
+                if start >= fetched.end {
+                    break;
+                }
+                let end = (start + BLOCK_BYTES).min(fetched.end);
+                let chunk = bytes.slice((start - fetched.start) as usize..(end - fetched.start) as usize);
+                self.cache.put(self.namespace.clone(), key.clone(), start..end, chunk.clone()).await;
+                blocks[(block - first) as usize] = Some(chunk);
+            }
+        }
+
+        let meta = meta.expect("metadata is cached or was just fetched");
+        let end = range.end.min(meta.size);
+        let mut parts = Vec::with_capacity(blocks.len());
+        for (block, data) in (first..=last).zip(&blocks) {
+            let start = block * BLOCK_BYTES;
+            if start >= end {
+                break;
+            }
+            let data = data.as_ref().ok_or_else(|| object_store::Error::Generic {
+                store: "LanceDiskCache",
+                source: std::io::Error::other(format!("block {block} of {location} was not populated")).into(),
+            })?;
+            let from = (range.start.max(start) - start) as usize;
+            let to = (end.min(start + data.len() as u64) - start) as usize;
+            parts.push(data.slice(from..to));
+        }
+        let bytes = if parts.len() == 1 {
+            parts.pop().unwrap_or_default()
+        } else {
+            let mut out = BytesMut::with_capacity((end - range.start) as usize);
+            parts.iter().for_each(|part| out.extend_from_slice(part));
+            out.freeze()
+        };
+        Ok(bytes_result(meta, range.start..end, Attributes::default(), bytes))
     }
 }
 
@@ -418,7 +685,46 @@ impl ObjectStore for DiskCacheStore {
         location: &Path,
         options: GetOptions,
     ) -> ObjectStoreResult<GetResult> {
-        self.original.get_opts(location, options).await
+        let conditional = options.if_match.is_some()
+            || options.if_none_match.is_some()
+            || options.if_modified_since.is_some()
+            || options.if_unmodified_since.is_some()
+            || options.version.is_some()
+            || options.head;
+        if !cacheable(location) || conditional {
+            return self.original.get_opts(location, options).await;
+        }
+        self.maybe_warm(location);
+        match options.range.clone() {
+            Some(GetRange::Bounded(range)) if range.start < range.end => {
+                self.get_blocks(location, range, options).await
+            }
+            None => match self.cache.get_meta(self.namespace.clone(), location.clone()).await {
+                Some(meta) if meta.size > 0 && meta.size <= WHOLE_OBJECT_MAX_BYTES => {
+                    let mut result = self.get_blocks(location, 0..meta.size, options).await?;
+                    result.meta = meta;
+                    Ok(result)
+                }
+                Some(_) => self.original.get_opts(location, options).await,
+                None => {
+                    let result = self.original.get_opts(location, options).await?;
+                    if result.meta.size > WHOLE_OBJECT_MAX_BYTES || result.range != (0..result.meta.size) {
+                        return Ok(result);
+                    }
+                    let (meta, range, attributes) = (result.meta.clone(), result.range.clone(), result.attributes.clone());
+                    let bytes = result.bytes().await?;
+                    self.cache.put_meta(self.namespace.clone(), meta.clone()).await;
+                    let key = location.as_ref().to_string();
+                    for start in (0..meta.size).step_by(BLOCK_BYTES as usize) {
+                        let end = (start + BLOCK_BYTES).min(meta.size);
+                        let chunk = bytes.slice(start as usize..end as usize);
+                        self.cache.put(self.namespace.clone(), key.clone(), start..end, chunk).await;
+                    }
+                    Ok(bytes_result(meta, range, attributes, bytes))
+                }
+            },
+            _ => self.original.get_opts(location, options).await,
+        }
     }
 
     async fn get_ranges(
@@ -429,62 +735,16 @@ impl ObjectStore for DiskCacheStore {
         if !cacheable(location) {
             return self.original.get_ranges(location, ranges).await;
         }
+        self.maybe_warm(location);
 
-        let location_string = location.as_ref().to_string();
-        let mut output = vec![None; ranges.len()];
-        let mut misses = Vec::new();
-        for (index, range) in ranges.iter().enumerate() {
-            let hit = self
-                .cache
-                .get(
-                    self.namespace.clone(),
-                    location_string.clone(),
-                    range.clone(),
-                )
-                .await;
-            if let Some(bytes) = hit {
-                output[index] = Some(bytes);
-            } else {
-                misses.push((index, range.clone()));
+        futures::future::try_join_all(ranges.iter().map(|range| async move {
+            if range.start >= range.end {
+                return Ok(Bytes::new());
             }
-        }
-
-        if !misses.is_empty() {
-            let missing_ranges: Vec<_> = misses.iter().map(|(_, range)| range.clone()).collect();
-            let fetched = self.original.get_ranges(location, &missing_ranges).await?;
-            if fetched.len() != misses.len() {
-                return Err(object_store::Error::Generic {
-                    store: "LanceDiskCache",
-                    source: std::io::Error::other(format!(
-                        "get_ranges returned {} results for {} ranges",
-                        fetched.len(),
-                        misses.len()
-                    ))
-                    .into(),
-                });
-            }
-            for ((index, range), bytes) in misses.into_iter().zip(fetched) {
-                output[index] = Some(bytes.clone());
-                self.cache
-                    .put(
-                        self.namespace.clone(),
-                        location_string.clone(),
-                        range,
-                        bytes,
-                    )
-                    .await;
-            }
-        }
-
-        output
-            .into_iter()
-            .map(|value| {
-                value.ok_or_else(|| object_store::Error::Generic {
-                    store: "LanceDiskCache",
-                    source: std::io::Error::other("range result was not populated").into(),
-                })
-            })
-            .collect()
+            let options = GetOptions::new().with_range(Some(range.clone()));
+            self.get_blocks(location, range.clone(), options).await?.bytes().await
+        }))
+        .await
     }
 
     fn delete_stream(
@@ -570,7 +830,7 @@ fn configured_wrapper() -> Option<Arc<DiskCacheWrapper>> {
                         max_bytes,
                         cache.initial_bytes()
                     );
-                    Some(Arc::new(DiskCacheWrapper { cache }))
+                    Some(Arc::new(DiskCacheWrapper { cache, warmed: Default::default() }))
                 }
                 Err(err) => {
                     log::warn!("Lance disk cache disabled: {err}");
@@ -605,6 +865,7 @@ mod tests {
             original: original.clone(),
             cache,
             namespace: "s3$test".to_string(),
+            warmed: None,
         };
         (original, store, temp)
     }
@@ -620,7 +881,8 @@ mod tests {
         original.delete(&path).await.unwrap();
         let second = store.get_ranges(&path, &[2..8]).await.unwrap();
         assert_eq!(second, first);
-        assert_eq!(store.cache.stats(), (1, 1, 6, 6));
+        // The first read fetched blocks 0..4 and 4..8; the second hit both.
+        assert_eq!(store.cache.stats(), (2, 0, 8, 8));
     }
 
     #[tokio::test]
@@ -639,9 +901,18 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_evicts_least_recently_used_range() {
-        let (original, store, _temp) = test_store(8).await;
+        let temp = tempdir().unwrap();
+        let original = Arc::new(InMemory::new());
         let path = Path::from("db/chunks.lance/data/vectors.lance");
         original.put(&path, Bytes::from_static(b"abcdefghijkl").into()).await.unwrap();
+        // Room for the object's metadata record plus two 4-byte blocks.
+        let meta_len = encode_meta(&original.head(&path).await.unwrap()).len() as u64;
+        let store = DiskCacheStore {
+            original: original.clone(),
+            cache: DiskRangeCache::new(temp.path().to_path_buf(), meta_len + 8).unwrap(),
+            namespace: "s3$test".to_string(),
+            warmed: None,
+        };
 
         store.get_ranges(&path, &[0..4]).await.unwrap();
         store.get_ranges(&path, &[4..8]).await.unwrap();
@@ -680,5 +951,101 @@ mod tests {
             store.get_ranges(&path, &[0..3]).await.unwrap(),
             vec![Bytes::from_static(b"new")]
         );
+    }
+
+    #[tokio::test]
+    async fn whole_immutable_object_survives_remote_removal() {
+        let (original, store, _temp) = test_store(1024).await;
+        let path = Path::from("db/chunks.lance/data/small.lance");
+        original.put(&path, Bytes::from_static(b"abcdefghij").into()).await.unwrap();
+
+        let first = store.get(&path).await.unwrap();
+        assert_eq!(first.meta.size, 10);
+        assert_eq!(first.bytes().await.unwrap(), Bytes::from_static(b"abcdefghij"));
+        original.delete(&path).await.unwrap();
+        let second = store.get(&path).await.unwrap();
+        assert_eq!((second.meta.size, second.range.clone()), (10, 0..10));
+        assert_eq!(second.bytes().await.unwrap(), Bytes::from_static(b"abcdefghij"));
+    }
+
+    #[tokio::test]
+    async fn single_range_reads_are_served_from_overlapping_blocks() {
+        let (original, store, _temp) = test_store(1024).await;
+        let path = Path::from("db/chunks.lance/data/vectors.lance");
+        original.put(&path, Bytes::from_static(b"abcdefghijkl").into()).await.unwrap();
+
+        assert_eq!(store.get_range(&path, 1..6).await.unwrap(), Bytes::from_static(b"bcdef"));
+        original.delete(&path).await.unwrap();
+        // Different ranges inside the blocks fetched above (0..4, 4..8).
+        assert_eq!(store.get_range(&path, 2..5).await.unwrap(), Bytes::from_static(b"cde"));
+        assert_eq!(store.get_range(&path, 4..8).await.unwrap(), Bytes::from_static(b"efgh"));
+        assert!(store.get_range(&path, 7..10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn range_past_end_is_clamped_like_the_remote() {
+        let (original, store, _temp) = test_store(1024).await;
+        let path = Path::from("db/chunks.lance/data/vectors.lance");
+        original.put(&path, Bytes::from_static(b"abcdefghij").into()).await.unwrap();
+        let options = || GetOptions::new().with_range(Some(GetRange::Bounded(6..20)));
+
+        let remote = original.get_opts(&path, options()).await.unwrap().range;
+        let fetched = store.get_opts(&path, options()).await.unwrap();
+        assert_eq!(fetched.range, remote);
+        assert_eq!(fetched.bytes().await.unwrap(), Bytes::from_static(b"ghij"));
+        original.delete(&path).await.unwrap();
+        let cached = store.get_opts(&path, options()).await.unwrap();
+        assert_eq!(cached.range, remote);
+        assert_eq!(cached.bytes().await.unwrap(), Bytes::from_static(b"ghij"));
+        assert!(store.get_range(&path, 10..12).await.is_err());
+    }
+
+    /// Warms a table with one index and one data file, removes both remotely,
+    /// and reports whether each is still readable from the cache.
+    async fn warm_then_read(max_bytes: u64) -> (bool, bool) {
+        let (original, store, _temp) = test_store(max_bytes).await;
+        let data = Path::from("db/chunks.lance/data/a.lance");
+        let index = Path::from("db/chunks.lance/_indices/ivf/part.idx");
+        let index_bytes = Bytes::from_static(b"0123456789abcdefghijklmnopqrstuvwxyz");
+        original.put(&data, Bytes::from_static(b"abcdefghij").into()).await.unwrap();
+        original.put(&index, index_bytes.clone().into()).await.unwrap();
+        assert_eq!(table_root(&data), Some(Path::from("db/chunks.lance")));
+
+        store.warm_root(Path::from("db/chunks.lance")).await;
+        original.delete(&data).await.unwrap();
+        original.delete(&index).await.unwrap();
+        let index_cached = match store.get(&index).await {
+            Ok(result) => result.bytes().await.unwrap() == index_bytes,
+            Err(_) => false,
+        };
+        (index_cached, store.get_range(&data, 2..5).await.is_ok())
+    }
+
+    #[tokio::test]
+    async fn warm_up_copies_indexes_and_data_that_fit_half_the_cache() {
+        assert_eq!(warm_then_read(4096).await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn warm_up_skips_data_files_when_the_table_exceeds_half_the_cache() {
+        // 36 index bytes + 10 data bytes > 80 / 2, but the index alone fits.
+        assert_eq!(warm_then_read(80).await, (true, false));
+    }
+
+    #[tokio::test]
+    async fn conditional_and_mutable_reads_bypass_the_cache() {
+        let (original, store, _temp) = test_store(1024).await;
+        let data = Path::from("db/chunks.lance/data/vectors.lance");
+        let manifest = Path::from("db/chunks.lance/_versions/3.manifest");
+        original.put(&data, Bytes::from_static(b"abcdefgh").into()).await.unwrap();
+        original.put(&manifest, Bytes::from_static(b"manifest").into()).await.unwrap();
+
+        store.get(&data).await.unwrap().bytes().await.unwrap();
+        store.get(&manifest).await.unwrap().bytes().await.unwrap();
+        original.delete(&data).await.unwrap();
+        original.delete(&manifest).await.unwrap();
+        assert!(store.get(&manifest).await.is_err());
+        assert!(store.get_opts(&data, GetOptions::new().with_if_match(Some("*"))).await.is_err());
+        assert!(store.get(&data).await.is_ok());
     }
 }

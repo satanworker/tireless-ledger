@@ -210,7 +210,7 @@ index 70fd6c3..51a6fba 100644
  use std::os::raw::{c_char, c_void};
 +use std::sync::Arc;
 +
-+const INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
++const INDEX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 +const METADATA_CACHE_BYTES: usize = 64 * 1024 * 1024;
  
  /// Connect to a LanceDB database (simple version)

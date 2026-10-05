@@ -366,7 +366,7 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.StatePath, "state", env("PI_MEMORYD_STATE", "./data/dedup_state.json"), "dedup state path")
 	flag.BoolVar(&cfg.DryRunS3, "dry-run-s3", envBool("PI_MEMORYD_DRY_RUN_S3", false), "skip AWS SDK S3 validation")
 	flag.BoolVar(&cfg.Optimize, "optimize", false, "compact data, refresh indexes, prune old versions, and exit")
-	flag.BoolVar(&cfg.CreateVectorIndex, "create-vector-index", false, "create a 64-partition IVF-Flat vector index and exit")
+	flag.BoolVar(&cfg.CreateVectorIndex, "create-vector-index", false, "create a 512-partition IVF-Flat vector index and exit")
 	flag.BoolVar(&cfg.DropVectorIndex, "drop-vector-index", false, "drop the IVF-Flat vector index and exit")
 	flag.BoolVar(&cfg.AuditDuplicates, "audit-duplicates", false, "scan all rows for duplicate IDs and exit non-zero if any exist")
 	flag.StringVar(&cfg.DeleteHost, "delete-host", "", "delete every row and dedup entry for exactly this host, then exit")
