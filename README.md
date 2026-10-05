@@ -94,10 +94,11 @@ The timer uses a non-blocking runtime lock, so delayed timer invocations cannot
 overlap an optimization already in progress.
 
 Production runs IVF-Flat (64 partitions) with 32 probes: at 326,000 chunks the
-exact flat scan decodes all 501 MB of vectors per query, and 32 probes cut
-hybrid latency over R2 by about 2.4× at 0.98 vector recall@5. Probing all 64
-partitions leaves vector-only latency unchanged; 16 probes dropped hybrid
-recall@5 to 0.73.
+exact flat scan decodes all 501 MB of vectors per query. 32 probes halved
+repeat hybrid latency (0.56 → 0.28 s), cut fresh hybrid from 0.84 to about
+0.65 s, and kept recall@5 at 1.00 vector / 0.98 hybrid against exact. Probing
+all 64 partitions leaves vector-only latency unchanged; 16 probes dropped
+hybrid recall@5 to 0.73.
 The index is derived and reversible:
 
 ```sh

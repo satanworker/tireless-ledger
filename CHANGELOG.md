@@ -10,11 +10,14 @@
 - The 64-partition IVF-Flat index was recreated on production `chunks`
   (35 s, 537 MiB under `_indices`); it survives `--optimize`.
 - Production config moves to `PI_MEMORYD_EXACT_VECTOR_SEARCH=false` and
-  `PI_MEMORYD_VECTOR_NPROBES=32`. Benchmarked over R2 with the production
-  binary (10 fresh + 10 repeated queries per mode): hybrid fresh median
-  0.93 s → 0.38 s, vector repeat 0.47 s → 0.17 s; recall@5 against exact on
-  20 queries was 0.98 (vector) and 0.93 (hybrid; 0.95 at 64 probes, so
-  roughly run-to-run noise). 16 probes dropped hybrid recall to 0.73.
+  `PI_MEMORYD_VECTOR_NPROBES=32`. Measured on production after the switch
+  (10 fresh + 10 repeated queries per mode, three rounds): hybrid fresh median
+  0.84 s → 0.63–0.67 s, hybrid repeat 0.56 s → 0.27–0.30 s, vector repeat
+  0.38 s → 0.17–0.22 s, hybrid CPU per query 0.85 s → 0.34–0.38 s. Recall@5
+  against an exact-scan instance on 20 queries: 1.00 vector, 0.98 hybrid.
+  16 probes dropped hybrid recall to 0.73 in pre-deploy testing.
+- Fresh hybrid queries are now bounded by the R2-backed FTS path (text-only
+  fresh median 0.40–0.45 s; 0.02 s on a local copy of the same tables).
 - home-satan's optimize timer now drops the IVF index, compacts, and rebuilds
   it on every compaction run (drop 1 s, optimize 15 s, build 9 s on a local
   copy), so centroids track corpus growth with no manual step. A failed build
