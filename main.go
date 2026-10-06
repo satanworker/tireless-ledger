@@ -188,7 +188,7 @@ type lanceStore interface {
 
 func main() {
 	cfg := loadConfig()
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
 	local := isMemoryURL(cfg.StorageURL)

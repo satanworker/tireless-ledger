@@ -51,6 +51,30 @@
 - `pi-memoryd` start now runs one warm-up hybrid query (`ExecStartPost`); the
   first cold query otherwise took 4.8–21.9 s loading the index from R2.
 
+### Maintenance command output
+
+- Send daemon diagnostics to stderr so `--fragment-counts` keeps stdout machine-readable.
+- Keep the optimizer tolerant of startup logs from the currently pinned production binary while parsing its final JSON line.
+
+### Prebuilt Lance library (2026-09-30)
+
+- The patched `liblancedb_go.a` is built once (`make lance-lib`, ~100 min on
+  home-satan) and downloaded by the Dockerfile `lance-lib` stage by URL and
+  SHA-256. Normal builds only compile and link Go: `make release-linux`
+  produced both Nix release binaries in 3m49s from an empty Go cache.
+- The rebuilt `pi-memoryd` opened the production R2 tables read-only
+  (`--fragment-counts`).
+
+### Claude Code session ingestion (2026-09-30)
+
+- `tireless-upload` now also mirrors `~/.claude/projects` (`--claude`,
+  `TIRELESS_CLAUDE_SESSIONS`) to `<host>/claude/...` in the raw prefix.
+- `pi-memoryd` parses the `claude` harness: user/assistant text messages,
+  one title row per distinct `ai-title`/`custom-title`/`summary`, `TodoWrite`
+  todo snapshots, and synchronous `Agent`/`Task` results. Subagent transcripts
+  are indexed as separate `agent-<id>` sessions. Pi, Codex, and OMP output is
+  unchanged, so the parser version was not bumped and nothing is reindexed.
+
 ### Persistent Lance range cache (2026-09-03)
 
 - R2-backed Lance data, index, and deletion-object ranges now use a bounded,

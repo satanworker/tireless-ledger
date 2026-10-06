@@ -21,7 +21,7 @@ GOARCH         ?= $(shell go env GOARCH)
 	docker-build up down doctor recall-local embed-local mac-test \
 	install-startup-service install-optimize-timer install-server-uploader install-upload-timer \
 	build-uploader install-uploader-bin install-mac-uploader install-raw-uploader \
-	fragment-counts migrate-split
+	fragment-counts migrate-split buildx-builder lance-lib release-linux
 
 all: build
 
@@ -47,6 +47,24 @@ release:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(GO_FLAGS) -ldflags='$(GO_LDFLAGS)' \
 		-o $(BIN_DIR)/pi-memoryd-darwin-amd64 .
 	@echo "release binaries in $(BIN_DIR)/"
+
+## Linux/arm64 release binaries for the home-satan Nix package. Links against the
+## published Lance library (the Dockerfile `lance-lib` stage); no Rust build.
+## Before a new library is published: make release-linux LANCE_LIB_DIR=bin/lance
+release-linux: buildx-builder
+	$(BUILDX) --target release-artifact --output type=local,dest=$(BIN_DIR) .
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(GO_FLAGS) -ldflags='$(GO_LDFLAGS)' \
+		-o $(BIN_DIR)/tireless-upload-linux-arm64 ./cmd/tireless-upload
+	docker buildx stop $(BUILDX_BUILDER) >/dev/null
+	cd $(BIN_DIR) && sha256sum pi-memoryd-linux-arm64 tireless-upload-linux-arm64
+
+## Slow, one-off: rebuild the patched Lance static library. Needed only when
+## LANCEDB_GO_COMMIT or docker/lancedb-go-* change. Publish the result as a
+## release asset and update the `lance-lib` stage URL and checksum.
+lance-lib: buildx-builder
+	$(BUILDX) --target lance-artifact --output type=local,dest=$(BIN_DIR)/lance .
+	docker buildx stop $(BUILDX_BUILDER) >/dev/null
+	sha256sum $(BIN_DIR)/lance/liblancedb_go.a
 
 test:
 	$(GO_ENV) go test ./...
@@ -99,12 +117,16 @@ doctor:
 	@echo "binary:  $$(test -x $(BIN) && ls -lh $(BIN) || echo 'not built (make build)')"
 	@echo "sops file: $(SOPS_FILE)"
 
-## Optional: Linux/server only. Not the Mac path.
-docker-build:
+BUILDX = docker buildx build --builder $(BUILDX_BUILDER) $(if $(LANCE_LIB_DIR),--build-context lance-lib=$(LANCE_LIB_DIR))
+
+buildx-builder:
 	@docker buildx inspect $(BUILDX_BUILDER) >/dev/null 2>&1 || \
 		docker buildx create --name $(BUILDX_BUILDER) --driver docker-container \
 			--driver-opt memory=3g,memory-swap=4g,cpu-quota=100000,cpu-period=100000
-	docker buildx build --builder $(BUILDX_BUILDER) --load --tag $(DOCKER_IMAGE) .
+
+## Optional: Linux/server only. Not the Mac path.
+docker-build: buildx-builder
+	$(BUILDX) --load --tag $(DOCKER_IMAGE) .
 	docker buildx stop $(BUILDX_BUILDER) >/dev/null
 
 up: secrets-decrypt

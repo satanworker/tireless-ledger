@@ -1,6 +1,6 @@
 # pi-memoryd
 
-`pi-memoryd` is the single recall service for indexed Pi, Codex, and OMP sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
+`pi-memoryd` is the single recall service for indexed Pi, Codex, OMP, and Claude Code sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
 
 ```text
 Mac launchd uploader -------\
@@ -13,8 +13,8 @@ the central ingester:
 
 | Component | Runs on | Reads | Responsibility |
 |---|---|---|---|
-| Mac uploader (`launchd`) | Each Mac | That Mac's Pi, Codex, and OMP session directories | Copies untouched JSONL to R2 every minute |
-| Server uploader (`systemd --user`) | VPS | The VPS's Pi, Codex, and OMP session directories | Copies untouched JSONL to R2 every minute |
+| Mac uploader (`launchd`) | Each Mac | That Mac's Pi, Codex, OMP, and Claude Code session directories | Copies untouched JSONL to R2 every minute |
+| Server uploader (`systemd --user`) | VPS | The VPS's Pi, Codex, OMP, and Claude Code session directories | Copies untouched JSONL to R2 every minute |
 | Central ingester (`pi-memoryd` in Docker) | VPS | All raw JSONL already uploaded to R2 | Parses, embeds, and writes the shared Lance recall index |
 
 Uploaders never parse or index sessions. `pi-memoryd` does not discover local
@@ -46,7 +46,22 @@ choice, not data recovery.
 
 ## Builds
 
-Production Linux/ARM64 builds use Docker. The image pins a `lancedb-go` commit, advances its Rust engine to stable LanceDB 0.37.1 / Lance 10, builds `liblancedb_go.a` with AWS support, applies the checked-in 256 MiB index / 64 MiB metadata session-cache overlay and bounded disk range-cache overlay, and links it into the Go 1.24 daemon.
+Production Linux/ARM64 builds use Docker. The image pins a `lancedb-go` commit, advances its Rust engine to stable LanceDB 0.37.1 / Lance 10, applies the checked-in 256 MiB index / 64 MiB metadata session-cache overlay and bounded disk range-cache overlay, and links the resulting `liblancedb_go.a` (AWS support) into the Go 1.24 daemon.
+
+The patched Rust library is built once and published as a GitHub release
+asset; the Dockerfile `lance-lib` stage downloads it by URL and SHA-256, so
+normal builds only compile and link Go. Rebuild it only when
+`LANCEDB_GO_COMMIT` or `docker/lancedb-go-*` change:
+
+```bash
+make lance-lib   # slow Rust build -> bin/lance/liblancedb_go.a + sha256
+# upload as a new release asset, then update the lance-lib stage URL/checksum
+```
+
+Release binaries for the home-satan Nix package (`pi-memoryd-linux-arm64`,
+`tireless-upload-linux-arm64`) come from `make release-linux`. Before a fresh
+library is published, link against the local copy with
+`make release-linux LANCE_LIB_DIR=bin/lance`.
 
 ```bash
 make secrets-decrypt
@@ -64,14 +79,10 @@ make install-startup-service
 The unit waits for `tailscale` before running `docker compose up`, avoiding a
 boot race when the service ports are bound directly to the Tailscale address.
 
-`make docker-build` always uses the persistent `tireless-limited` BuildKit
-builder. Its named Docker volume retains the Cargo registry, compiled Lance
-target, Go modules, and Go build cache across builder stops and VPS reboots.
-The builder is capped at 1 CPU, 3 GiB RAM, and 4 GiB including swap, then
-stopped after loading `pi-memoryd:local` into Docker. Normal deployment uses
-that saved image and does not rebuild it; run `make docker-build` only after
-source or dependency changes. Do not prune the builder cache volume unless a
-deliberate cold rebuild is acceptable.
+All Docker targets use the persistent `tireless-limited` BuildKit builder,
+capped at 1 CPU, 3 GiB RAM, and 4 GiB including swap, and stopped afterwards.
+Its named volume keeps Go module and build caches across stops and reboots;
+losing it costs only a Go rebuild, not a Rust one.
 
 After a bulk ingest, run one offline maintenance pass to compact the final
 fragment tail and fold newly written rows into the existing FTS and scalar
@@ -184,7 +195,16 @@ The raw object layout is deliberately the only contract:
 <host>/pi/<any subdirectories>/<file>.jsonl
 <host>/codex/<any subdirectories>/<file>.jsonl
 <host>/omp/<any subdirectories>/<file>.jsonl
+<host>/claude/<any subdirectories>/<file>.jsonl
 ```
+
+The `claude` tree mirrors `~/.claude/projects` (override with
+`TIRELESS_CLAUDE_SESSIONS`). The file stem is the session ID, so each subagent
+transcript under `<session>/subagents/agent-<id>.jsonl` is its own
+`agent-<id>` session. Meta/caveat records, thinking, tool calls, and ordinary
+tool results are skipped; `ai-title`/`custom-title`/`summary` records become one
+title row per distinct title, `TodoWrite` inputs become todo rows, and
+synchronous `Agent`/`Task` results become task rows.
 
 Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages plus important session state: titles, todo snapshots, and task/subagent tool results. Every logical message is stored once, in full, as a canonical `message` row. Important state rows use `record_kind` values `title`, `todo`, or `task` so normal recall can find them without reading a local session file. The daemon uses llama.cpp's tokenizer to split each searchable row into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent row ID. Search runs over chunks and collapses hits by parent. Session walking prefers the untouched raw JSONL archive and falls back to the derived `messages` table; `include=todos`, `include=tasks`, `include=titles`, or `include=state` reads those exact records from raw when available, so reconstruction is not limited by chunk overlap, embedding truncation, or quantized search indexes.
 

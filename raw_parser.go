@@ -19,7 +19,7 @@ var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", 
 func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 	host, harness, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude>/<path>.jsonl")
 	}
 	return parseSessionJSONL(body, host, harness, key, false)
 }
@@ -27,14 +27,14 @@ func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 func parseRawSessionForIndex(key string, body []byte) ([]MemoryItem, error) {
 	host, harness, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude>/<path>.jsonl")
 	}
 	return parseSessionJSONL(body, host, harness, key, true)
 }
 
 func rawObjectIdentity(key string) (host, harness string, ok bool) {
 	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
-	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
+	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp" && parts[1] != "claude") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
 		return "", "", false
 	}
 	return parts[0], parts[1], true
@@ -48,12 +48,17 @@ type pendingRawState struct {
 	kind      string
 }
 
+// Claude Code sessions keep the file stem as session ID: main transcripts are
+// named <sessionId>.jsonl, while subagent transcripts live in
+// <sessionId>/subagents/agent-<id>.jsonl and become their own sessions.
 func parseSessionJSONL(body []byte, host, harness, source string, includeState bool) ([]MemoryItem, error) {
 	sessionID := strings.TrimSuffix(filepath.Base(source), filepath.Ext(source))
 	project := "unknown"
 	seen := map[string]bool{}
 	items := make([]MemoryItem, 0)
 	pendingState := make([]pendingRawState, 0)
+	var lastTS int64
+	claudeTaskCalls := map[string]bool{}
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64*1024), 64<<20)
 	lineNo := 0
@@ -65,6 +70,73 @@ func parseSessionJSONL(body []byte, host, harness, source string, includeState b
 		}
 		var obj map[string]interface{}
 		if json.Unmarshal(line, &obj) != nil {
+			continue
+		}
+		if harness == "claude" {
+			if ts := parseRawTimestamp(obj["timestamp"]); ts != 0 {
+				lastTS = ts
+			}
+			if project == "unknown" && stringField(obj, "cwd") != "" {
+				project = projectFromCWD(stringField(obj, "cwd"))
+				for _, pending := range pendingState {
+					items = append(items, rawRecord(host, harness, sessionID, pending.id, pending.role, pending.text, pending.timestamp, project, pending.kind))
+				}
+				pendingState = pendingState[:0]
+			}
+			switch stringField(obj, "type") {
+			case "ai-title", "custom-title", "summary":
+				text := titleText(obj, stringField(obj, "type"))
+				if !includeState || text == "" || seen[text] {
+					continue
+				}
+				// Claude repeats title records every turn; one row per distinct title.
+				seen[text] = true
+				id := "title-" + hashText(text)[:16]
+				if project == "unknown" {
+					pendingState = append(pendingState, pendingRawState{id: id, role: "system", text: text, timestamp: lastTS, kind: "title"})
+				} else {
+					items = append(items, rawRecord(host, harness, sessionID, id, "system", text, lastTS, project, "title"))
+				}
+			case "user", "assistant":
+				if obj["isMeta"] == true {
+					continue
+				}
+				msg, _ := obj["message"].(map[string]interface{})
+				role := stringField(msg, "role")
+				ts := parseRawTimestamp(obj["timestamp"])
+				if parts, ok := msg["content"].([]interface{}); ok && includeState {
+					for _, raw := range parts {
+						part, _ := raw.(map[string]interface{})
+						switch stringField(part, "type") {
+						case "tool_use":
+							switch stringField(part, "name") {
+							case "TodoWrite":
+								input, _ := part["input"].(map[string]interface{})
+								if text := todoTextFromSessionRecord(input, "TodoWrite"); text != "" {
+									items = append(items, rawRecord(host, harness, sessionID, stringField(part, "id"), role, text, ts, project, "todo"))
+								}
+							case "Agent", "Task":
+								claudeTaskCalls[stringField(part, "id")] = true
+							}
+						case "tool_result":
+							toolUseID := stringField(part, "tool_use_id")
+							// Async launches only acknowledge the spawn; the result arrives later as a <task-notification> user message.
+							if result, _ := obj["toolUseResult"].(map[string]interface{}); !claudeTaskCalls[toolUseID] || result["isAsync"] == true {
+								continue
+							}
+							if text := toolResultText(part, "task"); text != "" {
+								items = append(items, rawRecord(host, harness, sessionID, toolUseID, "toolResult", text, ts, project, "task"))
+							}
+						}
+					}
+				}
+				text := contentText(msg["content"])
+				uuid := stringField(obj, "uuid")
+				if !indexableMessage(role, text) || uuid == "" || strings.HasPrefix(text, "<local-command-stdout>") {
+					continue
+				}
+				items = append(items, rawRecord(host, harness, sessionID, uuid, role, text, ts, project, "message"))
+			}
 			continue
 		}
 		if harness == "pi" || harness == "omp" {
@@ -217,7 +289,7 @@ func contentText(v interface{}) string {
 }
 
 func titleText(m map[string]interface{}, source string) string {
-	title := strings.TrimSpace(firstStringField(m, "title", "name", "summary"))
+	title := strings.TrimSpace(firstStringField(m, "title", "name", "summary", "aiTitle", "customTitle"))
 	if title == "" {
 		return ""
 	}
