@@ -526,10 +526,26 @@ Deferred, in order: optimize without stopping the daemon (measure queries during
 
 Not rehearsed: starting the old binary while the PQ index exists (the documented bad rollback order); `make switch` itself.
 
+**v0.2.3 supersedes v0.2.2 (2026-10-10, evening): Lance 13 + disk-cache promotion.** Same Go code and the same rollout steps; only the Rust library changed (`lance-lib-0.40.0-r1`: lancedb v0.40.0 / Lance 13 / object_store 0.14, built with `aws,remote` because lancedb 0.40.0's `job.rs` uses `Error::Http` outside the `remote` feature; the wrapper gained `wrap_paginated` and `GetResult.extensions`; plus the E2 promotion/single-flight change from docs §3.2). `home-satan` `packages/pi-memoryd` is pinned to 0.2.3. Measured on fresh copies of production:
+
+| check | result |
+|---|---|
+| Lance 13 reads today's layout (IVF_FLAT, np 128), no cache | works; startup 30 → 28 waves, 67 → 38 requests vs Lance 10; hybrid first query 536 → 493 requests; no errors |
+| cutover with 0.2.3 | metadata 7 s, drop 2 s, optimize 53 s (5 → 2 fragments), create PQ index 227 s; **4 min 49 s total** |
+| after cutover | listening 0.9 s; first query 1.2 s (3 waves: the 34 MB index in one promoted read); restart with valid cache: 0.13 s first query; 0.07 s steady; 14 metadata fields |
+| recall vs exact scan (30 queries) | **1.000 vector / 0.993 hybrid** (one query differs by one of five) |
+| ingest 40 rows (4 fragments) → `--optimize` | 82 s; PQ 330,283 indexed / 0 unindexed, 1 index; FTS and btree likewise |
+| **cross-version, the rollback question**: 0.2.2 (Lance 10) reading everything Lance 13 wrote (compacted data, PQ index, FTS appends after the ingest) | works; recall 1.000 / 0.987; text search finds the Lance-13-ingested rows |
+| no-cache cold on the B5 layout, Lance 13 vs 10 | startup 27 → 25 waves, 50 → 34 requests; hybrid first query 291 → 261 requests; bytes unchanged (the Python-only −38% FTS bytes did not reproduce in the Go path) |
+| R2 variance seen during the run | one first-query sample at 5.6 s (34 MB at ~6 MB/s); the same step re-measured at 1.2 s twice |
+
+Rollback to 0.2.2 (Lance 10) needs nothing beyond the pin: it reads the Lance-13-written dataset. Rollback to 0.2.1 is the procedure above (drop the PQ index first).
+
+
 
 ### Rollout
 
-1. In `tireless-ledger`, apply the diff and add the CHANGELOG entry. Run `go test ./...`, then `make release-linux` and publish pi-memoryd. There is no lib rebuild.
+1. Done: v0.2.3 is published and `home-satan` is pinned to it (see Status).
 2. In `home-satan`, bump the input and apply the optimize-script change, keeping `PI_MEMORYD_VECTOR_NPROBES=128`. Then run `make switch`. The new binary now serves the old IVF_FLAT index with refine and the two-step fetch, at the same recall.
 3. Cutover, about 6 minutes of service downtime:
    ```sh
