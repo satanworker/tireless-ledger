@@ -5,7 +5,11 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{
+    future::{BoxFuture, Shared},
+    stream::BoxStream,
+    FutureExt, StreamExt, TryStreamExt,
+};
 use lance::dataset::ReadParams;
 use lance::io::{ObjectStoreParams, WrappingObjectStore};
 use object_store::{
@@ -40,6 +44,29 @@ const WHOLE_OBJECT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Background warm-up copies each table's immutable files in chunks of this size.
 const WARM_CHUNK_BYTES: u64 = 64 * BLOCK_BYTES;
 const WARM_CONCURRENCY: usize = 8;
+/// A file's first read is Lance fetching its footer. Index files up to this size are
+/// then fetched whole in that one request, data files get their last
+/// `DATA_TAIL_BYTES` (footer, column and page metadata), so the dependent reads that
+/// follow are cache hits instead of round trips. 0 disables it.
+const PROMOTE_BYTES_ENV: &str = "LANCE_DISK_CACHE_PROMOTE_BYTES";
+const DEFAULT_PROMOTE_BYTES: u64 = 64 * 1024 * 1024;
+const DATA_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+const FOOTER_READ_BYTES: u64 = 64 * 1024;
+/// `LANCE_DISK_CACHE_WARM=0` turns the background table copy off.
+const WARM_ENV: &str = "LANCE_DISK_CACHE_WARM";
+
+/// One remote fetch shared by every concurrent reader of its blocks: file size (meta),
+/// fetched range, bytes. `None` when the fetch failed; readers then fetch themselves.
+type SpanFuture = Shared<BoxFuture<'static, Option<(ObjectMeta, Range<u64>, Bytes)>>>;
+
+#[derive(Default)]
+struct Inflight(Mutex<HashMap<(String, u64), SpanFuture>>);
+
+impl std::fmt::Debug for Inflight {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Inflight")
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -67,22 +94,26 @@ struct CacheMetrics {
 struct DiskRangeCache {
     root: Arc<PathBuf>,
     max_bytes: u64,
+    promote_bytes: u64,
     state: Arc<Mutex<CacheState>>,
     metrics: Arc<CacheMetrics>,
     temp_id: Arc<AtomicU64>,
+    inflight: Arc<Inflight>,
 }
 
 impl DiskRangeCache {
-    fn new(root: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
+    fn new(root: PathBuf, max_bytes: u64, promote_bytes: u64) -> std::io::Result<Self> {
         fs::create_dir_all(&root)?;
         let mut state = CacheState::default();
         load_existing_entries(&root, &mut state)?;
         let cache = Self {
             root: Arc::new(root),
             max_bytes,
+            promote_bytes,
             state: Arc::new(Mutex::new(state)),
             metrics: Arc::new(CacheMetrics::default()),
             temp_id: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(Inflight::default()),
         };
         cache.evict_to(max_bytes)?;
         Ok(cache)
@@ -450,6 +481,7 @@ fn bytes_result(meta: ObjectMeta, range: Range<u64>, attributes: Attributes, byt
         meta,
         range,
         attributes,
+        extensions: Default::default(),
     }
 }
 
@@ -470,7 +502,7 @@ fn table_root(location: &Path) -> Option<Path> {
 #[derive(Debug)]
 struct DiskCacheWrapper {
     cache: DiskRangeCache,
-    warmed: Arc<Mutex<HashSet<String>>>,
+    warmed: Option<Arc<Mutex<HashSet<String>>>>,
 }
 
 impl WrappingObjectStore for DiskCacheWrapper {
@@ -479,8 +511,18 @@ impl WrappingObjectStore for DiskCacheWrapper {
             original,
             cache: self.cache.clone(),
             namespace: namespace.to_string(),
-            warmed: Some(self.warmed.clone()),
+            warmed: self.warmed.clone(),
         })
+    }
+
+    /// Listings are never cached (manifests and version lists must stay fresh), so the
+    /// pushed-down pager can bypass the wrapper.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
     }
 }
 
@@ -571,7 +613,7 @@ impl DiskCacheStore {
             self.cache.put_meta(self.namespace.clone(), meta.clone()).await;
         }
         let options = GetOptions::new().with_range(Some(range.clone()));
-        match self.get_blocks(&meta.location, range.clone(), options).await {
+        match self.get_blocks(&meta.location, range.clone(), options, false).await {
             Ok(_) => range.end - range.start,
             Err(err) => {
                 log::warn!("Lance disk cache warm-up could not read {}: {err}", meta.location);
@@ -580,9 +622,59 @@ impl DiskCacheStore {
         }
     }
 
+    /// Lance's first read of a file is its 64 KiB footer, so `range.end` is the file
+    /// size. Widen that fetch to the whole file for small index files and to the tail
+    /// of data files. `size` is the cached file size, if the warm-up already recorded
+    /// it; the footer blocks being uncached is what marks the first touch.
+    fn widen(&self, location: &Path, size: Option<u64>, range: &Range<u64>, lo: u64, hi: u64) -> (u64, u64) {
+        let promote = self.cache.promote_bytes;
+        let footer = range.end - range.start == FOOTER_READ_BYTES && size.is_none_or(|size| size == range.end);
+        if promote == 0 || !footer {
+            return (lo, hi);
+        }
+        let path = location.as_ref();
+        if path.contains("/_indices/") && range.end <= promote {
+            return (0, hi);
+        }
+        if path.contains("/data/") {
+            let start = range.end.saturating_sub(DATA_TAIL_BYTES) / BLOCK_BYTES;
+            return (start.min(lo), hi);
+        }
+        (lo, hi)
+    }
+
+    /// Fetches blocks `lo..=hi` in one request and caches them.
+    async fn fetch_span(&self, location: Path, lo: u64, hi: u64, options: GetOptions) -> ObjectStoreResult<(ObjectMeta, Range<u64>, Bytes)> {
+        let fetch = GetOptions {
+            range: Some(GetRange::Bounded(lo * BLOCK_BYTES..(hi + 1) * BLOCK_BYTES)),
+            extensions: options.extensions,
+            ..Default::default()
+        };
+        let result = self.original.get_opts(&location, fetch).await?;
+        let (meta, fetched) = (result.meta.clone(), result.range.clone());
+        if self.cache.get_meta(self.namespace.clone(), location.clone()).await.is_none() {
+            self.cache.put_meta(self.namespace.clone(), meta.clone()).await;
+        }
+        let bytes = result.bytes().await?;
+        let key = location.as_ref().to_string();
+        for block in lo..=hi {
+            let start = block * BLOCK_BYTES;
+            if start >= fetched.end {
+                break;
+            }
+            let end = (start + BLOCK_BYTES).min(fetched.end);
+            let chunk = bytes.slice((start - fetched.start) as usize..(end - fetched.start) as usize);
+            self.cache.put(self.namespace.clone(), key.clone(), start..end, chunk).await;
+        }
+        Ok((meta, fetched, bytes))
+    }
+
     /// Serves `range` from aligned cached blocks, fetching the missing span of
     /// blocks in one request. Ranges past the end are clamped like S3 does.
-    async fn get_blocks(&self, location: &Path, range: Range<u64>, options: GetOptions) -> ObjectStoreResult<GetResult> {
+    /// `share`: publish the fetch so concurrent readers of its blocks wait for it
+    /// instead of fetching again. Warm-up chunks are not published: a query's 256 KiB
+    /// row read must not queue behind a 16 MiB copy.
+    async fn get_blocks(&self, location: &Path, range: Range<u64>, options: GetOptions, share: bool) -> ObjectStoreResult<GetResult> {
         let mut meta = self.cache.get_meta(self.namespace.clone(), location.clone()).await;
         if meta.as_ref().is_some_and(|meta| range.start >= meta.size) {
             return self.original.get_opts(location, options).await;
@@ -606,28 +698,80 @@ impl DiskCacheStore {
         let missing: Vec<u64> = (first..=last)
             .filter(|&block| needed(block) && blocks[(block - first) as usize].is_none())
             .collect();
-        if let (Some(&lo), Some(&hi)) = (missing.first(), missing.last()) {
-            let fetch = GetOptions {
-                range: Some(GetRange::Bounded(lo * BLOCK_BYTES..(hi + 1) * BLOCK_BYTES)),
-                extensions: options.extensions,
-                ..Default::default()
-            };
-            let result = self.original.get_opts(location, fetch).await?;
-            let fetched = result.range.clone();
-            if meta.is_none() {
-                self.cache.put_meta(self.namespace.clone(), result.meta.clone()).await;
-                meta = Some(result.meta.clone());
-            }
-            let bytes = result.bytes().await?;
-            for block in lo..=hi {
+        let fill = |blocks: &mut Vec<Option<Bytes>>, fetched: &Range<u64>, bytes: &Bytes| {
+            for block in first..=last {
                 let start = block * BLOCK_BYTES;
-                if start >= fetched.end {
-                    break;
+                if blocks[(block - first) as usize].is_some() || start < fetched.start || start >= fetched.end {
+                    continue;
                 }
                 let end = (start + BLOCK_BYTES).min(fetched.end);
-                let chunk = bytes.slice((start - fetched.start) as usize..(end - fetched.start) as usize);
-                self.cache.put(self.namespace.clone(), key.clone(), start..end, chunk.clone()).await;
-                blocks[(block - first) as usize] = Some(chunk);
+                blocks[(block - first) as usize] = Some(bytes.slice((start - fetched.start) as usize..(end - fetched.start) as usize));
+            }
+        };
+        if let (Some(&lo), Some(&hi)) = (missing.first(), missing.last()) {
+            let (lo, hi) = self.widen(location, meta.as_ref().map(|meta| meta.size), &range, lo, hi);
+            let hash = object_hash(&self.namespace, &key);
+            // Single flight: concurrent readers of the same blocks (the vector and text
+            // channels open the same files at the same time) share one request.
+            let (own, waits) = {
+                let mut map = self.cache.inflight.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let waits: Option<Vec<SpanFuture>> = missing.iter().map(|block| map.get(&(hash.clone(), *block)).cloned()).collect();
+                match waits {
+                    Some(waits) => (None, waits),
+                    None => {
+                        let store = self.clone();
+                        let (loc, ext) = (location.clone(), GetOptions { extensions: options.extensions.clone(), ..Default::default() });
+                        let fut: SpanFuture = async move {
+                            match store.fetch_span(loc.clone(), lo, hi, ext).await {
+                                Ok(span) => Some(span),
+                                Err(err) => {
+                                    log::warn!("Lance disk cache fetch of {loc} failed: {err}");
+                                    None
+                                }
+                            }
+                        }
+                        .boxed()
+                        .shared();
+                        if share {
+                            for block in lo..=hi {
+                                map.entry((hash.clone(), block)).or_insert_with(|| fut.clone());
+                            }
+                        }
+                        (Some(fut), Vec::new())
+                    }
+                }
+            };
+            if let Some(fut) = own {
+                let result = fut.clone().await;
+                {
+                    let mut map = self.cache.inflight.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for block in lo..=hi {
+                        if map.get(&(hash.clone(), block)).is_some_and(|entry| Shared::ptr_eq(entry, &fut)) {
+                            map.remove(&(hash.clone(), block));
+                        }
+                    }
+                }
+                if let Some((fetched_meta, fetched, bytes)) = result {
+                    meta.get_or_insert(fetched_meta);
+                    fill(&mut blocks, &fetched, &bytes);
+                }
+            }
+            for fut in waits {
+                if let Some((fetched_meta, fetched, bytes)) = fut.await {
+                    meta.get_or_insert(fetched_meta);
+                    fill(&mut blocks, &fetched, &bytes);
+                }
+            }
+            // Anything still missing (a shared fetch failed or did not cover it): fetch
+            // directly so the real error surfaces.
+            let size = meta.as_ref().map_or(u64::MAX, |meta| meta.size);
+            let still: Vec<u64> = (first..=last)
+                .filter(|&block| block * BLOCK_BYTES < size && blocks[(block - first) as usize].is_none())
+                .collect();
+            if let (Some(&lo), Some(&hi)) = (still.first(), still.last()) {
+                let (fetched_meta, fetched, bytes) = self.fetch_span(location.clone(), lo, hi, options).await?;
+                meta.get_or_insert(fetched_meta);
+                fill(&mut blocks, &fetched, &bytes);
             }
         }
 
@@ -697,11 +841,11 @@ impl ObjectStore for DiskCacheStore {
         self.maybe_warm(location);
         match options.range.clone() {
             Some(GetRange::Bounded(range)) if range.start < range.end => {
-                self.get_blocks(location, range, options).await
+                self.get_blocks(location, range, options, true).await
             }
             None => match self.cache.get_meta(self.namespace.clone(), location.clone()).await {
                 Some(meta) if meta.size > 0 && meta.size <= WHOLE_OBJECT_MAX_BYTES => {
-                    let mut result = self.get_blocks(location, 0..meta.size, options).await?;
+                    let mut result = self.get_blocks(location, 0..meta.size, options, true).await?;
                     result.meta = meta;
                     Ok(result)
                 }
@@ -742,7 +886,7 @@ impl ObjectStore for DiskCacheStore {
                 return Ok(Bytes::new());
             }
             let options = GetOptions::new().with_range(Some(range.clone()));
-            self.get_blocks(location, range.clone(), options).await?.bytes().await
+            self.get_blocks(location, range.clone(), options, true).await?.bytes().await
         }))
         .await
     }
@@ -822,7 +966,12 @@ fn configured_wrapper() -> Option<Arc<DiskCacheWrapper>> {
                 },
                 Err(_) => DEFAULT_CACHE_BYTES,
             };
-            match DiskRangeCache::new(PathBuf::from(root), max_bytes) {
+            let promote_bytes = match std::env::var(PROMOTE_BYTES_ENV) {
+                Ok(value) => value.parse::<u64>().unwrap_or(DEFAULT_PROMOTE_BYTES),
+                Err(_) => DEFAULT_PROMOTE_BYTES,
+            };
+            let warm = std::env::var(WARM_ENV).map_or(true, |value| value != "0");
+            match DiskRangeCache::new(PathBuf::from(root), max_bytes, promote_bytes) {
                 Ok(cache) => {
                     eprintln!(
                         "lancedb-go disk range cache dir={} max_bytes={} existing_bytes={}",
@@ -830,7 +979,8 @@ fn configured_wrapper() -> Option<Arc<DiskCacheWrapper>> {
                         max_bytes,
                         cache.initial_bytes()
                     );
-                    Some(Arc::new(DiskCacheWrapper { cache, warmed: Default::default() }))
+                    eprintln!("lancedb-go disk cache promote_bytes={promote_bytes} warm={warm}");
+                    Some(Arc::new(DiskCacheWrapper { cache, warmed: warm.then(Default::default) }))
                 }
                 Err(err) => {
                     log::warn!("Lance disk cache disabled: {err}");
@@ -859,7 +1009,7 @@ mod tests {
 
     async fn test_store(max_bytes: u64) -> (Arc<InMemory>, DiskCacheStore, tempfile::TempDir) {
         let temp = tempdir().unwrap();
-        let cache = DiskRangeCache::new(temp.path().to_path_buf(), max_bytes).unwrap();
+        let cache = DiskRangeCache::new(temp.path().to_path_buf(), max_bytes, 0).unwrap();
         let original = Arc::new(InMemory::new());
         let store = DiskCacheStore {
             original: original.clone(),
@@ -909,7 +1059,7 @@ mod tests {
         let meta_len = encode_meta(&original.head(&path).await.unwrap()).len() as u64;
         let store = DiskCacheStore {
             original: original.clone(),
-            cache: DiskRangeCache::new(temp.path().to_path_buf(), meta_len + 8).unwrap(),
+            cache: DiskRangeCache::new(temp.path().to_path_buf(), meta_len + 8, 0).unwrap(),
             namespace: "s3$test".to_string(),
             warmed: None,
         };

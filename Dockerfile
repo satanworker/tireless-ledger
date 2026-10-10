@@ -4,8 +4,8 @@
 # well as Rust, so the Go build always needs this (cheap) stage.
 FROM golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac AS lance-src
 ARG LANCEDB_GO_COMMIT=fa14ce29c7724354f2cea630a1d3488b56bbd64b
-# The overlay advances lancedb-go's stale Rust pin from v0.24.0 to v0.37.1
-# (Lance 10), matching the engine used by the Python comparison sidecar.
+# The overlay advances lancedb-go's stale Rust pin from v0.24.0 to v0.40.0
+# (Lance 13), matching the engine used by the Python comparison sidecar.
 RUN git clone https://github.com/lancedb/lancedb-go.git /opt/lancedb-go \
   && git -C /opt/lancedb-go checkout "$LANCEDB_GO_COMMIT"
 COPY docker/lancedb-go-session-cache.patch /tmp/lancedb-go-session-cache.patch
@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=lance-src /opt/lancedb-go /opt/lancedb-go
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/opt/lancedb-go/rust/target \
-    CARGO_BUILD_JOBS=1 cargo build --manifest-path /opt/lancedb-go/rust/Cargo.toml --release --features aws \
+    CARGO_BUILD_JOBS=1 cargo build --manifest-path /opt/lancedb-go/rust/Cargo.toml --release --features aws,remote \
   && mkdir -p /out \
   && cp /opt/lancedb-go/rust/target/release/liblancedb_go.a /out/
 
@@ -34,8 +34,8 @@ COPY --from=lance-build /out/liblancedb_go.a /liblancedb_go.a
 # Published output of `make lance-lib` for the pins above. Override locally with
 # --build-context lance-lib=<dir containing liblancedb_go.a>.
 FROM scratch AS lance-lib
-ADD --checksum=sha256:1a11e58ded224f0a6cbc82b35692acb604e85e94148544c1aea731f292cab24d \
-    https://github.com/satanworker/tireless-ledger/releases/download/lance-lib-0.37.1-r2/liblancedb_go-linux-arm64.a \
+ADD --checksum=sha256:5b02d03d9b52e53868741e03faf3741201a9c93bfbb16b208ed33612e65c286f \
+    https://github.com/satanworker/tireless-ledger/releases/download/lance-lib-0.40.0-r1/liblancedb_go-linux-arm64.a \
     /liblancedb_go.a
 
 FROM golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac AS go-build

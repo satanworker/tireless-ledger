@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Lance 13 and disk-cache first-touch promotion (2026-10-10)
+
+- The Rust library moves to lancedb v0.40.0 (Lance 13, object_store 0.14;
+  `lance-lib-0.40.0-r1`). lancedb 0.40.0 references `Error::Http` outside its
+  `remote` feature, so the library is built with `aws,remote`. Everything Lance
+  13 writes (compacted data, the IVF_PQ index, FTS appends) was read back by the
+  Lance 10 binary at the same recall, so rollback to 0.2.2 stays possible.
+- The disk cache widens a file's first footer read: index files up to
+  `LANCE_DISK_CACHE_PROMOTE_BYTES` (default 64 MiB) are fetched whole, data
+  files get their last 8 MiB, so the dependent reads that follow are local.
+  Identical in-flight block fetches are shared. `LANCE_DISK_CACHE_WARM=0`
+  disables the background table copy. Measured on the IVF_PQ layout with an
+  empty cache: first query after a restart 2.4 s → 1.4 s (11 → 8 round trips);
+  index-only re-warm after an optimize 1.4 → 1.06 s.
+- Lance 13 on the same layout, no cache: startup 27 → 25 round trips, first
+  hybrid query 291 → 261 requests; no change in bytes.
+
 ### Single-partition IVF_PQ, refine, two-step row fetch (2026-10-10)
 
 - The vector index is one IVF_PQ partition (96 sub-vectors, 34 MB; was

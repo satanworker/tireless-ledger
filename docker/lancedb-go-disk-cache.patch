@@ -5,9 +5,9 @@ index bc94f05..9465011 100644
 @@ -18,6 +18,12 @@ path = "src/lib_simple.rs"
  
  [dependencies]
- lancedb = { git = "https://github.com/lancedb/lancedb.git", tag = "v0.37.1", default-features = false }
-+lance = { version = "=10.0.0", default-features = false }
-+object_store = "0.13.2"
+ lancedb = { git = "https://github.com/lancedb/lancedb.git", tag = "v0.40.0", default-features = false }
++lance = { version = "=13.0.0", default-features = false }
++object_store = "0.14.1"
 +async-trait = "0.1"
 +bytes = "1"
 +futures = "0.3"
