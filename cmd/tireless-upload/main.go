@@ -16,7 +16,7 @@ import (
 )
 
 type settings struct {
-	rawURL, endpoint, region, host, piRoot, codexRoot, ompRoot, claudeRoot string
+	rawURL, endpoint, region, host, piRoot, codexRoot, ompRoot, claudeRoot, grokRoot string
 }
 
 func main() {
@@ -31,6 +31,7 @@ func main() {
 	flag.StringVar(&cfg.codexRoot, "codex", env("TIRELESS_CODEX_SESSIONS", filepath.Join(home, ".codex", "sessions")), "Codex sessions directory")
 	flag.StringVar(&cfg.ompRoot, "omp", env("TIRELESS_OMP_SESSIONS", filepath.Join(home, ".omp", "agent", "sessions")), "OMP sessions directory")
 	flag.StringVar(&cfg.claudeRoot, "claude", env("TIRELESS_CLAUDE_SESSIONS", filepath.Join(home, ".claude", "projects")), "Claude Code projects directory")
+	flag.StringVar(&cfg.grokRoot, "grok", env("TIRELESS_GROK_SESSIONS", filepath.Join(home, ".grok", "sessions")), "Grok sessions directory")
 	flag.Parse()
 	if err := run(context.Background(), cfg); err != nil {
 		log.Fatal(err)
@@ -59,7 +60,7 @@ func run(ctx context.Context, cfg settings) error {
 		}
 	})
 	totalScanned, totalUploaded := 0, 0
-	for _, source := range []struct{ harness, root string }{{"pi", cfg.piRoot}, {"codex", cfg.codexRoot}, {"omp", cfg.ompRoot}, {"claude", cfg.claudeRoot}} {
+	for _, source := range []struct{ harness, root string }{{"pi", cfg.piRoot}, {"codex", cfg.codexRoot}, {"omp", cfg.ompRoot}, {"claude", cfg.claudeRoot}, {"grok", cfg.grokRoot}} {
 		scanned, uploaded, err := syncTree(ctx, client, bucket, prefix, cfg.host, source.harness, source.root)
 		if err != nil {
 			return err
@@ -92,6 +93,10 @@ func syncTree(ctx context.Context, client *s3.Client, bucket, prefix, host, harn
 			return walkErr
 		}
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".jsonl") {
+			return nil
+		}
+		// Grok keeps several JSONL logs per session; updates.jsonl holds the clean message stream.
+		if harness == "grok" && entry.Name() != "updates.jsonl" {
 			return nil
 		}
 		scanned++

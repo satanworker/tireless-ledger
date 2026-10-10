@@ -1,5 +1,5 @@
 [Unit]
-Description=Continuously upload this server's Codex, Pi, OMP, and Claude Code sessions
+Description=Continuously upload this server's Codex, Pi, OMP, Claude Code, and Grok sessions
 
 [Timer]
 OnBootSec=30s

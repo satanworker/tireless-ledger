@@ -1,6 +1,6 @@
 # pi-memoryd
 
-`pi-memoryd` is the single recall service for indexed Pi, Codex, OMP, and Claude Code sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
+`pi-memoryd` is the single recall service for indexed Pi, Codex, OMP, Claude Code, and Grok sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
 
 ```text
 Mac launchd uploader -------\
@@ -13,8 +13,8 @@ the central ingester:
 
 | Component | Runs on | Reads | Responsibility |
 |---|---|---|---|
-| Mac uploader (`launchd`) | Each Mac | That Mac's Pi, Codex, OMP, and Claude Code session directories | Copies untouched JSONL to R2 every minute |
-| Server uploader (`systemd --user`) | VPS | The VPS's Pi, Codex, OMP, and Claude Code session directories | Copies untouched JSONL to R2 every minute |
+| Mac uploader (`launchd`) | Each Mac | That Mac's Pi, Codex, OMP, Claude Code, and Grok session directories | Copies untouched JSONL to R2 every minute |
+| Server uploader (`systemd --user`) | VPS | The VPS's Pi, Codex, OMP, Claude Code, and Grok session directories | Copies untouched JSONL to R2 every minute |
 | Central ingester (`pi-memoryd` in Docker) | VPS | All raw JSONL already uploaded to R2 | Parses, embeds, and writes the shared Lance recall index |
 
 Uploaders never parse or index sessions. `pi-memoryd` does not discover local
@@ -196,6 +196,7 @@ The raw object layout is deliberately the only contract:
 <host>/codex/<any subdirectories>/<file>.jsonl
 <host>/omp/<any subdirectories>/<file>.jsonl
 <host>/claude/<any subdirectories>/<file>.jsonl
+<host>/grok/<url-encoded cwd>/<session>/updates.jsonl
 ```
 
 The `claude` tree mirrors `~/.claude/projects` (override with
@@ -205,6 +206,12 @@ transcript under `<session>/subagents/agent-<id>.jsonl` is its own
 tool results are skipped; `ai-title`/`custom-title`/`summary` records become one
 title row per distinct title, `TodoWrite` inputs become todo rows, and
 synchronous `Agent`/`Task` results become task rows.
+
+The `grok` tree mirrors `~/.grok/sessions` (override with
+`TIRELESS_GROK_SESSIONS`), uploading only each session's `updates.jsonl`. Grok
+is also what T3 Code runs for Grok threads; T3's Claude threads already land in
+`~/.claude/projects`. User and agent message chunks become messages; thoughts,
+tool calls, hooks, and T3's injected `<runtime_info>` prompt suffix are skipped.
 
 Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages plus important session state: titles, todo snapshots, and task/subagent tool results. Every logical message is stored once, in full, as a canonical `message` row. Important state rows use `record_kind` values `title`, `todo`, or `task` so normal recall can find them without reading a local session file. The daemon uses llama.cpp's tokenizer to split each searchable row into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent row ID. Search runs over chunks and collapses hits by parent. Session walking prefers the untouched raw JSONL archive and falls back to the derived `messages` table; `include=todos`, `include=tasks`, `include=titles`, or `include=state` reads those exact records from raw when available, so reconstruction is not limited by chunk overlap, embedding truncation, or quantized search indexes.
 

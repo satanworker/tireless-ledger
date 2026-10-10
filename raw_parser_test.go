@@ -145,6 +145,25 @@ func TestParseRawClaudeSession(t *testing.T) {
 	}
 }
 
+func TestParseRawSessionGrok(t *testing.T) {
+	body := []byte(`{"timestamp":1791311373,"method":"_x.ai/session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"hook_execution"}}}
+{"timestamp":1791311374,"method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Index Grok sessions too."}},"_meta":{"eventId":"g1-4","agentTimestampMs":1791311374246}}}
+{"timestamp":1791311374,"method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<runtime_info>In case you're asked: T3 Code.</runtime_info>"}},"_meta":{"eventId":"g1-5"}}}
+{"timestamp":1791311376,"method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"private reasoning here"}},"_meta":{"eventId":"g1-6"}}}
+{"timestamp":1791311377,"method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Adding a grok harness."}},"_meta":{"eventId":"g1-7"}}}
+`)
+	items, err := parseRawSessionForIndex("home-satan/grok/%2Frepo%2Ftireless-ledger/g1/updates.jsonl", body)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	if m := items[0].Metadata; m.Harness != "grok" || m.SessionID != "g1" || m.ProjectName != "tireless-ledger" || m.Role != "user" || m.Timestamp != 1791311374 {
+		t.Fatalf("meta=%+v", m)
+	}
+	if items[0].ForwardContent != "Index Grok sessions too." || items[1].ForwardContent != "Adding a grok harness." || items[1].Metadata.Role != "assistant" {
+		t.Fatalf("items=%+v", items)
+	}
+}
+
 func TestRawObjectIdentityRejectsUnknownFiles(t *testing.T) {
 	if _, _, ok := rawObjectIdentity("mbp14/notes/file.txt"); ok {
 		t.Fatal("accepted unsupported key")

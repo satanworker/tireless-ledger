@@ -1,5 +1,5 @@
 [Unit]
-Description=Upload this server's Codex, Pi, OMP, and Claude Code sessions to Tireless Ledger
+Description=Upload this server's Codex, Pi, OMP, Claude Code, and Grok sessions to Tireless Ledger
 ConditionPathExists=%h/tireless-ledger/.env
 ConditionPathExists=%h/.local/bin/tireless-upload
 

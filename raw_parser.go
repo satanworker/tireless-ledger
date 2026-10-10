@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,7 +21,7 @@ var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", 
 func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 	host, harness, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok>/<path>.jsonl")
 	}
 	return parseSessionJSONL(body, host, harness, key, false)
 }
@@ -27,14 +29,14 @@ func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 func parseRawSessionForIndex(key string, body []byte) ([]MemoryItem, error) {
 	host, harness, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok>/<path>.jsonl")
 	}
 	return parseSessionJSONL(body, host, harness, key, true)
 }
 
 func rawObjectIdentity(key string) (host, harness string, ok bool) {
 	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
-	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp" && parts[1] != "claude") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
+	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp" && parts[1] != "claude" && parts[1] != "grok") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
 		return "", "", false
 	}
 	return parts[0], parts[1], true
@@ -59,6 +61,12 @@ func parseSessionJSONL(body []byte, host, harness, source string, includeState b
 	pendingState := make([]pendingRawState, 0)
 	var lastTS int64
 	claudeTaskCalls := map[string]bool{}
+	if harness == "grok" {
+		// Grok keys are <host>/grok/<url-encoded cwd>/<sessionId>/updates.jsonl.
+		if cwd, err := url.PathUnescape(path.Base(path.Dir(path.Dir(source)))); err == nil {
+			project = projectFromCWD(cwd)
+		}
+	}
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64*1024), 64<<20)
 	lineNo := 0
@@ -70,6 +78,22 @@ func parseSessionJSONL(body []byte, host, harness, source string, includeState b
 		}
 		var obj map[string]interface{}
 		if json.Unmarshal(line, &obj) != nil {
+			continue
+		}
+		if harness == "grok" {
+			params, _ := obj["params"].(map[string]interface{})
+			update, _ := params["update"].(map[string]interface{})
+			meta, _ := params["_meta"].(map[string]interface{})
+			role := map[string]string{"user_message_chunk": "user", "agent_message_chunk": "assistant"}[stringField(update, "sessionUpdate")]
+			content, _ := update["content"].(map[string]interface{})
+			text := strings.TrimSpace(stringField(content, "text"))
+			// T3 Code appends its harness instructions to every prompt as a separate chunk.
+			if stringField(obj, "method") != "session/update" || role == "" || strings.HasPrefix(text, "<runtime_info>") || !indexableMessage(role, text) {
+				continue
+			}
+			sessionID = valueOr(stringField(params, "sessionId"), sessionID)
+			id := valueOr(stringField(meta, "eventId"), fmt.Sprintf("line-%d", lineNo))
+			items = append(items, rawRecord(host, harness, sessionID, id, role, text, parseRawTimestamp(firstValue(meta["agentTimestampMs"], obj["timestamp"])), project, "message"))
 			continue
 		}
 		if harness == "claude" {
