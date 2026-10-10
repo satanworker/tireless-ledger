@@ -505,6 +505,28 @@ Approved after the disk-cache experiments (docs report §3). Implemented in this
 
 Deferred, in order: optimize without stopping the daemon (measure queries during a live `--optimize` on a scratch copy); `PI_MEMORYD_RAW_WRITE_INTERVAL` 5m → 15m; the E2 disk-cache promotion with the next Rust lib rebuild.
 
+**Released and rehearsed (2026-10-10, afternoon).** v0.2.2 is published (commits `665c909` B5, `7068dde` Grok ingest; binaries `pi-memoryd-linux-arm64` sha256 `3c128c1c…`, `tireless-upload-linux-arm64` `f889394c…`). `home-satan` commit `605aba7` pins it and carries the optimize-script change; `nix build .#pi-memoryd` and the evaluated `tireless-optimize` script were checked. Every rollout and rollback step below was then run on a fresh copy of production (v12983 after the run, 330,254 rows) with the nix-built 0.2.2 and the production 0.2.1 binaries, through the logging proxy, with a 6 GB disk cache dir:
+
+| step | result |
+|---|---|
+| 2. new binary on the old IVF_FLAT index, np 128, empty cache | listening 3.5 s; first vector query 4.6 s, then p50 0.099 s vector / 0.071 s hybrid; recall vs exact scan 0.98 vector / 0.91 hybrid (today's index; plain overlap, ties count as misses); no errors |
+| 3. metadata commit (pylance 10.0.0) | 7 s |
+| 3. `--drop-vector-index` | 2 s, drops `vector_ivf_flat` |
+| 3. `--optimize` | 94 s (chunks 15 → 2 fragments, messages 15 → 2) |
+| 3. `--create-vector-index` | 233 s, `created IVF-PQ vector index partitions=1 sub_vectors=96` |
+| 3. total downtime | about 5 min 40 s |
+| 4. daemon after cutover | listening 0.9 s; the `warmLedger` query 1.3 s (reads the 34 MB PQ index, 7 waves); then p50 0.058 s vector / 0.059 s hybrid, 0 R2 requests; all 14 metadata fields present; cache re-warm 34 MB in 1.5 s |
+| ingest 60 rows in 6 batches through `/v1/memory/ingest` | 6 tail fragments; searchable at once (text and vector) |
+| `--optimize` with 6 tail fragments | 112 s; chunks 8 → 2; `--create-vector-index` afterwards: "vector index already exists", 2 s; pylance: `vector_ivf_pq` 330,254 indexed / 0 unindexed, 1 index; FTS and btree likewise |
+| daemon after that optimize | listening 0.9 s; first query 1.5 s; p50 0.062 / 0.061 s; vector-only search finds the ingested rows through the index; **recall vs exact scan 1.000 vector / 1.000 hybrid (30 queries)** |
+| rollback: new `--drop-vector-index` | 2 s, drops `vector_ivf_pq` |
+| rollback: exact scan with no index | p50 0.89 s vector / 0.99 s hybrid (this is also the ground truth above) |
+| rollback: old 0.2.1 `--create-vector-index` on the re-encoded data | 47 s, IVF_FLAT 512 |
+| rollback: old daemon, np 128 | p50 0.071 / 0.069 s; recall 0.98 / 0.987; no errors |
+
+Not rehearsed: starting the old binary while the PQ index exists (the documented bad rollback order); `make switch` itself.
+
+
 ### Rollout
 
 1. In `tireless-ledger`, apply the diff and add the CHANGELOG entry. Run `go test ./...`, then `make release-linux` and publish pi-memoryd. There is no lib rebuild.
