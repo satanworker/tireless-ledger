@@ -471,12 +471,12 @@ Findings:
 
 - The shipped disk cache already removes most of the cold cost in production. The remaining user-visible window is ~6 s after each restart, and the optimize downtime around it.
 - B5 is still the larger win: it halves the warm volume, removes the index rebuild from the optimize cycle (34 MB re-warm instead of 508 MB + 740 MB), and takes the no-cache fallback from 11 s to 3 s.
-- E2 is worth about 1 s of a 4 s window, six times a day. Ship it when the Rust lib is rebuilt for another reason (Lance 13, for example); it is not worth a release on its own. The diff is 203 changed lines, no new dependencies, and leaves behaviour unchanged with `LANCE_DISK_CACHE_PROMOTE_BYTES=0`.
+- E2 was shipped after all, in v0.2.3, together with Lance 13 (3.5). The diff is 203 changed lines, no new dependencies, and leaves behaviour unchanged with `LANCE_DISK_CACHE_PROMOTE_BYTES=0`.
 - The one setting that matters today is the cache cap: it must stay above indexes + data (`with_data=true`), or every query pays ~0.5 s for rows.
 
 ### 3.4 E2 diff
 
-Kept at `~/ledger-bench/e2-disk-cache.diff` on home-satan together with the rebuilt lib (`~/ledger-bench/lance1/liblancedb_go.a`, built from the `lance-artifact` stage with the modified wrapper; a control build of the unmodified wrapper took 1 h 45 min on a 2-CPU builder, the incremental rebuild 2 min). Summary of the change:
+Shipped in `docker/lancedb-go-disk-cache.rs` as of v0.2.3 (`lance-lib-0.40.0-r1`). Summary of the change:
 
 ```text
 const PROMOTE_BYTES_ENV = "LANCE_DISK_CACHE_PROMOTE_BYTES"   (default 64 MiB; 0 disables)
@@ -503,6 +503,29 @@ fn get_blocks(location, range, options, share):
 
 warm_chunk -> get_blocks(..., share=false); get_opts/get_ranges -> share=true
 ```
+
+### 3.5 Released: v0.2.2 (B5) and v0.2.3 (B5 + Lance 13 + E2), 2026-10-10
+
+Everything above was measured with patched bench binaries. The release binaries were then rehearsed, with every rollout and rollback step, on fresh copies of production (the task file's Status section has the full tables). What that added:
+
+- **Lance 13 (lancedb v0.40.0) in the Go path.** Reads today's layout, compacts, builds and folds the PQ index. Cold gains on its own are small: startup 27 → 25 round trips, first hybrid query 291 → 261 requests, bytes unchanged. The −38% FTS bytes measured with pylance 13 in section 1.5 did **not** reproduce in the Go path; the Python harness issued a different read pattern. Two build issues: lancedb 0.40.0 does not compile without its `remote` feature (`job.rs` uses `Error::Http` unconditionally), and object_store 0.14 / lance-io 13 need `GetResult.extensions` and `WrappingObjectStore::wrap_paginated` in the wrapper.
+- **Cross-version safety.** The Lance 10 binary (0.2.2) reads everything Lance 13 wrote: compacted data, the PQ index, FTS appends after an ingest; recall 1.000 / 0.987. Rollback from 0.2.3 to 0.2.2 is the pin alone.
+- **Cutover cost with the release binary:** 4 min 49 s (metadata 7 s, drop 2 s, optimize 53 s, PQ build 227 s). First query after it 1.2 s (the 34 MB index in one promoted read, 3 round trips); restart with a valid cache 0.13 s; steady 0.07 s; recall vs exact 1.000 vector / 0.993 hybrid.
+- **R2 throughput varies by an order of magnitude** across the day: the same 34 MB read took 1.2 s twice and 5.6 s once (~6 MB/s). Bulk copies earlier ran at ~125 MB/s. Single cold samples are not reliable; the numbers in this report are medians or repeated.
+
+### 3.6 What the numbers mean for a client without a server (WASM)
+
+The 1.2–1.4 s "first query" is the daemon on the VPS with its cache already holding the text index and rows, 0.1 s per round trip. A browser client has no disk cache and no Lance, so what carries over is the file layout, not the latency:
+
+| | VPS daemon, measured | browser client, projected [INFERENCE] |
+|---|---|---|
+| round trip to R2 | 0.1 s | 0.05–0.3 s by user location |
+| nothing local, Lance's 28-trip chain | 3.5 s | 5–8 s; not how a client should work |
+| first use: PQ codes 34 MB + text index 46 MB + a `parent_id` sidecar ~3 MB, fetched whole | – | ~85 MB once per device, kept in browser storage |
+| every query after that | 0.07 s | 2 round trips: 200 refine vectors in parallel with local postings, then 5 rows: 0.3–0.6 s |
+| after an optimize | re-warm 34 MB | re-download the changed small files |
+
+B5 made the routing side fit in a few whole files; that is the precondition. Still missing for such a client: a `parent_id[rowid]` sidecar so collapsing needs no row reads, a row-oriented doc store so a result is one contiguous read, and the reader itself (PQ scan + inverted index over those files; Lance does not target WASM).
 
 ## Caveats
 
