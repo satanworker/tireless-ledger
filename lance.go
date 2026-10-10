@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,9 +25,14 @@ const (
 	lanceTableName        = "turns"
 	lanceChunksTable      = "chunks"
 	lanceMessagesTable    = "messages"
-	lanceVectorIndexName  = "vector_ivf_flat"
-	lanceVectorPartitions = uint32(512)
-	lanceVectorNProbes    = 64
+	lanceVectorIndexName = "vector_ivf_pq"
+	// One partition: a cold search reads the whole PQ index (~100 B/chunk) in a few large
+	// requests instead of two small requests per probed partition, and recall is exact
+	// after refine. ponytail: full PQ scan; past ~1M chunks use 64+ partitions, probe ~50%.
+	lanceVectorPartitions   = uint32(1)
+	lanceVectorSubVectors   = uint32(96)
+	lanceVectorRefineFactor = uint32(4)
+	lanceVectorNProbes      = 1
 )
 
 var lanceOutputColumns = []string{
@@ -120,22 +126,31 @@ func (s *cgoLanceStore) openOrCreateTable(ctx context.Context, name string) (con
 	return s.createTable(ctx, name)
 }
 
+// A search's first read of a column loads every page's dictionary (parent_id, file_hash
+// and file_path cost ~20 MB cold at 330k rows) and every full-zip page's repetition
+// index (forward_content, ~1.3 MB). Plain miniblock pages cost KBs. Compaction applies
+// these to existing tables once the dataset schema carries them.
+var (
+	lanceNoDictionary = arrow.NewMetadata([]string{"lance-encoding:dict-divisor"}, []string{"1000000000"})
+	lanceMiniblock    = arrow.NewMetadata([]string{"lance-encoding:structural-encoding"}, []string{"miniblock"})
+)
+
 func (s *cgoLanceStore) createTable(ctx context.Context, name string) (contracts.ITable, error) {
 	fields := []arrow.Field{
 		{Name: "id", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "vector", Type: arrow.FixedSizeListOf(int32(s.dims), arrow.PrimitiveTypes.Float32), Nullable: true},
-		{Name: "forward_content", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "forward_content", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceMiniblock},
 		{Name: "scope", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "project_name", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "file_path", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "file_hash", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "file_path", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
+		{Name: "file_hash", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
 		{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "session_id", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "session_id", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
 		{Name: "host", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "harness", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "role", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "record_kind", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "parent_id", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "parent_id", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
 		{Name: "chunk_index", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
 		{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
 	}
@@ -293,13 +308,13 @@ func (s *cgoLanceStore) CreateVectorIndex(ctx context.Context) error {
 			}
 		}
 	}
-	partitions := lanceVectorPartitions
-	if err := table.CreateIndexWithParams(ctx, []string{"vector"}, contracts.IndexTypeIvfFlat,
-		contracts.IndexParams{NumPartitions: &partitions, DistanceType: contracts.DistanceTypeL2},
+	partitions, subVectors := lanceVectorPartitions, lanceVectorSubVectors
+	if err := table.CreateIndexWithParams(ctx, []string{"vector"}, contracts.IndexTypeIvfPq,
+		contracts.IndexParams{NumPartitions: &partitions, NumSubVectors: &subVectors, DistanceType: contracts.DistanceTypeL2},
 		&contracts.CreateIndexOptions{Name: lanceVectorIndexName, WaitTimeout: 10 * time.Minute}); err != nil {
-		return fmt.Errorf("create IVF-Flat vector index: %w", err)
+		return fmt.Errorf("create IVF-PQ vector index: %w", err)
 	}
-	slog.Info("created IVF-Flat vector index", "name", lanceVectorIndexName, "partitions", partitions, "nprobes", s.nprobes)
+	slog.Info("created IVF-PQ vector index", "name", lanceVectorIndexName, "partitions", partitions, "sub_vectors", subVectors, "nprobes", s.nprobes)
 	return nil
 }
 
@@ -309,16 +324,17 @@ func (s *cgoLanceStore) DropVectorIndex(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list lance indexes: %w", err)
 	}
+	// By column, not name: the IVF-Flat index this replaces is named vector_ivf_flat.
 	for _, index := range indexes {
-		if index.Name == lanceVectorIndexName {
+		if len(index.Columns) == 1 && index.Columns[0] == "vector" {
 			if err := table.DropIndex(ctx, index.Name); err != nil {
-				return fmt.Errorf("drop IVF-Flat vector index: %w", err)
+				return fmt.Errorf("drop vector index %s: %w", index.Name, err)
 			}
-			slog.Info("dropped IVF-Flat vector index", "name", index.Name)
+			slog.Info("dropped vector index", "name", index.Name, "type", index.IndexType)
 			return nil
 		}
 	}
-	slog.Info("IVF-Flat vector index is absent", "name", lanceVectorIndexName)
+	slog.Info("vector index is absent")
 	return nil
 }
 
@@ -511,8 +527,9 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	case hasVector:
 		config.Limit = &limit
 		nprobes := s.nprobes
+		refine := lanceVectorRefineFactor
 		config.VectorSearch = &contracts.VectorSearch{
-			Column: "vector", Vector: req.Vector, K: limit, Nprobes: &nprobes,
+			Column: "vector", Vector: req.Vector, K: limit, Nprobes: &nprobes, RefineFactor: &refine,
 			BypassVectorIndex: s.exact,
 		}
 		if hasText {
@@ -530,7 +547,13 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 		}
 		config.FTSSearch = &contracts.FTSSearch{Column: "forward_content", Query: req.BM25.Query}
 	}
-	rows, err := table.Select(ctx, config)
+	var rows []map[string]interface{}
+	var err error
+	if req.Collapse > 0 && (hasVector || hasText) {
+		rows, err = selectCollapsed(ctx, table, config, req.Collapse)
+	} else {
+		rows, err = table.Select(ctx, config)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -570,6 +593,70 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 		}
 	}
 	return results, nil
+}
+
+// selectCollapsed ranks candidates reading only parent_id, keeps the best row of each of
+// the first `parents` parents, then reads the output columns for just those rows. A cold
+// search reads ~5 rows of the wide columns instead of fetchK per channel.
+func selectCollapsed(ctx context.Context, table contracts.ITable, config contracts.QueryConfig, parents int) ([]map[string]interface{}, error) {
+	rank := config
+	rank.Columns = []string{"parent_id"}
+	rank.WithRowID = true
+	hits, err := table.Select(ctx, rank)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, parents)
+	kept := make([]map[string]interface{}, 0, parents)
+	rowIDs := make([]string, 0, parents)
+	for _, hit := range hits {
+		rowID := strconv.FormatUint(uint64(numberValue(hit["_rowid"])), 10)
+		parent := stringValue(hit["parent_id"])
+		if parent == "" {
+			parent = rowID
+		}
+		if seen[parent] {
+			continue
+		}
+		seen[parent] = true
+		kept = append(kept, hit)
+		rowIDs = append(rowIDs, rowID)
+		if len(kept) == parents {
+			break
+		}
+	}
+	if len(kept) == 0 {
+		return nil, nil
+	}
+	// No Limit: Lance 10 applies a limit on a `_rowid IN` scan as a row range before the
+	// filter and returns nothing.
+	full, err := table.Select(ctx, contracts.QueryConfig{Columns: config.Columns, Where: "_rowid IN (" + strings.Join(rowIDs, ",") + ")", WithRowID: true})
+	if err != nil {
+		return nil, err
+	}
+	if len(full) != len(kept) {
+		// A concurrent merge-insert rewrote a hit between the two reads (row ids are row
+		// addresses); rank and fetch in one pass instead.
+		return table.Select(ctx, config)
+	}
+	byRowID := make(map[float64]map[string]interface{}, len(full))
+	for _, row := range full {
+		byRowID[numberValue(row["_rowid"])] = row
+	}
+	for i, hit := range kept {
+		row := byRowID[numberValue(hit["_rowid"])]
+		if row == nil {
+			return table.Select(ctx, config)
+		}
+		for _, k := range []string{"_relevance_score", "_score", "_distance"} {
+			if v, ok := hit[k]; ok {
+				row[k] = v
+			}
+		}
+		delete(row, "_rowid")
+		kept[i] = row
+	}
+	return kept, nil
 }
 
 type splitMigrationState struct {

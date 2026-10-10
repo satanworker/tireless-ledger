@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Single-partition IVF_PQ, refine, two-step row fetch (2026-10-10)
+
+- The vector index is one IVF_PQ partition (96 sub-vectors, 34 MB; was
+  IVF_FLAT with 512 partitions, 509 MB) searched with refine factor 4. A
+  cold search reads the whole index in a few requests instead of 128
+  partitions two at a time. Recall@5 against brute force on production data:
+  1.000 vector / 0.987 hybrid (was 0.973 / 0.977 at 128 probes).
+- `--drop-vector-index` drops by column, so it removes the old
+  `vector_ivf_flat` too. `--optimize` folds new rows into the PQ index (19 s
+  for 15 fragments) instead of needing a drop and retrain each run.
+- New tables set `lance-encoding:dict-divisor` on `parent_id`, `file_hash`,
+  `file_path`, `session_id` and `structural-encoding=miniblock` on
+  `forward_content`. Existing tables need a one-off metadata commit (see the
+  cold-search task file); the next `--optimize` rewrites the data with it.
+  This removes ~20 MB of page dictionaries from every cold query.
+- Hybrid, vector and text searches rank reading only `parent_id`, keep the
+  best row per parent up to the request limit, then read the output columns
+  for those rows by `_rowid`. Falls back to one select if rows moved between
+  the two reads.
+- Measured fully cold through a logging proxy, hybrid, 10 queries: 48.6 MB,
+  407 requests, 28 sequential waves, 3.5 s (was 218.7 MB, 779, 83, 11.2 s).
+  With the disk cache: first query after a restart 2.4 s, all local after
+  about 5 s (was 2.1 s / 10 s). `PI_MEMORYD_VECTOR_NPROBES` defaults to 1.
+
 ### Block disk cache, table warm-up, 512 IVF partitions (2026-10-06)
 
 - Every immutable read now goes through the disk cache. Before, only batched

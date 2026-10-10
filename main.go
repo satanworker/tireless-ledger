@@ -108,6 +108,9 @@ type vectorSearchRequest struct {
 	IncludeFields []string      `json:"includeFields,omitempty"`
 	AfterTS       int64         `json:"after_ts,omitempty"`
 	AfterID       string        `json:"after_id,omitempty"`
+	// Collapse > 0 returns at most this many rows with distinct parent_id, reading the
+	// output columns only for them (vector/text searches).
+	Collapse int `json:"-"`
 }
 
 type vectorFilter struct {
@@ -354,7 +357,7 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.AWSRegion, "aws-region", env("AWS_REGION", env("AWS_DEFAULT_REGION", defaultRegion)), "AWS region")
 	flag.StringVar(&cfg.S3Endpoint, "s3-endpoint", env("PI_MEMORYD_S3_ENDPOINT", env("AWS_ENDPOINT_URL", env("AWS_ENDPOINT", ""))), "S3-compatible endpoint URL")
 	flag.IntVar(&cfg.Dimensions, "dimensions", envInt("PI_MEMORYD_DIMENSIONS", 384), "vector dimensions")
-	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 64), "IVF partitions scanned per vector query")
+	flag.IntVar(&cfg.VectorNProbes, "vector-nprobes", envInt("PI_MEMORYD_VECTOR_NPROBES", 1), "IVF partitions scanned per vector query")
 	flag.BoolVar(&cfg.ExactVectorSearch, "exact-vector-search", envBool("PI_MEMORYD_EXACT_VECTOR_SEARCH", true), "bypass ANN and exhaustively scan vectors for exact recall")
 	flag.BoolVar(&cfg.SplitTables, "split-tables", envBool("PI_MEMORYD_SPLIT_TABLES", false), "serve separate messages and chunks tables")
 	flag.BoolVar(&cfg.DualWriteSplit, "dual-write-split", envBool("PI_MEMORYD_DUAL_WRITE_SPLIT", false), "write both legacy and split tables")
@@ -366,8 +369,8 @@ func loadConfig() runtimeConfig {
 	flag.StringVar(&cfg.StatePath, "state", env("PI_MEMORYD_STATE", "./data/dedup_state.json"), "dedup state path")
 	flag.BoolVar(&cfg.DryRunS3, "dry-run-s3", envBool("PI_MEMORYD_DRY_RUN_S3", false), "skip AWS SDK S3 validation")
 	flag.BoolVar(&cfg.Optimize, "optimize", false, "compact data, refresh indexes, prune old versions, and exit")
-	flag.BoolVar(&cfg.CreateVectorIndex, "create-vector-index", false, "create a 512-partition IVF-Flat vector index and exit")
-	flag.BoolVar(&cfg.DropVectorIndex, "drop-vector-index", false, "drop the IVF-Flat vector index and exit")
+	flag.BoolVar(&cfg.CreateVectorIndex, "create-vector-index", false, "create the single-partition IVF-PQ vector index and exit")
+	flag.BoolVar(&cfg.DropVectorIndex, "drop-vector-index", false, "drop the vector index and exit")
 	flag.BoolVar(&cfg.AuditDuplicates, "audit-duplicates", false, "scan all rows for duplicate IDs and exit non-zero if any exist")
 	flag.StringVar(&cfg.DeleteHost, "delete-host", "", "delete every row and dedup entry for exactly this host, then exit")
 	flag.StringVar(&cfg.RawURL, "raw-url", env("PI_MEMORYD_RAW_URL", ""), "optional S3 prefix containing raw session files")
@@ -527,7 +530,7 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	searchReq := vectorSearchRequest{Table: "chunks", K: fetchK, Filter: filter, IncludeFields: include}
+	searchReq := vectorSearchRequest{Table: "chunks", K: fetchK, Filter: filter, IncludeFields: include, Collapse: req.Limit}
 	if hasVec {
 		searchReq.Vector = req.QueryVector
 	}
