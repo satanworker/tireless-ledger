@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Grok Bot harness
+
+- `tireless-upload --grokbot <dir>` (`TIRELESS_GROKBOT_SESSIONS`) mirrors Grok
+  Bot chat exports to `<host>/grokbot/<file>.jsonl`. It is empty by default, so
+  existing uploaders skip it.
+- `pi-memoryd` accepts the `grokbot` harness and parses it with the Pi/OMP
+  session parser: the session ID is the agent ID, the project is the `cwd` slug,
+  and millisecond timestamps become seconds. Rows keep `harness=grokbot`.
+
 ### Lance 13 and disk-cache first-touch promotion (2026-10-10)
 
 - The Rust library moves to lancedb v0.40.0 (Lance 13, object_store 0.14;

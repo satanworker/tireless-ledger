@@ -16,7 +16,7 @@ import (
 )
 
 type settings struct {
-	rawURL, endpoint, region, host, piRoot, codexRoot, ompRoot, claudeRoot, grokRoot string
+	rawURL, endpoint, region, host, piRoot, codexRoot, ompRoot, claudeRoot, grokRoot, grokbotRoot string
 }
 
 func main() {
@@ -32,6 +32,7 @@ func main() {
 	flag.StringVar(&cfg.ompRoot, "omp", env("TIRELESS_OMP_SESSIONS", filepath.Join(home, ".omp", "agent", "sessions")), "OMP sessions directory")
 	flag.StringVar(&cfg.claudeRoot, "claude", env("TIRELESS_CLAUDE_SESSIONS", filepath.Join(home, ".claude", "projects")), "Claude Code projects directory")
 	flag.StringVar(&cfg.grokRoot, "grok", env("TIRELESS_GROK_SESSIONS", filepath.Join(home, ".grok", "sessions")), "Grok sessions directory")
+	flag.StringVar(&cfg.grokbotRoot, "grokbot", env("TIRELESS_GROKBOT_SESSIONS", ""), "Grok Bot chat export directory (disabled when empty)")
 	flag.Parse()
 	if err := run(context.Background(), cfg); err != nil {
 		log.Fatal(err)
@@ -60,7 +61,7 @@ func run(ctx context.Context, cfg settings) error {
 		}
 	})
 	totalScanned, totalUploaded := 0, 0
-	for _, source := range []struct{ harness, root string }{{"pi", cfg.piRoot}, {"codex", cfg.codexRoot}, {"omp", cfg.ompRoot}, {"claude", cfg.claudeRoot}, {"grok", cfg.grokRoot}} {
+	for _, source := range []struct{ harness, root string }{{"pi", cfg.piRoot}, {"codex", cfg.codexRoot}, {"omp", cfg.ompRoot}, {"claude", cfg.claudeRoot}, {"grok", cfg.grokRoot}, {"grokbot", cfg.grokbotRoot}} {
 		scanned, uploaded, err := syncTree(ctx, client, bucket, prefix, cfg.host, source.harness, source.root)
 		if err != nil {
 			return err
@@ -74,7 +75,7 @@ func run(ctx context.Context, cfg settings) error {
 
 func syncTree(ctx context.Context, client *s3.Client, bucket, prefix, host, harness, root string) (scanned, uploaded int, err error) {
 	info, statErr := os.Stat(root)
-	if os.IsNotExist(statErr) {
+	if root == "" || os.IsNotExist(statErr) {
 		return 0, 0, nil
 	}
 	if statErr != nil {

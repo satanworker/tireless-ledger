@@ -1,6 +1,6 @@
 # pi-memoryd
 
-`pi-memoryd` is the single recall service for indexed Pi, Codex, OMP, Claude Code, and Grok sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
+`pi-memoryd` is the single recall service for indexed Pi, Codex, OMP, Claude Code, Grok, and Grok Bot sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
 
 ```text
 Mac launchd uploader -------\
@@ -14,7 +14,7 @@ the central ingester:
 | Component | Runs on | Reads | Responsibility |
 |---|---|---|---|
 | Mac uploader (`launchd`) | Each Mac | That Mac's Pi, Codex, OMP, Claude Code, and Grok session directories | Copies untouched JSONL to R2 every minute |
-| Server uploader (`systemd --user`) | VPS | The VPS's Pi, Codex, OMP, Claude Code, and Grok session directories | Copies untouched JSONL to R2 every minute |
+| Server uploader (`systemd --user`) | VPS | The VPS's Pi, Codex, OMP, Claude Code, and Grok session directories, plus Grok Bot chat exports when `TIRELESS_GROKBOT_SESSIONS` is set | Copies untouched JSONL to R2 every minute |
 | Central ingester (`pi-memoryd` in Docker) | VPS | All raw JSONL already uploaded to R2 | Parses, embeds, and writes the shared Lance recall index |
 
 Uploaders never parse or index sessions. `pi-memoryd` does not discover local
@@ -197,6 +197,7 @@ The raw object layout is deliberately the only contract:
 <host>/omp/<any subdirectories>/<file>.jsonl
 <host>/claude/<any subdirectories>/<file>.jsonl
 <host>/grok/<url-encoded cwd>/<session>/updates.jsonl
+<host>/grokbot/<slug>-<agentid8>.jsonl
 ```
 
 The `claude` tree mirrors `~/.claude/projects` (override with
@@ -212,6 +213,15 @@ The `grok` tree mirrors `~/.grok/sessions` (override with
 is also what T3 Code runs for Grok threads; T3's Claude threads already land in
 `~/.claude/projects`. User and agent message chunks become messages; thoughts,
 tool calls, hooks, and T3's injected `<runtime_info>` prompt suffix are skipped.
+
+The `grokbot` tree holds Grok Bot chat histories exported on `grok-box` and
+rsynced to the uploader host. It is off unless `--grokbot` /
+`TIRELESS_GROKBOT_SESSIONS` names a directory; every `*.jsonl` in it is
+uploaded. Each append-only file is one bot in the Pi session format: a
+`{"type":"session","id":"<agent_id>","cwd":"/grok-box/<slug>"}` header, then
+`message` lines with millisecond timestamps. The agent ID is the session ID and
+the slug is the project. Records keep the `grokbot` harness, so their IDs never
+collide with Pi or OMP rows.
 
 Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages plus important session state: titles, todo snapshots, and task/subagent tool results. Every logical message is stored once, in full, as a canonical `message` row. Important state rows use `record_kind` values `title`, `todo`, or `task` so normal recall can find them without reading a local session file. The daemon uses llama.cpp's tokenizer to split each searchable row into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent row ID. Search runs over chunks and collapses hits by parent. Session walking prefers the untouched raw JSONL archive and falls back to the derived `messages` table; `include=todos`, `include=tasks`, `include=titles`, or `include=state` reads those exact records from raw when available, so reconstruction is not limited by chunk overlap, embedding truncation, or quantized search indexes.
 

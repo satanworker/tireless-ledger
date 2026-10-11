@@ -164,9 +164,33 @@ func TestParseRawSessionGrok(t *testing.T) {
 	}
 }
 
+func TestParseRawSessionGrokbot(t *testing.T) {
+	body := []byte(`{"type":"session","id":"agent-1234abcd","cwd":"/grok-box/pentagrok"}
+{"type":"message","id":"e1","timestamp":1791311374246,"message":{"role":"user","content":[{"type":"text","text":"Rotate the R2 keys tonight."}]}}
+{"type":"message","id":"e2","timestamp":1791311375000,"message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+{"type":"message","id":"e3","timestamp":1791311377999,"message":{"role":"assistant","content":[{"type":"text","text":"Keys rotated, uploader restarted."}]}}
+`)
+	items, err := parseRawSessionForIndex("grok-box/grokbot/pentagrok-1234abcd.jsonl", body)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	if m := items[0].Metadata; m.Host != "grok-box" || m.Harness != "grokbot" || m.SessionID != "agent-1234abcd" || m.ProjectName != "pentagrok" || m.Role != "user" || m.Timestamp != 1791311374 {
+		t.Fatalf("meta=%+v", m)
+	}
+	if m := items[1].Metadata; m.Role != "assistant" || m.Timestamp != 1791311377 || items[1].ForwardContent != "Keys rotated, uploader restarted." {
+		t.Fatalf("item=%+v", items[1])
+	}
+	omp, err := parseRawSessionForIndex("grok-box/omp/pentagrok-1234abcd.jsonl", body)
+	if err != nil || len(omp) != 2 || omp[0].ID == items[0].ID {
+		t.Fatalf("grokbot IDs must differ from omp: omp=%+v err=%v", omp, err)
+	}
+}
+
 func TestRawObjectIdentityRejectsUnknownFiles(t *testing.T) {
-	if _, _, ok := rawObjectIdentity("mbp14/notes/file.txt"); ok {
-		t.Fatal("accepted unsupported key")
+	for _, key := range []string{"mbp14/notes/file.txt", "mbp14/notes/file.jsonl", "grok-box/grokbots/a.jsonl"} {
+		if _, _, ok := rawObjectIdentity(key); ok {
+			t.Fatalf("accepted unsupported key %q", key)
+		}
 	}
 	if host, harness, ok := rawObjectIdentity("mbp14/codex/a.jsonl"); !ok || host != "mbp14" || harness != "codex" {
 		t.Fatalf("host=%q harness=%q ok=%v", host, harness, ok)
@@ -175,6 +199,9 @@ func TestRawObjectIdentityRejectsUnknownFiles(t *testing.T) {
 		t.Fatalf("host=%q harness=%q ok=%v", host, harness, ok)
 	}
 	if host, harness, ok := rawObjectIdentity("home-satan/claude/-repo/c1.jsonl"); !ok || host != "home-satan" || harness != "claude" {
+		t.Fatalf("host=%q harness=%q ok=%v", host, harness, ok)
+	}
+	if host, harness, ok := rawObjectIdentity("grok-box/grokbot/pentagrok-1234abcd.jsonl"); !ok || host != "grok-box" || harness != "grokbot" {
 		t.Fatalf("host=%q harness=%q ok=%v", host, harness, ok)
 	}
 }

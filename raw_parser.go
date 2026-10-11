@@ -21,7 +21,7 @@ var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", 
 func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 	host, harness, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok|grokbot>/<path>.jsonl")
 	}
 	return parseSessionJSONL(body, host, harness, key, false)
 }
@@ -29,14 +29,14 @@ func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 func parseRawSessionForIndex(key string, body []byte) ([]MemoryItem, error) {
 	host, harness, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok|grokbot>/<path>.jsonl")
 	}
 	return parseSessionJSONL(body, host, harness, key, true)
 }
 
 func rawObjectIdentity(key string) (host, harness string, ok bool) {
 	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
-	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp" && parts[1] != "claude" && parts[1] != "grok") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
+	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp" && parts[1] != "claude" && parts[1] != "grok" && parts[1] != "grokbot") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
 		return "", "", false
 	}
 	return parts[0], parts[1], true
@@ -163,7 +163,8 @@ func parseSessionJSONL(body []byte, host, harness, source string, includeState b
 			}
 			continue
 		}
-		if harness == "pi" || harness == "omp" {
+		// grokbot files are Grok Bot chat exports written in the Pi session format.
+		if harness == "pi" || harness == "omp" || harness == "grokbot" {
 			entryID := valueOr(stringField(obj, "id"), fmt.Sprintf("line-%d", lineNo))
 			switch stringField(obj, "type") {
 			case "session":
