@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Grok Bot harness
+### Grok Bot harness (2026-10-12)
 
 - `tireless-upload --grokbot <dir>` (`TIRELESS_GROKBOT_SESSIONS`) mirrors Grok
   Bot chat exports to `<host>/grokbot/<file>.jsonl`. It is empty by default, so
