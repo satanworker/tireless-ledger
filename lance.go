@@ -626,10 +626,12 @@ type genericMigrationState struct {
 }
 
 // MigrateFrom copies the token-chunks-v4 messages and chunks tables at sourceURL into
-// the generic tables, keeping every vector. The v4 file_path (<host>/<harness>/
-// <session>[/<kind>]/<turn>) is exactly the new readable message id, so raw re-ingestion
-// after the cutover finds every message already present and embeds nothing. markMessages
-// seeds the dedup state for each copied batch of messages.
+// the generic tables, keeping every vector. The v4 file_path maps to the readable id
+// the raw parser emits (see v4MessageID), so raw re-ingestion after the cutover finds
+// every message already present and embeds nothing. v4 often stored one message twice,
+// as <session>/message/<turn> and <session>/<turn>; both map to one id and the
+// /message/ row (the newer derivation) wins. markMessages seeds the dedup state for
+// each copied batch of messages.
 func (s *cgoLanceStore) MigrateFrom(ctx context.Context, sourceURL string, batchSize int, checkpointPath string, markMessages func([]MemoryItem) error) error {
 	state := genericMigrationState{SourceVersions: map[string]uint64{}, Offsets: map[string]int64{}}
 	if b, err := os.ReadFile(checkpointPath); err == nil {
@@ -651,6 +653,8 @@ func (s *cgoLanceStore) MigrateFrom(ctx context.Context, sourceURL string, batch
 		return fmt.Errorf("connect migration source: %w", err)
 	}
 	defer src.Close()
+	// shadowed holds the plain v4 paths whose /message/ twin is copied instead.
+	shadowed := map[string]bool{}
 	for _, part := range []struct {
 		name  string
 		chunk bool
@@ -679,7 +683,25 @@ func (s *cgoLanceStore) MigrateFrom(ctx context.Context, sourceURL string, batch
 		if err != nil {
 			return fmt.Errorf("count source %s: %w", part.name, err)
 		}
-		slog.Info("migration table starting", "table", part.name, "source_version", state.SourceVersions[part.name], "source_rows", sourceRows, "offset", state.Offsets[part.name])
+		paths, err := table.Select(ctx, contracts.QueryConfig{Columns: []string{"file_path"}})
+		if err != nil {
+			return fmt.Errorf("scan source %s paths: %w", part.name, err)
+		}
+		if !part.chunk {
+			for _, row := range paths {
+				path, _ := row["file_path"].(string)
+				if parts := strings.Split(path, "/"); len(parts) == 5 && parts[3] == "message" {
+					shadowed[parts[0]+"/"+parts[1]+"/"+parts[2]+"/"+parts[4]] = true
+				}
+			}
+		}
+		expectedRows := sourceRows
+		for _, row := range paths {
+			if path, _ := row["file_path"].(string); shadowed[path] {
+				expectedRows--
+			}
+		}
+		slog.Info("migration table starting", "table", part.name, "source_version", state.SourceVersions[part.name], "source_rows", sourceRows, "expected_rows", expectedRows, "offset", state.Offsets[part.name])
 		for {
 			record, err := table.Query().Limit(batchSize).Offset(int(state.Offsets[part.name])).Execute(ctx)
 			if err != nil {
@@ -691,7 +713,8 @@ func (s *cgoLanceStore) MigrateFrom(ctx context.Context, sourceURL string, batch
 				}
 				break
 			}
-			items, err := v4Items(record, part.chunk)
+			sourceBatch := record.NumRows()
+			items, err := v4Items(record, part.chunk, shadowed)
 			record.Release()
 			if err != nil {
 				return fmt.Errorf("convert %s batch at %d: %w", part.name, state.Offsets[part.name], err)
@@ -704,7 +727,7 @@ func (s *cgoLanceStore) MigrateFrom(ctx context.Context, sourceURL string, batch
 					return err
 				}
 			}
-			state.Offsets[part.name] += int64(len(items))
+			state.Offsets[part.name] += sourceBatch
 			if err := saveMigrationState(checkpointPath, state); err != nil {
 				return err
 			}
@@ -714,19 +737,20 @@ func (s *cgoLanceStore) MigrateFrom(ctx context.Context, sourceURL string, batch
 		if err != nil {
 			return fmt.Errorf("count migrated %s: %w", part.name, err)
 		}
-		// Distinct v4 rows must stay distinct: fewer destination rows means two v4 rows
-		// mapped to one readable id.
-		if destRows < sourceRows {
-			return fmt.Errorf("migrated %s has %d rows, source has %d: readable ids collided", part.name, destRows, sourceRows)
+		// Every unshadowed v4 row must stay distinct: fewer destination rows means two
+		// of them mapped to one readable id.
+		if destRows < expectedRows {
+			return fmt.Errorf("migrated %s has %d rows, expected %d: readable ids collided", part.name, destRows, expectedRows)
 		}
-		slog.Info("migration table complete", "table", part.name, "source_rows", sourceRows, "destination_rows", destRows)
+		slog.Info("migration table complete", "table", part.name, "expected_rows", expectedRows, "destination_rows", destRows)
 	}
 	state.Complete = true
 	return saveMigrationState(checkpointPath, state)
 }
 
-// v4Items converts a token-chunks-v4 messages or chunks batch into generic rows.
-func v4Items(record arrow.Record, chunk bool) ([]MemoryItem, error) {
+// v4Items converts a token-chunks-v4 messages or chunks batch into generic rows,
+// dropping rows whose file_path is shadowed by a /message/ twin.
+func v4Items(record arrow.Record, chunk bool, shadowed map[string]bool) ([]MemoryItem, error) {
 	str := func(name string) (func(int) string, error) {
 		idx := record.Schema().FieldIndices(name)
 		if len(idx) == 0 {
@@ -793,8 +817,11 @@ func v4Items(record arrow.Record, chunk bool) ([]MemoryItem, error) {
 		}
 		vectorValues = values.Float32Values()
 	}
-	items := make([]MemoryItem, int(record.NumRows()))
-	for i := range items {
+	items := make([]MemoryItem, 0, int(record.NumRows()))
+	for i := 0; i < int(record.NumRows()); i++ {
+		if shadowed[cols["file_path"](i)] {
+			continue
+		}
 		messageID, kind := v4MessageID(cols["file_path"](i), cols["id"](i))
 		item := MemoryItem{
 			ID:   messageID,
@@ -812,22 +839,9 @@ func v4Items(record arrow.Record, chunk bool) ([]MemoryItem, error) {
 			start, end := vectors.ValueOffsets(i)
 			item.Vector = append([]float32(nil), vectorValues[start:end]...)
 		}
-		items[i] = item
+		items = append(items, item)
 	}
 	return items, nil
-}
-
-// v4MessageID maps a v4 file_path to the readable message id and its kind:
-// <host>/<harness>/<session>/<turn> is a message, <host>/<harness>/<session>/<kind>/<turn>
-// a title/todo/task. Rows without a path (direct HTTP ingest) keep their v4 id.
-func v4MessageID(filePath, v4ID string) (string, string) {
-	if filePath == "" {
-		return v4ID, "message"
-	}
-	if parts := strings.Split(filePath, "/"); len(parts) == 5 {
-		return filePath, parts[3]
-	}
-	return filePath, "message"
 }
 
 func saveMigrationState(path string, state genericMigrationState) error {

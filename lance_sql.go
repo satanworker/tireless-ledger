@@ -58,3 +58,21 @@ func lanceCombineSQL(parts ...string) string {
 	}
 	return strings.Join(nonempty, " AND ")
 }
+
+// v4MessageID maps a v4 file_path to the readable message id the raw parser emits
+// (rawRecord) and its kind: <host>/<harness>/<session>/<turn> and
+// <host>/<harness>/<session>/message/<turn> are the message <host>/<harness>/<session>/<turn>;
+// <host>/<harness>/<session>/<kind>/<turn> keeps its path as a title/todo/task id.
+// Rows without a path (direct HTTP ingest) keep their v4 id.
+func v4MessageID(filePath, v4ID string) (string, string) {
+	if filePath == "" {
+		return v4ID, "message"
+	}
+	if parts := strings.Split(filePath, "/"); len(parts) == 5 {
+		if parts[3] == "message" {
+			return parts[0] + "/" + parts[1] + "/" + parts[2] + "/" + parts[4], "message"
+		}
+		return filePath, parts[3]
+	}
+	return filePath, "message"
+}

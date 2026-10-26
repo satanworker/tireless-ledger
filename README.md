@@ -26,7 +26,7 @@ session directories; it only ingests objects that an uploader has copied to R2.
 
 This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI used by the omp `tireless_recall` tools and grok-box) and `packages.<system>.tireless-upload` for Linux and macOS. Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `pi-memoryd` itself links the patched Lance library, so it ships as the `release-linux` binary. When `go.mod`/`go.sum` change, update `vendorHash` in `flake.nix`.
 
-The live derived recall store defaults to `s3://<bucket>/session-recall-lance-generic-v1/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+The live derived recall store defaults to `s3://<bucket>/session-recall-lance-generic-v2/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
 
 ## Record schema
 
@@ -266,9 +266,9 @@ An object is recorded as indexed only after every derived row is persisted. On a
 
 ## Generic-schema migration
 
-`make migrate-generic` copies the `token-chunks-v4` `messages` and `chunks` tables (default prefix `session-recall-lance-token-chunks-v4`, override with `MIGRATE_FROM_PREFIX`) into the generic tables at `PI_MEMORYD_S3_PREFIX` without downloading raw files or re-embedding. The v4 `file_path` (`<host>/<harness>/<session>[/<kind>]/<turn>`) becomes the readable id, chunks keep their vectors as `<id>#<chunk_index>`, and every copied message is written to the dedup state, so the raw re-scan after the cutover embeds nothing. It pins both source table versions, copies 1,024-row batches with merge-insert, and saves `/data/generic_migration.json` after every batch; re-running resumes and is safe after interruption. It fails if two v4 rows map to one id.
+`make migrate-generic` copies the `token-chunks-v4` `messages` and `chunks` tables (default prefix `session-recall-lance-token-chunks-v4`, override with `MIGRATE_FROM_PREFIX`) into the generic tables at `PI_MEMORYD_S3_PREFIX` without downloading raw files or re-embedding. The v4 `file_path` maps to the id the raw parser emits: `<host>/<harness>/<session>/<turn>` for messages (the v4 form `<session>/message/<turn>` loses its `message` segment) and `<host>/<harness>/<session>/<kind>/<turn>` for titles, todos and tasks. Where v4 stored one turn in both message forms, the `/message/` row is copied and its plain twin skipped. Chunks keep their vectors as `<id>#<chunk_index>`, and every copied message is written to the dedup state, so the raw re-scan after the cutover embeds only messages that are new or whose derivation changed. It pins both source table versions, copies 1,024-row batches with merge-insert, and saves `/data/generic_migration.json` after every batch; re-running resumes and is safe after interruption. It fails if two non-twin v4 rows map to one id.
 
-Rollout: stop the daemon, run `make migrate-generic`, then `--create-vector-index` and start the new image (the Compose default prefix is `session-recall-lance-generic-v1`). The v4 prefix stays untouched; rollback is the previous image with `PI_MEMORYD_S3_PREFIX=session-recall-lance-token-chunks-v4`.
+Rollout: stop the daemon, run `make migrate-generic`, then `--create-vector-index` and start the new image (the Compose default prefix is `session-recall-lance-generic-v2`). The v4 prefix stays untouched; rollback is the previous image with `PI_MEMORYD_S3_PREFIX=session-recall-lance-token-chunks-v4`.
 
 The durable registry is `/data/raw_registry.json`. Inspect progress with:
 
@@ -306,7 +306,7 @@ The older target names remain as compatibility aliases:
 | Variable | Purpose |
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
-| `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-generic-v1` |
+| `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-generic-v2` |
 | `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions searched per vector query (of 512); default 64, production 128 |
 | `PI_MEMORYD_EXACT_VECTOR_SEARCH` | Intended to bypass IVF for an exact scan, but Lance ignores it while an index exists; code default `true`, production `false` |
 | `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable `--migrate-from` copy batch; default `1024` |

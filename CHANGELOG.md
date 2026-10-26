@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fix: v4 migration duplicated messages (2026-10-26)
+
+- `--migrate-from` kept v4 paths `<session>/message/<turn>` as ids, but the raw
+  parser emits `<session>/<turn>`, so the post-cutover re-scan re-embedded
+  those messages under a second id. They now map to `<session>/<turn>`; where v4
+  held both forms of one turn (59,604 pairs), the `/message/` row wins and the
+  plain twin is skipped. The collision check counts rows net of skipped twins.
+  Production moved to `session-recall-lance-generic-v2`; `generic-v1` is the
+  duplicated store.
+
 ### One source for the CLI and uploader (2026-10-26)
 
 - The `tireless` CLI moved here as `cmd/tireless` (was copied in
@@ -34,7 +44,7 @@
   tables with their vectors and seeds the dedup state, so the raw re-scan
   embeds nothing. Removed the legacy `turns` table mode, `--migrate-split`,
   `PI_MEMORYD_SPLIT_TABLES` and `PI_MEMORYD_DUAL_WRITE_SPLIT`. Compose default
-  prefix is now `session-recall-lance-generic-v1`.
+  prefix is now `session-recall-lance-generic-v2`.
 
 ### Grok Bot harness (2026-10-12)
 
