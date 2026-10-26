@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### One source for the CLI and uploader (2026-10-26)
+
+- The `tireless` CLI moved here as `cmd/tireless` (was copied in
+  `home-satan/packages/tireless` and `satanworker/pkgs/tireless`). `flake.nix`
+  exports `tireless` and `tireless-upload` for Linux and macOS; host repos use
+  the `tireless-ledger` flake input. Removed the legacy `mac/` Python client.
+
 ### Generic record schema and Telegram (2026-10-26)
 
 - One schema for every source, so personal and Valantis deployments run the

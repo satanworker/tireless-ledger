@@ -22,6 +22,10 @@ the central ingester:
 Uploaders never parse or index sessions. `pi-memoryd` does not discover local
 session directories; it only ingests objects that an uploader has copied to R2.
 
+## Nix packages
+
+This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI used by the omp `tireless_recall` tools and grok-box) and `packages.<system>.tireless-upload` for Linux and macOS. Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `pi-memoryd` itself links the patched Lance library, so it ships as the `release-linux` binary. When `go.mod`/`go.sum` change, update `vendorHash` in `flake.nix`.
+
 The live derived recall store defaults to `s3://<bucket>/session-recall-lance-generic-v1/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
 
 ## Record schema
