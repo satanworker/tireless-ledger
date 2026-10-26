@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Telegram exporter package (2026-10-26)
+
+- `flake.nix` exports `tireless-telegram`: `cmd/tireless-telegram` with
+  Python + Telethon, so hosts run the exporter from the flake input instead of
+  a host-side `telethon-python` wrapper. home-satan runs it on a timer.
+
 ### Fix: v4 migration duplicated messages (2026-10-26)
 
 - `--migrate-from` kept v4 paths `<session>/message/<turn>` as ids, but the raw

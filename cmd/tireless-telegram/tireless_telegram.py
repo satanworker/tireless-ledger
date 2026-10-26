@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export Telegram messages to <out>/<chat_id>/<yyyy-mm>.jsonl for tireless-upload --telegram.
 
-Run on hosts via: telethon-python cmd/tireless-telegram/tireless_telegram.py [flags]
+Run on hosts via the `tireless-telegram` flake package: tireless-telegram [flags]
 First run logs in interactively (phone + code); later runs reuse --session.
 """
 import argparse

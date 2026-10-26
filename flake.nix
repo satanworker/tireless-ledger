@@ -1,5 +1,5 @@
 {
-  description = "tireless-ledger: recall CLI and raw uploader (pi-memoryd itself ships as a release binary)";
+  description = "tireless-ledger: recall CLI, raw uploader and Telegram exporter (pi-memoryd itself ships as a release binary)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -23,6 +23,9 @@
       packages = forAllSystems (pkgs: {
         tireless = goPackage pkgs "tireless" "cmd/tireless";
         tireless-upload = goPackage pkgs "tireless-upload" "cmd/tireless-upload";
+        tireless-telegram = pkgs.writeShellScriptBin "tireless-telegram" ''
+          exec ${pkgs.python3.withPackages (ps: [ ps.telethon ])}/bin/python3 ${./cmd/tireless-telegram/tireless_telegram.py} "$@"
+        '';
       });
     };
 }

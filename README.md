@@ -24,7 +24,7 @@ session directories; it only ingests objects that an uploader has copied to R2.
 
 ## Nix packages
 
-This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI used by the omp `tireless_recall` tools and grok-box) and `packages.<system>.tireless-upload` for Linux and macOS. Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `pi-memoryd` itself links the patched Lance library, so it ships as the `release-linux` binary. When `go.mod`/`go.sum` change, update `vendorHash` in `flake.nix`.
+This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI used by the omp `tireless_recall` tools and grok-box), `packages.<system>.tireless-upload` and `packages.<system>.tireless-telegram` (the Telethon exporter) for Linux and macOS. Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `pi-memoryd` itself links the patched Lance library, so it ships as the `release-linux` binary. When `go.mod`/`go.sum` change, update `vendorHash` in `flake.nix`.
 
 The live derived recall store defaults to `s3://<bucket>/session-recall-lance-generic-v2/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
 
@@ -252,7 +252,7 @@ uploaded. Each append-only file is one bot in the Pi session format: a
 the slug is the project. Records keep the `grokbot` harness, so their IDs never
 collide with Pi or OMP rows.
 
-The `telegram` tree holds exports written by `cmd/tireless-telegram` (Telethon; run with the `telethon-python` wrapper). It is off unless `tireless-upload --telegram <dir>` / `TIRELESS_TELEGRAM_DIR` names the export directory, uploaded as `<host>/telegram/<chat_id>/<yyyy-mm>.jsonl`. Each line is one message version:
+The `telegram` tree holds exports written by `cmd/tireless-telegram` (Telethon; the `tireless-telegram` flake package). It is off unless `tireless-upload --telegram <dir>` / `TIRELESS_TELEGRAM_DIR` names the export directory, uploaded as `<host>/telegram/<chat_id>/<yyyy-mm>.jsonl`. Each line is one message version:
 
 ```json
 {"id":"812","chat_id":"-1001234567890","chat_type":"group","chat_title":"Valantis Core","topic_id":"","date":1791311374,"edit_date":0,"sender_id":"55501","sender_name":"Alice","reply_to":"809","fwd_from":"","media":"","text":"pushed v0.3 to staging"}
