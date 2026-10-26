@@ -21,7 +21,7 @@ GOARCH         ?= $(shell go env GOARCH)
 	docker-build up down doctor recall-local embed-local mac-test \
 	install-startup-service install-optimize-timer install-server-uploader install-upload-timer \
 	build-uploader install-uploader-bin install-mac-uploader install-raw-uploader \
-	fragment-counts migrate-split buildx-builder lance-lib release-linux
+	fragment-counts migrate-generic buildx-builder lance-lib release-linux
 
 all: build
 
@@ -138,10 +138,12 @@ down:
 fragment-counts:
 	docker compose run --rm --no-deps --no-TTY pi-memoryd --fragment-counts
 
-# Resumable and idempotent: progress is checkpointed in the daemon data volume.
-# Production should be dual-writing before this copy begins.
-migrate-split:
-	docker compose run --rm --no-deps --no-TTY pi-memoryd --migrate-split
+# Copies the token-chunks-v4 tables (vectors kept) into the generic tables at
+# PI_MEMORYD_S3_PREFIX and seeds the dedup state so raw re-ingestion embeds nothing.
+# Resumable: progress is checkpointed in the daemon data volume.
+migrate-generic:
+	set -a && . ./.env && docker compose run --rm --no-deps --no-TTY pi-memoryd \
+		--migrate-from "s3://$${PI_MEMORYD_S3_BUCKET}/$${MIGRATE_FROM_PREFIX:-session-recall-lance-token-chunks-v4}"
 
 install-optimize-timer:
 	./scripts/install-optimize-timer.sh

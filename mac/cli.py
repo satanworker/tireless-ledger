@@ -8,10 +8,11 @@ import os
 import socket
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from parse import walk_roots
+from parse import sha256_hex, walk_roots
 
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 DIMS = 384
@@ -32,16 +33,16 @@ def _post(url: str, payload: dict) -> dict:
 
 
 def _ingest_item(turn: dict, vector: list[float]) -> dict:
-    meta = {k: v for k, v in turn["metadata"].items() if k != "source"}
     return {
         "id": turn["id"],
         "vector": vector,
-        "forward_content": turn["forward_content"],
-        "metadata": meta,
+        "text": turn["text"],
+        "metadata": turn["metadata"],
     }
 
 
-def _load_known_files(path: Path | None) -> dict[str, str]:
+def _load_known(path: Path | None) -> dict[str, str]:
+    """id -> content_hash from a copied server dedup state."""
     if path is None:
         return {}
     with path.open() as f:
@@ -59,7 +60,7 @@ def cmd_parse(args: argparse.Namespace) -> None:
         if args.limit and n > args.limit:
             break
         if args.dump:
-            print(json.dumps({"id": turn["id"], "meta": turn["metadata"], "text": turn["forward_content"][:200]}))
+            print(json.dumps({"id": turn["id"], "meta": turn["metadata"], "text": turn["text"][:200]}))
     print(f"turns={n if not args.limit else min(n, args.limit)}", file=sys.stderr)
 
 
@@ -78,7 +79,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     accepted = skipped = n = 0
     url = args.server.rstrip("/") + "/v1/memory/ingest"
     buf: list[dict] = []
-    known_files = _load_known_files(args.known_state)
+    known = _load_known(args.known_state)
     seen_ids: set[str] = set()
 
     def flush() -> None:
@@ -91,7 +92,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         # BGE-small has a 512-token input window. Keep the full text in Lance,
         # but bound the text sent to llama.cpp so a long Codex turn cannot
         # reject the entire ingest batch.
-        texts = [t["forward_content"][:EMBED_MAX_CHARS] for t in buf]
+        texts = [t["text"][:EMBED_MAX_CHARS] for t in buf]
         vecs = _embed_texts(args.embed_url, texts)
         recs = [_ingest_item(t, vecs[j]) for j, t in enumerate(buf)]
         resp = _post(url, {"records": recs})
@@ -109,8 +110,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
             skipped += 1
             continue
         seen_ids.add(turn["id"])
-        meta = turn["metadata"]
-        if known_files.get(meta["file_path"]) == meta["file_hash"]:
+        if known.get(turn["id"]) == sha256_hex(turn["text"]):
             skipped += 1
             continue
         buf.append(turn)
@@ -124,25 +124,24 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 
 
 def cmd_query(args: argparse.Namespace) -> None:
-    body: dict = {"limit": args.limit, "scope": "session_memory"}
-    if args.session:
-        body["session_id"] = args.session
-    if args.project:
-        body["project_name"] = args.project
+    body: dict = {"limit": args.limit}
+    for key in ("container_id", "project", "source", "kind"):
+        if getattr(args, key):
+            body[key] = getattr(args, key)
     if args.text:
         body["query_text"] = args.text
     if args.embed or not args.text:
-        q = QUERY_PREFIX + (args.text or args.session or "")
+        q = QUERY_PREFIX + (args.text or args.container_id or "")
         body["query_vector"] = _embed_texts(args.embed_url, [q])[0]
     resp = _post(args.server.rstrip("/") + "/v1/memory/query", body)
     print(json.dumps(resp, indent=2))
 
 
-def cmd_session(args: argparse.Namespace) -> None:
-    q = f"session_id={args.session_id}"
-    if args.limit:
-        q += f"&limit={args.limit}"
-    url = args.server.rstrip("/") + "/v1/memory/session?" + q
+def cmd_container(args: argparse.Namespace) -> None:
+    params = {"container_id": args.container_id, "limit": args.limit}
+    if args.source:
+        params["source"] = args.source
+    url = args.server.rstrip("/") + "/v1/memory/container?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -184,23 +183,26 @@ def main() -> None:
         "--known-state",
         type=Path,
         default=None,
-        help="skip file_path/file_hash pairs already present in a copied server dedup state",
+        help="skip id/content_hash pairs already present in a copied server dedup state",
     )
     si.add_argument("--dry-run", action="store_true")
     si.set_defaults(func=cmd_ingest)
 
     sq = sub.add_parser("query", help="BM25 and/or ANN query")
     sq.add_argument("text", nargs="?", default="")
-    sq.add_argument("--session", default="")
+    sq.add_argument("--container", dest="container_id", default="")
     sq.add_argument("--project", default="")
+    sq.add_argument("--source", default="")
+    sq.add_argument("--kind", default="")
     sq.add_argument("--limit", type=int, default=8)
     sq.add_argument("--embed", action="store_true", help="also send query_vector (hybrid)")
     sq.set_defaults(func=cmd_query)
 
-    ss = sub.add_parser("session", help="list turns in one session")
-    ss.add_argument("session_id")
-    ss.add_argument("--limit", type=int, default=50)
-    ss.set_defaults(func=cmd_session)
+    sc = sub.add_parser("container", help="list records in one container (session or chat)")
+    sc.add_argument("container_id")
+    sc.add_argument("--source", default="")
+    sc.add_argument("--limit", type=int, default=50)
+    sc.set_defaults(func=cmd_container)
 
     args = p.parse_args()
     _paths(args)

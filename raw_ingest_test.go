@@ -24,6 +24,8 @@ func (f *fakeRawStore) Get(_ context.Context, key string, _ int64) ([]byte, erro
 	return f.bodies[key], nil
 }
 
+func memRows(s *server) int { return len(s.mem.messages) + len(s.mem.chunks) }
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
@@ -83,15 +85,15 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	if store.gets != 1 {
 		t.Fatalf("gets=%d", store.gets)
 	}
-	if len(s.mem.items) != 2 {
-		t.Fatalf("indexed=%d", len(s.mem.items))
+	if memRows(s) != 2 {
+		t.Fatalf("indexed=%d", memRows(s))
 	}
 	r.scan(context.Background())
 	if store.gets != 1 {
 		t.Fatalf("completed object downloaded again: gets=%d", store.gets)
 	}
-	if len(s.mem.items) != 2 {
-		t.Fatalf("duplicate rows=%d", len(s.mem.items))
+	if memRows(s) != 2 {
+		t.Fatalf("duplicate rows=%d", memRows(s))
 	}
 
 	// A parser version change invalidates only derived state and safely replays.
@@ -102,8 +104,8 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	if store.gets != 2 {
 		t.Fatalf("parser upgrade was not replayed: gets=%d", store.gets)
 	}
-	if len(s.mem.items) != 2 {
-		t.Fatalf("replay duplicated rows=%d", len(s.mem.items))
+	if memRows(s) != 2 {
+		t.Fatalf("replay duplicated rows=%d", memRows(s))
 	}
 }
 
@@ -129,18 +131,18 @@ func TestRawIngestScanIndexesOmpObject(t *testing.T) {
 		t.Fatalf("registry=%+v", registry.Objects[obj.Key])
 	}
 	var found bool
-	for _, item := range s.mem.items {
-		if item.Metadata.Harness == "omp" && item.Metadata.SessionID == "omp-s1" && item.Metadata.ProjectName == "omp-project" {
+	for _, item := range s.mem.messages {
+		if item.Metadata.Source == "omp" && item.Metadata.ContainerID == "omp-s1" && item.Metadata.Project == "omp-project" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("missing OMP item in indexed metadata: %+v", s.mem.items)
+		t.Fatalf("missing OMP item in indexed metadata: %+v", s.mem.messages)
 	}
 }
 
-func TestRawSessionWalkUsesUntouchedObject(t *testing.T) {
+func TestRawContainerWalkUsesUntouchedObject(t *testing.T) {
 	body := []byte("{\"type\":\"session\",\"id\":\"omp-walk\",\"cwd\":\"/repo/raw-walk\"}\n" +
 		"{\"type\":\"message\",\"id\":\"u1\",\"timestamp\":\"2026-09-01T18:20:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"First raw message stays exact.\"}]}}\n" +
 		"{\"type\":\"message\",\"id\":\"a1\",\"timestamp\":\"2026-09-01T18:20:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Second raw message stays exact.\"}]}}\n")
@@ -158,21 +160,21 @@ func TestRawSessionWalkUsesUntouchedObject(t *testing.T) {
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"index":0,"embedding":[0.1,0.2]},{"index":1,"embedding":[0.2,0.1]}]}`)), Header: make(http.Header)}, nil
 	})}}
 	r.scan(context.Background())
-	if got := registry.Objects[obj.Key].SessionIDs; len(got) != 1 || got[0] != "omp-walk" {
-		t.Fatalf("session ids=%v", got)
+	if got := registry.Objects[obj.Key].ContainerIDs; len(got) != 1 || got[0] != "omp-walk" {
+		t.Fatalf("container ids=%v", got)
 	}
-	s.mem.items = map[string]MemoryItem{}
-	results, ok, err := r.sessionWalk(context.Background(), "omp-walk", "mac", "omp", 0, "", 10)
+	s.mem = newMemStore(2)
+	results, ok, err := r.containerWalk(context.Background(), "omp-walk", "mac", "omp", 0, "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok || len(results) != 2 {
 		t.Fatalf("ok=%v results=%+v", ok, results)
 	}
-	if results[0].ForwardContent != "First raw message stays exact." || results[1].ForwardContent != "Second raw message stays exact." {
+	if results[0].Text != "First raw message stays exact." || results[1].Text != "Second raw message stays exact." {
 		t.Fatalf("results=%+v", results)
 	}
-	page, ok, err := r.sessionWalk(context.Background(), "omp-walk", "mac", "omp", metaTS(results[0]), results[0].ID, 10)
+	page, ok, err := r.containerWalk(context.Background(), "omp-walk", "mac", "omp", metaTS(results[0]), results[0].ID, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +183,7 @@ func TestRawSessionWalkUsesUntouchedObject(t *testing.T) {
 	}
 }
 
-func TestRawSessionImportantStateWalkUsesUntouchedObject(t *testing.T) {
+func TestRawContainerStateWalkUsesUntouchedObject(t *testing.T) {
 	body := []byte("{\"type\":\"session\",\"id\":\"omp-state\",\"cwd\":\"/repo/raw-state\",\"title\":\"Stateful OMP session\"}\n" +
 		"{\"type\":\"message\",\"id\":\"todo-1\",\"timestamp\":\"2026-09-01T18:20:00Z\",\"message\":{\"role\":\"toolResult\",\"toolName\":\"todo\",\"details\":{\"phases\":[{\"phase\":\"Remote todo retrieval\",\"items\":[{\"content\":\"Expose todo session entries\",\"status\":\"in_progress\"}]}]}}}\n" +
 		"{\"type\":\"message\",\"id\":\"task-1\",\"timestamp\":\"2026-09-01T18:20:01Z\",\"message\":{\"role\":\"toolResult\",\"toolName\":\"task\",\"content\":[{\"type\":\"text\",\"text\":\"Subagent found task output worth searching.\"}]}}\n")
@@ -194,18 +196,18 @@ func TestRawSessionImportantStateWalkUsesUntouchedObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &rawIngestor{server: s, store: store, registry: registry}
-	results, ok, err := r.sessionImportantStateWalk(context.Background(), "omp-state", "mac", "omp", 0, "", 10, map[string]bool{"todo": true})
+	results, ok, err := r.containerStateWalk(context.Background(), "omp-state", "mac", "omp", 0, "", 10, map[string]bool{"todo": true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok || len(results) != 1 {
 		t.Fatalf("ok=%v results=%+v", ok, results)
 	}
-	if got := results[0].Metadata["record_kind"]; got != "todo" {
+	if got := results[0].Metadata["kind"]; got != "todo" {
 		t.Fatalf("kind=%v", got)
 	}
-	if !strings.Contains(results[0].ForwardContent, "Expose todo session entries") {
-		t.Fatalf("todo=%q", results[0].ForwardContent)
+	if !strings.Contains(results[0].Text, "Expose todo session entries") {
+		t.Fatalf("todo=%q", results[0].Text)
 	}
 }
 
@@ -237,7 +239,7 @@ func TestTokenChunksCoverEntireMessageWithOverlap(t *testing.T) {
 	}
 }
 
-func TestLongMessageTailIsSearchableAndSessionKeepsOriginal(t *testing.T) {
+func TestLongMessageTailIsSearchableAndContainerKeepsOriginal(t *testing.T) {
 	words := make([]string, 900)
 	for i := range words {
 		words[i] = fmt.Sprintf("detail%04d", i)
@@ -253,22 +255,22 @@ func TestLongMessageTailIsSearchableAndSessionKeepsOriginal(t *testing.T) {
 		}
 		return testEmbeddingResponse(req, 2)
 	})}}
-	message := rawTurn("mbp14", "pi", "session-long", "turn-long", "assistant", text, 123, "project")
-	if err := r.indexMessages(context.Background(), []MemoryItem{message}); err != nil {
+	message := rawRecord("mbp14", "pi", "session-long", "turn-long", "assistant", text, 123, "project", "message")
+	groups := chunkGroups([]MemoryItem{message}, func(MemoryItem) bool { return true })
+	if _, err := r.indexGroups(context.Background(), groups); err != nil {
 		t.Fatal(err)
 	}
 	hits := s.mem.search(vectorSearchRequest{
-		BM25:   &bm25Query{Field: "forward_content", Query: "TAIL_SEMANTIC_FACT"},
-		K:      10,
-		Filter: &vectorFilter{Eq: &comparisonFilter{Field: "record_kind", Value: "chunk"}},
+		BM25: &bm25Query{Field: "text", Query: "TAIL_SEMANTIC_FACT"},
+		K:    10,
 	})
 	hits = collapseChunkHits(hits, 5)
 	if len(hits) != 1 || hits[0].ID != message.ID {
 		t.Fatalf("tail hits=%+v", hits)
 	}
-	walk := s.mem.bySession("session-long", "mbp14", "pi", 0, "", 10)
-	if len(walk) != 1 || walk[0].ForwardContent != text {
-		t.Fatalf("session reconstruction changed: rows=%d", len(walk))
+	walk := s.mem.byContainer("session-long", "mbp14", "pi", map[string]bool{"message": true}, 0, "", 10)
+	if len(walk) != 1 || walk[0].Text != text {
+		t.Fatalf("container reconstruction changed: rows=%d", len(walk))
 	}
 }
 
@@ -346,7 +348,7 @@ func TestRawIngestRetriesFailedEmbedding(t *testing.T) {
 	entry.UpdatedAt = entry.UpdatedAt.Add(-time.Minute)
 	registry.Objects[obj.Key] = entry
 	r.scan(context.Background())
-	if !registry.Done(obj) || len(s.mem.items) != 2 || embedCalls != 2 {
-		t.Fatalf("entry=%+v rows=%d calls=%d", registry.Objects[obj.Key], len(s.mem.items), embedCalls)
+	if !registry.Done(obj) || memRows(s) != 2 || embedCalls != 2 {
+		t.Fatalf("entry=%+v rows=%d calls=%d", registry.Objects[obj.Key], memRows(s), embedCalls)
 	}
 }

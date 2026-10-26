@@ -7,11 +7,11 @@ func TestLanceQuoteAndFilterSQL(t *testing.T) {
 		t.Fatalf("quote=%q want=%q", got, want)
 	}
 	f := &vectorFilter{And: []vectorFilter{
-		{Eq: &comparisonFilter{Field: "session_id", Value: "s'1"}},
+		{Eq: &comparisonFilter{Field: "container_id", Value: "s'1"}},
 		{Eq: &comparisonFilter{Field: "host", Value: "mac"}},
-		{Eq: &comparisonFilter{Field: "record_kind", Value: "chunk"}},
+		{Eq: &comparisonFilter{Field: "kind", Value: "todo"}},
 	}}
-	if got, want := lanceFilterSQL(f), "(session_id = 's''1' AND host = 'mac' AND record_kind = 'chunk')"; got != want {
+	if got, want := lanceFilterSQL(f), "(container_id = 's''1' AND host = 'mac' AND kind = 'todo')"; got != want {
 		t.Fatalf("filter=%q want=%q", got, want)
 	}
 	if got := lanceFilterSQL(&vectorFilter{Eq: &comparisonFilter{Field: "timestamp", Value: 1}}); got != "" {

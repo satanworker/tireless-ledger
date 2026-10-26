@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -113,7 +112,7 @@ type rawRegistryEntry struct {
 	Attempts      int       `json:"attempts,omitempty"`
 	Error         string    `json:"error,omitempty"`
 	UpdatedAt     time.Time `json:"updated_at"`
-	SessionIDs    []string  `json:"session_ids,omitempty"`
+	ContainerIDs  []string  `json:"container_ids,omitempty"`
 }
 
 type rawRegistry struct {
@@ -188,7 +187,7 @@ func (r *rawRegistry) set(obj rawObject, status string, records int, setErr erro
 	}
 	entry.ETag, entry.Size, entry.Status, entry.ParserVersion = obj.ETag, obj.Size, status, rawParserVersion
 	if len(sessionIDs) > 0 {
-		entry.SessionIDs = uniqueStrings(sessionIDs)
+		entry.ContainerIDs = uniqueStrings(sessionIDs)
 	}
 	entry.Records, entry.UpdatedAt = records, time.Now().UTC()
 	if status == "processing" {
@@ -251,7 +250,7 @@ func (r *rawRegistry) RemoveHost(host string) int {
 	return removed
 }
 
-func (r *rawRegistry) keysForSession(sessionID, host, harness string) []string {
+func (r *rawRegistry) keysForContainer(containerID, host, source string) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	keys := make([]string, 0)
@@ -259,18 +258,18 @@ func (r *rawRegistry) keysForSession(sessionID, host, harness string) []string {
 		if entry.Status != "indexed" {
 			continue
 		}
-		keyHost, keyHarness, ok := rawObjectIdentity(key)
+		keyHost, keySource, ok := rawObjectIdentity(key)
 		if !ok {
 			continue
 		}
 		if host != "" && keyHost != host {
 			continue
 		}
-		if harness != "" && keyHarness != harness {
+		if source != "" && keySource != source {
 			continue
 		}
-		for _, id := range entry.SessionIDs {
-			if id == sessionID {
+		for _, id := range entry.ContainerIDs {
+			if id == containerID {
 				keys = append(keys, key)
 				break
 			}
@@ -280,11 +279,11 @@ func (r *rawRegistry) keysForSession(sessionID, host, harness string) []string {
 	return keys
 }
 
-func sessionIDs(items []MemoryItem) []string {
+func containerIDs(items []MemoryItem) []string {
 	ids := make([]string, 0, 1)
 	for _, item := range items {
-		if item.Metadata.SessionID != "" {
-			ids = append(ids, item.Metadata.SessionID)
+		if item.Metadata.ContainerID != "" {
+			ids = append(ids, item.Metadata.ContainerID)
 		}
 	}
 	return uniqueStrings(ids)
@@ -307,8 +306,8 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
-func (r *rawIngestor) sessionKeys(ctx context.Context, sessionID, host, harness string) ([]string, error) {
-	keys := r.registry.keysForSession(sessionID, host, harness)
+func (r *rawIngestor) containerKeys(ctx context.Context, containerID, host, source string) ([]string, error) {
+	keys := r.registry.keysForContainer(containerID, host, source)
 	if len(keys) > 0 {
 		return keys, nil
 	}
@@ -316,18 +315,20 @@ func (r *rawIngestor) sessionKeys(ctx context.Context, sessionID, host, harness 
 	if err != nil {
 		return nil, err
 	}
+	// Keys carry the session id or, for Telegram, the chat id of a <chat>:<topic> container.
+	needle, _, _ := strings.Cut(containerID, ":")
 	for _, obj := range objects {
-		keyHost, keyHarness, ok := rawObjectIdentity(obj.Key)
+		keyHost, keySource, ok := rawObjectIdentity(obj.Key)
 		if !ok {
 			continue
 		}
 		if host != "" && keyHost != host {
 			continue
 		}
-		if harness != "" && keyHarness != harness {
+		if source != "" && keySource != source {
 			continue
 		}
-		if strings.Contains(obj.Key, sessionID) {
+		if strings.Contains(obj.Key, needle) {
 			keys = append(keys, obj.Key)
 		}
 	}
@@ -335,16 +336,16 @@ func (r *rawIngestor) sessionKeys(ctx context.Context, sessionID, host, harness 
 	return keys, nil
 }
 
-func (r *rawIngestor) sessionWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int) ([]queryResult, bool, error) {
-	return r.sessionRecordWalk(ctx, sessionID, host, harness, afterTS, afterID, limit, map[string]bool{"message": true})
+func (r *rawIngestor) containerWalk(ctx context.Context, containerID, host, source string, afterTS int64, afterID string, limit int) ([]queryResult, bool, error) {
+	return r.containerRecordWalk(ctx, containerID, host, source, afterTS, afterID, limit, map[string]bool{"message": true})
 }
 
-func (r *rawIngestor) sessionImportantStateWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int, kinds map[string]bool) ([]queryResult, bool, error) {
-	return r.sessionRecordWalk(ctx, sessionID, host, harness, afterTS, afterID, limit, kinds)
+func (r *rawIngestor) containerStateWalk(ctx context.Context, containerID, host, source string, afterTS int64, afterID string, limit int, kinds map[string]bool) ([]queryResult, bool, error) {
+	return r.containerRecordWalk(ctx, containerID, host, source, afterTS, afterID, limit, kinds)
 }
 
-func (r *rawIngestor) sessionRecordWalk(ctx context.Context, sessionID, host, harness string, afterTS int64, afterID string, limit int, kinds map[string]bool) ([]queryResult, bool, error) {
-	keys, err := r.sessionKeys(ctx, sessionID, host, harness)
+func (r *rawIngestor) containerRecordWalk(ctx context.Context, containerID, host, source string, afterTS int64, afterID string, limit int, kinds map[string]bool) ([]queryResult, bool, error) {
+	keys, err := r.containerKeys(ctx, containerID, host, source)
 	if err != nil {
 		return nil, false, err
 	}
@@ -371,22 +372,22 @@ func (r *rawIngestor) sessionRecordWalk(ctx context.Context, sessionID, host, ha
 			return nil, true, err
 		}
 		for _, item := range items {
-			if item.Metadata.SessionID != sessionID {
+			if item.Metadata.ContainerID != containerID {
 				continue
 			}
 			if host != "" && item.Metadata.Host != host {
 				continue
 			}
-			if harness != "" && item.Metadata.Harness != harness {
+			if source != "" && item.Metadata.Source != source {
 				continue
 			}
-			if !kinds[item.Metadata.RecordKind] {
+			if !kinds[item.Metadata.Kind] {
 				continue
 			}
 			if !afterCursor(item.Metadata.Timestamp, item.ID, afterTS, afterID) {
 				continue
 			}
-			results = append(results, rawQueryResult(item))
+			results = append(results, queryResult{ID: item.ID, Score: float64(item.Metadata.Timestamp), Text: item.Text, Metadata: metadataMap(item.Metadata)})
 		}
 	}
 	if len(results) == 0 {
@@ -403,29 +404,6 @@ func (r *rawIngestor) sessionRecordWalk(ctx context.Context, sessionID, host, ha
 		results = results[:limit]
 	}
 	return results, true, nil
-}
-
-func rawQueryResult(item MemoryItem) queryResult {
-	return queryResult{
-		ID:             item.ID,
-		Score:          float64(item.Metadata.Timestamp),
-		ForwardContent: item.ForwardContent,
-		Metadata: map[string]interface{}{
-			"scope":        string(item.Metadata.Scope),
-			"project_name": item.Metadata.ProjectName,
-			"file_path":    item.Metadata.FilePath,
-			"file_hash":    item.Metadata.FileHash,
-			"timestamp":    item.Metadata.Timestamp,
-			"session_id":   item.Metadata.SessionID,
-			"host":         item.Metadata.Host,
-			"harness":      item.Metadata.Harness,
-			"role":         item.Metadata.Role,
-			"record_kind":  item.Metadata.RecordKind,
-			"parent_id":    item.Metadata.ParentID,
-			"chunk_index":  item.Metadata.ChunkIndex,
-			"chunk_count":  item.Metadata.ChunkCount,
-		},
-	}
 }
 
 type rawStatusResponse struct {
@@ -518,70 +496,66 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 	if err != nil {
 		return fmt.Errorf("extract: %w", err)
 	}
-	pending := items[:0]
-	for _, item := range items {
-		if !r.server.dedup.Seen(rawDerivedPath(item.Metadata.FilePath), item.Metadata.FileHash) {
-			pending = append(pending, item)
-		}
+	seen := func(item MemoryItem) bool {
+		return r.server.dedup.Seen(rawDerivedKey(item.ID), item.Metadata.ContentHash)
 	}
-	messageBatch := r.server.cfg.EmbedBatchSize
-	if messageBatch <= 0 {
-		messageBatch = 32
+	groups := chunkGroups(items, func(item MemoryItem) bool { return !seen(item) })
+	groupBatch := r.server.cfg.EmbedBatchSize
+	if groupBatch <= 0 {
+		groupBatch = 32
 	}
-	for start := 0; start < len(pending); start += messageBatch {
-		end := start + messageBatch
-		if end > len(pending) {
-			end = len(pending)
+	newRecords := 0
+	for start := 0; start < len(groups); start += groupBatch {
+		end := start + groupBatch
+		if end > len(groups) {
+			end = len(groups)
 		}
-		if err := r.indexMessages(ctx, pending[start:end]); err != nil {
+		written, err := r.indexGroups(ctx, groups[start:end])
+		if err != nil {
 			return err
 		}
+		newRecords += written
 	}
-	if err := r.registry.set(obj, "indexed", len(items), nil, sessionIDs(items)); err != nil {
+	if err := r.registry.set(obj, "indexed", len(items), nil, containerIDs(items)); err != nil {
 		return fmt.Errorf("save indexed state: %w", err)
 	}
-	slog.Info("raw object indexed", "key", obj.Key, "records", len(items), "new_records", len(pending))
+	slog.Info("raw object indexed", "key", obj.Key, "records", len(items), "new_records", newRecords, "chunk_groups", len(groups))
 	return nil
 }
 
-func rawDerivedPath(filePath string) string {
-	return filePath + "|" + rawParserVersion
+// rawDerivedKey is the dedup key of a raw-derived message: a parser version bump
+// re-derives every message once.
+func rawDerivedKey(id string) string {
+	return id + "|" + rawParserVersion
 }
 
-func (r *rawIngestor) indexMessages(ctx context.Context, messages []MemoryItem) error {
-	type prepared struct {
-		message MemoryItem
-		chunks  []MemoryItem
-	}
-	preparedMessages := make([]prepared, 0, len(messages))
-	flat := make([]MemoryItem, 0, len(messages))
-	for _, message := range messages {
-		texts, err := r.splitTokenChunks(ctx, message.ForwardContent)
+// indexGroups token-splits and embeds each group, then writes the group's pending
+// messages and its chunks. It returns the number of messages written.
+func (r *rawIngestor) indexGroups(ctx context.Context, groups []chunkGroup) (int, error) {
+	var messages, chunks []MemoryItem
+	for _, group := range groups {
+		texts, err := r.splitTokenChunks(ctx, group.text)
 		if err != nil {
-			return fmt.Errorf("tokenize message %s: %w", message.ID, err)
+			return 0, fmt.Errorf("tokenize %s: %w", group.id, err)
 		}
-		chunks := make([]MemoryItem, len(texts))
 		for i, text := range texts {
-			chunk := message
-			chunk.ID = hashText(message.ID + "|token-chunk-v1|" + strconv.Itoa(i))
-			chunk.ForwardContent = text
-			chunk.Metadata.RecordKind = "chunk"
-			chunk.Metadata.ParentID = message.ID
+			chunk := MemoryItem{ID: chunkID(group.id, i), Text: text, Metadata: group.meta}
+			chunk.Metadata.MessageID = group.id
 			chunk.Metadata.ChunkIndex = int64(i)
 			chunk.Metadata.ChunkCount = int64(len(texts))
-			chunks[i] = chunk
-			flat = append(flat, chunk)
+			chunks = append(chunks, chunk)
 		}
-		message.Metadata.RecordKind = "message"
-		message.Metadata.ParentID = message.ID
-		message.Metadata.ChunkCount = int64(len(chunks))
-		preparedMessages = append(preparedMessages, prepared{message: message, chunks: chunks})
+		for _, message := range group.pending {
+			if message.ID == group.id {
+				message.Metadata.ChunkCount = int64(len(texts))
+			}
+			messages = append(messages, message)
+		}
 	}
-	texts := make([]string, len(flat))
-	for i := range flat {
-		texts[i] = flat[i].ForwardContent
+	texts := make([]string, len(chunks))
+	for i := range chunks {
+		texts[i] = chunks[i].Text
 	}
-	vectors := make([][]float32, 0, len(texts))
 	batchSize := r.server.cfg.EmbedBatchSize
 	if batchSize <= 0 {
 		batchSize = 32
@@ -593,26 +567,16 @@ func (r *rawIngestor) indexMessages(ctx context.Context, messages []MemoryItem) 
 		}
 		batch, err := r.embedTexts(ctx, texts[start:end])
 		if err != nil {
-			return err
+			return 0, err
 		}
-		vectors = append(vectors, batch...)
+		for i, vector := range batch {
+			chunks[start+i].Vector = vector
+		}
 	}
-	for i := range flat {
-		flat[i].Vector = vectors[i]
+	if err := r.server.flush(messages, chunks, func(m MemoryItem) string { return rawDerivedKey(m.ID) }); err != nil {
+		return 0, fmt.Errorf("index: %w", err)
 	}
-	records := make([]MemoryItem, 0, len(messages)+len(flat))
-	flatIndex := 0
-	for i := range preparedMessages {
-		count := len(preparedMessages[i].chunks)
-		preparedMessages[i].message.Vector = flat[flatIndex].Vector
-		records = append(records, preparedMessages[i].message)
-		records = append(records, flat[flatIndex:flatIndex+count]...)
-		flatIndex += count
-	}
-	if err := r.server.flushDerived(messages, records); err != nil {
-		return fmt.Errorf("index: %w", err)
-	}
-	return nil
+	return len(messages), nil
 }
 
 func (r *rawIngestor) embedTexts(ctx context.Context, texts []string) ([][]float32, error) {

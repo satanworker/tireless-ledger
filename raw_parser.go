@@ -14,29 +14,36 @@ import (
 	"time"
 )
 
-const rawParserVersion = "session-jsonl-v3-important-state"
+// Bumping this re-parses every raw object; messages whose id and text are unchanged
+// are still skipped by the dedup state, so only changed derivations are re-embedded.
+const rawParserVersion = "generic-v1"
 
 var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", "<INSTRUCTIONS>"}
 
+var rawSources = map[string]bool{"pi": true, "codex": true, "omp": true, "claude": true, "grok": true, "grokbot": true, "telegram": true}
+
 func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
-	host, harness, ok := rawObjectIdentity(key)
-	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok|grokbot>/<path>.jsonl")
-	}
-	return parseSessionJSONL(body, host, harness, key, false)
+	return parseRawObject(key, body, false)
 }
 
 func parseRawSessionForIndex(key string, body []byte) ([]MemoryItem, error) {
-	host, harness, ok := rawObjectIdentity(key)
-	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok|grokbot>/<path>.jsonl")
-	}
-	return parseSessionJSONL(body, host, harness, key, true)
+	return parseRawObject(key, body, true)
 }
 
-func rawObjectIdentity(key string) (host, harness string, ok bool) {
+func parseRawObject(key string, body []byte, includeState bool) ([]MemoryItem, error) {
+	host, source, ok := rawObjectIdentity(key)
+	if !ok {
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok|grokbot|telegram>/<path>.jsonl")
+	}
+	if source == "telegram" {
+		return parseTelegramJSONL(body, host)
+	}
+	return parseSessionJSONL(body, host, source, key, includeState)
+}
+
+func rawObjectIdentity(key string) (host, source string, ok bool) {
 	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
-	if len(parts) < 3 || parts[0] == "" || (parts[1] != "pi" && parts[1] != "codex" && parts[1] != "omp" && parts[1] != "claude" && parts[1] != "grok" && parts[1] != "grokbot") || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
+	if len(parts) < 3 || parts[0] == "" || !rawSources[parts[1]] || !strings.HasSuffix(strings.ToLower(parts[len(parts)-1]), ".jsonl") {
 		return "", "", false
 	}
 	return parts[0], parts[1], true
@@ -267,27 +274,23 @@ func parseSessionJSONL(body []byte, host, harness, source string, includeState b
 	return items, nil
 }
 
-func rawTurn(host, harness, sessionID, turnID, role, text string, timestamp int64, project string) MemoryItem {
-	return rawRecord(host, harness, sessionID, turnID, role, text, timestamp, project, "message")
-}
-
-func rawRecord(host, harness, sessionID, turnID, role, text string, timestamp int64, project, kind string) MemoryItem {
+// rawRecord builds an agent-session message. Its id is readable and owned by the
+// ingesting host: <host>/<source>/<session>/<turn>, or
+// <host>/<source>/<session>/<kind>/<turn> for titles, todos and tasks.
+func rawRecord(host, source, sessionID, turnID, role, text string, timestamp int64, project, kind string) MemoryItem {
 	if timestamp == 0 {
 		timestamp = 1
 	}
-	idInput := host + "|" + harness + "|" + sessionID + "|" + turnID
-	filePath := host + "/" + harness + "/" + sessionID + "/" + turnID
+	id := host + "/" + source + "/" + sessionID + "/" + turnID
 	if kind != "message" {
-		idInput = host + "|" + harness + "|" + sessionID + "|" + kind + "|" + turnID
-		filePath = host + "/" + harness + "/" + sessionID + "/" + kind + "/" + turnID
+		id = host + "/" + source + "/" + sessionID + "/" + kind + "/" + turnID
 	}
 	return MemoryItem{
-		ID:             hashText(idInput),
-		ForwardContent: text,
+		ID:   id,
+		Text: text,
 		Metadata: Metadata{
-			Scope: ScopeSession, ProjectName: project, FilePath: filePath,
-			FileHash: hashText(text), Timestamp: timestamp, SessionID: sessionID, Host: host, Harness: harness, Role: role,
-			RecordKind: kind,
+			Source: source, Host: host, ContainerID: sessionID, ContainerKind: "agent_session", Project: project,
+			AuthorID: role, Kind: kind, Timestamp: timestamp, ContentHash: hashText(text),
 		},
 	}
 }

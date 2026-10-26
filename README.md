@@ -1,6 +1,8 @@
 # pi-memoryd
 
-`pi-memoryd` is the single recall service for indexed Pi, Codex, OMP, Claude Code, Grok, and Grok Bot sessions. Production is one Go process linked to LanceDB through CGO. Macs only copy their untouched session JSONL files to R2; the VPS extracts, embeds, and indexes them.
+`pi-memoryd` is the single recall service for indexed Pi, Codex, OMP, Claude Code, Grok, and Grok Bot sessions and Telegram chats. Production is one Go process linked to LanceDB through CGO. Uploaders only copy untouched JSONL files to R2; the VPS extracts, embeds, and indexes them.
+
+The same code runs as separate deployments (personal and Valantis), each with its own VPS, R2 bucket, and set of uploaders. Nothing in the code distinguishes them.
 
 ```text
 Mac launchd uploader -------\
@@ -20,7 +22,27 @@ the central ingester:
 Uploaders never parse or index sessions. `pi-memoryd` does not discover local
 session directories; it only ingests objects that an uploader has copied to R2.
 
-The live derived recall store defaults to `s3://<bucket>/session-recall-lance-token-chunks-v4/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+The live derived recall store defaults to `s3://<bucket>/session-recall-lance-generic-v1/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+
+## Record schema
+
+Every source writes the same generic columns, so a new source needs a parser and no schema change. `messages` holds one row per message; `chunks` holds the embedded text plus the same columns for filtering.
+
+| Column | Agent session | Telegram |
+|---|---|---|
+| `id` | `<host>/<source>/<session>/<turn>` (`…/<session>/<kind>/<turn>` for titles, todos, tasks) | `<host>/telegram/<container_id>/<msg_id>` |
+| `source` | `pi`, `codex`, `omp`, `claude`, `grok`, `grokbot` | `telegram` |
+| `host` | uploading machine (first raw key segment) | exporting account/machine |
+| `container_id`, `container_kind` | session id, `agent_session` | chat id (`<chat>:<topic>` in forum topics), `dm`/`group`/`topic`/`channel` |
+| `container_title` | empty | chat title |
+| `project` | repo from the session `cwd` | empty |
+| `author_id`, `author_name` | `user`/`assistant`/…, empty | sender id, display name |
+| `kind` | `message`, `title`, `todo`, `task` | `message` |
+| `reply_to` | empty | id of the replied-to message |
+| `timestamp`, `text`, `content_hash` | | |
+| `attrs` | empty | JSON: `fwd_from`, `edit_date`, `media` |
+
+Chunks add `message_id`, `chunk_index`, `chunk_count`, and `vector`; chunk ids are `<message_id>#<index>`. IDs are readable and start with the host that ingested them, so a host can re-send, overwrite, or delete (`--delete-host`) its own rows.
 
 ## Current production state
 
@@ -137,10 +159,10 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 ## Lance behavior
 
 - Merge-insert on stable `id`; an ingest response is successful only after persistence.
-- Vector (IVF-Flat, 512 partitions), BM25, and combined hybrid search with LanceDB RRF.
-- Search reads only the `chunks` table; session walking reads only `messages`.
-- Session walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
-- Searchable chunks use IVF-Flat vector, FTS, and scalar `id` indexes; messages use scalar `session_id` and `id` indexes.
+- Vector (single-partition IVF-PQ), BM25, and combined hybrid search with LanceDB RRF.
+- Search reads only the `chunks` table; container walking reads only `messages`.
+- Container walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
+- Chunks use vector, `text` FTS, and scalar `id` indexes; messages use scalar `container_id` and `id` indexes.
 - One-row scan and dummy FTS warmup during startup.
 - Every immutable read (data, index, and deletion files) goes through a
   persistent local block cache: aligned 256 KiB blocks plus a per-object
@@ -169,9 +191,9 @@ operational baselines rather than a latency guarantee.
 ## HTTP API
 
 - `GET /-/ready`
-- `POST /v1/memory/ingest`
-- `POST /v1/memory/query`
-- `GET /v1/memory/session?session_id=...&after_ts=...&after_id=...[&include=todos|tasks|titles|state]`
+- `POST /v1/memory/ingest` — `{records:[{id, vector, text, metadata:{source, host, container_id, timestamp, …}}]}`; one chunk `<id>#0` per record
+- `POST /v1/memory/query` — filters `source`, `host`, `container_id`, `container_kind`, `project`, `author_id`, `kind`
+- `GET /v1/memory/container?container_id=...&host=&source=&after_ts=...&after_id=...[&include=todos|tasks|titles|state]`
 - `GET /v1/raw/status`
 
 Example hybrid query:
@@ -180,10 +202,13 @@ Example hybrid query:
 {
   "query_vector": [0.1, 0.2],
   "query_text": "wallet activation",
-  "session_id": "session-id",
+  "source": "telegram",
+  "container_kind": "group",
   "limit": 5
 }
 ```
+
+Results are collapsed per message: `id` is the message id (for Telegram, the first message of the matched window), `text` the matched chunk, and `metadata.matched_chunk_id` the chunk.
 
 Production uses 384-dimensional `BAAI/bge-small-en-v1.5` vectors. Query prefixes belong only on query embeddings; do not mix embeddings from different model/runtime configurations in the same table.
 
@@ -223,34 +248,23 @@ uploaded. Each append-only file is one bot in the Pi session format: a
 the slug is the project. Records keep the `grokbot` harness, so their IDs never
 collide with Pi or OMP rows.
 
-Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages plus important session state: titles, todo snapshots, and task/subagent tool results. Every logical message is stored once, in full, as a canonical `message` row. Important state rows use `record_kind` values `title`, `todo`, or `task` so normal recall can find them without reading a local session file. The daemon uses llama.cpp's tokenizer to split each searchable row into overlapping windows of at most 384 tokens (64-token overlap), embeds every `chunk` row, and links each chunk to its stable parent row ID. Search runs over chunks and collapses hits by parent. Session walking prefers the untouched raw JSONL archive and falls back to the derived `messages` table; `include=todos`, `include=tasks`, `include=titles`, or `include=state` reads those exact records from raw when available, so reconstruction is not limited by chunk overlap, embedding truncation, or quantized search indexes.
+The `telegram` tree holds exports written by `cmd/tireless-telegram` (Telethon; run with the `telethon-python` wrapper). It is off unless `tireless-upload --telegram <dir>` / `TIRELESS_TELEGRAM_DIR` names the export directory, uploaded as `<host>/telegram/<chat_id>/<yyyy-mm>.jsonl`. Each line is one message version:
 
-An object is recorded as indexed only after every derived row is persisted. On a crash, the object is retried; stable parent and chunk IDs make replay harmless. Growing files are coalesced for five minutes before their next derived write, reducing tiny Lance fragments without delaying new files. Failed objects retry with bounded exponential backoff. Parser/chunker-version changes automatically reprocess the derived data. The raw JSONL remains the source of truth for clean reindexing.
+```json
+{"id":"812","chat_id":"-1001234567890","chat_type":"group","chat_title":"Valantis Core","topic_id":"","date":1791311374,"edit_date":0,"sender_id":"55501","sender_name":"Alice","reply_to":"809","fwd_from":"","media":"","text":"pushed v0.3 to staging"}
+```
 
-## Split-table migration
+An edit appends a line with the same `id`; the last line wins, and an edit to empty text drops the message. The exporter keeps a per-chat cursor and exports every dialog (`--chats all`, the personal setup) or only the chat ids listed in a file (`--chats <file>`, the company setup). Edits and deletes of already-exported messages are not re-fetched.
 
-Existing `turns` rows can be copied into the split layout without downloading
-raw files or recomputing embeddings. The rollout is deliberately reversible:
+Objects are never modified or deleted by the daemon. It polls the raw prefix, downloads changed objects, and extracts user/assistant messages plus important session state: titles, todo snapshots, and task/subagent tool results. Every logical message is stored once, in full, as a canonical `messages` row; titles, todos, and tasks keep `kind` `title`, `todo`, or `task` so normal recall can find them without reading a local session file. The daemon uses llama.cpp's tokenizer to split each searchable text into overlapping windows of at most 384 tokens (64-token overlap), embeds every chunk, and links each chunk to its message id. Short Telegram messages embed poorly one by one, so consecutive DM/group/topic messages less than 10 minutes apart share one window (`Name: text` lines, at most 1,200 characters) whose chunks hang off the window's first message; channel posts stand alone. A new or edited message re-embeds only its window. Search runs over chunks and collapses hits by message. Container walking prefers the untouched raw JSONL archive and falls back to the derived `messages` table; `include=todos`, `include=tasks`, `include=titles`, or `include=state` reads those exact records from raw when available, so reconstruction is not limited by chunk overlap, embedding truncation, or quantized search indexes.
 
-1. Run the new image with `PI_MEMORYD_DUAL_WRITE_SPLIT=true` and
-   `PI_MEMORYD_SPLIT_TABLES=false`. Reads stay on `turns`, while new writes also
-   land in `chunks` and `messages`.
-2. Run `make migrate-split`. It pins one immutable source-table version, copies
-   in 1,024-row batches with merge-insert on stable IDs, and saves
-   `/data/split_migration.json` after every batch. Re-running the command resumes
-   that exact snapshot and is safe after interruption. Before marking the
-   checkpoint complete, an ID-only reconciliation copies any omissions and
-   proves that no source IDs are missing from either destination.
-3. Create/refresh the chunk indexes, validate the shadow service, then set
-   `PI_MEMORYD_SPLIT_TABLES=true` while leaving dual-write enabled for the
-   rollback observation window. Disable dual-write only after that window.
+An object is recorded as indexed only after every derived row is persisted. On a crash, the object is retried; stable message and chunk IDs make replay harmless. Growing files are coalesced for five minutes before their next derived write, reducing tiny Lance fragments without delaying new files. Failed objects retry with bounded exponential backoff. A parser version change re-parses every object, but the dedup state (message id → content hash) skips messages whose text is unchanged, so nothing is re-embedded unless it changed. The raw JSONL remains the source of truth for clean reindexing.
 
-Keep the old `turns` table and previous image during the observation window.
-After dual-write is disabled, that table becomes a historical snapshot and is
-not a lossless rollback target for newer sessions. Untouched raw JSONL in R2 is
-the authoritative recovery source. The current VPS still retains the old image
-as `pi-memoryd:pre-split-20260825` (`sha256:0ce78d40f440...`) and the dormant
-legacy table, but neither participates in normal runtime operation.
+## Generic-schema migration
+
+`make migrate-generic` copies the `token-chunks-v4` `messages` and `chunks` tables (default prefix `session-recall-lance-token-chunks-v4`, override with `MIGRATE_FROM_PREFIX`) into the generic tables at `PI_MEMORYD_S3_PREFIX` without downloading raw files or re-embedding. The v4 `file_path` (`<host>/<harness>/<session>[/<kind>]/<turn>`) becomes the readable id, chunks keep their vectors as `<id>#<chunk_index>`, and every copied message is written to the dedup state, so the raw re-scan after the cutover embeds nothing. It pins both source table versions, copies 1,024-row batches with merge-insert, and saves `/data/generic_migration.json` after every batch; re-running resumes and is safe after interruption. It fails if two v4 rows map to one id.
+
+Rollout: stop the daemon, run `make migrate-generic`, then `--create-vector-index` and start the new image (the Compose default prefix is `session-recall-lance-generic-v1`). The v4 prefix stays untouched; rollback is the previous image with `PI_MEMORYD_S3_PREFIX=session-recall-lance-token-chunks-v4`.
 
 The durable registry is `/data/raw_registry.json`. Inspect progress with:
 
@@ -288,12 +302,10 @@ The older target names remain as compatibility aliases:
 | Variable | Purpose |
 |---|---|
 | `PI_MEMORYD_STORAGE_URL` | Lance database URI, composed as `s3://<bucket>/<PI_MEMORYD_S3_PREFIX>` by Docker Compose |
-| `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-token-chunks-v4` |
+| `PI_MEMORYD_S3_PREFIX` | Optional Compose prefix override; defaults to `session-recall-lance-generic-v1` |
 | `PI_MEMORYD_VECTOR_NPROBES` | IVF partitions searched per vector query (of 512); default 64, production 128 |
 | `PI_MEMORYD_EXACT_VECTOR_SEARCH` | Intended to bypass IVF for an exact scan, but Lance ignores it while an index exists; code default `true`, production `false` |
-| `PI_MEMORYD_SPLIT_TABLES` | Read/write separate `chunks` and `messages` tables; production default `true` |
-| `PI_MEMORYD_DUAL_WRITE_SPLIT` | Write both legacy and split layouts during migration/observation; production default `false` |
-| `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable legacy-to-split copy batch; default `1024` |
+| `PI_MEMORYD_MIGRATION_BATCH` | Rows per resumable `--migrate-from` copy batch; default `1024` |
 | `PI_MEMORYD_MAX_CONCURRENT_QUERIES` | Maximum native Lance searches in flight; default `2` |
 | `PI_MEMORYD_QUERY_TIMEOUT` | HTTP-side query deadline; default `30s` |
 | `PI_MEMORYD_LANCE_CACHE_BYTES` | Persistent local block-cache cap for immutable Lance data/index files; Compose defaults to `2147483648` (2 GiB), and `0` disables it. Tables up to half the cap are warmed fully |

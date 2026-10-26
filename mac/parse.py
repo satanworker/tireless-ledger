@@ -16,8 +16,8 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
 
-def record_id(host: str, harness: str, session_id: str, turn_id: str) -> str:
-    return sha256_hex(f"{host}|{harness}|{session_id}|{turn_id}")
+def record_id(host: str, source: str, container_id: str, native_id: str) -> str:
+    return f"{host}/{source}/{container_id}/{native_id}"
 
 
 def parse_ts(raw: Any) -> int:
@@ -68,7 +68,7 @@ def _skip_user(text: str) -> bool:
 
 
 def iter_pi_turns(path: Path, host: str) -> Iterator[dict[str, Any]]:
-    session_id = path.stem.split("_")[-1]
+    container_id = path.stem.split("_")[-1]
     project = "unknown"
     cwd = ""
     with path.open(errors="ignore") as f:
@@ -81,7 +81,7 @@ def iter_pi_turns(path: Path, host: str) -> Iterator[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             if obj.get("type") == "session":
-                session_id = str(obj.get("id") or session_id)
+                container_id = str(obj.get("id") or container_id)
                 cwd = str(obj.get("cwd") or "")
                 project = project_from_cwd(cwd)
                 continue
@@ -99,20 +99,19 @@ def iter_pi_turns(path: Path, host: str) -> Iterator[dict[str, Any]]:
                 continue
             yield _turn(
                 host=host,
-                harness="pi",
-                session_id=session_id,
+                source="pi",
+                container_id=container_id,
                 turn_id=turn_id,
                 role=role,
                 text=text,
                 ts=parse_ts(obj.get("timestamp") or msg.get("timestamp")),
                 project=project,
-                source=str(path),
             )
 
 
 def iter_codex_turns(path: Path, host: str) -> Iterator[dict[str, Any]]:
-    session_id = path.stem.rsplit("-", 5)
-    session_id = "-".join(session_id[-5:]) if len(session_id) >= 5 else path.stem
+    parts = path.stem.rsplit("-", 5)
+    container_id = "-".join(parts[-5:]) if len(parts) >= 5 else path.stem
     project = "unknown"
     seen: set[str] = set()
     with path.open(errors="ignore") as f:
@@ -126,7 +125,7 @@ def iter_codex_turns(path: Path, host: str) -> Iterator[dict[str, Any]]:
                 continue
             pl = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
             if obj.get("type") == "session_meta":
-                session_id = str(pl.get("id") or session_id)
+                container_id = str(pl.get("id") or container_id)
                 project = project_from_cwd(str(pl.get("cwd") or ""))
                 continue
             if obj.get("type") != "response_item" or pl.get("type") != "message":
@@ -150,54 +149,47 @@ def iter_codex_turns(path: Path, host: str) -> Iterator[dict[str, Any]]:
             seen.add(key)
             yield _turn(
                 host=host,
-                harness="codex",
-                session_id=session_id,
+                source="codex",
+                container_id=container_id,
                 turn_id=turn_id,
                 role=role,
                 text=text,
                 ts=parse_ts(obj.get("timestamp")),
                 project=project,
-                source=str(path),
             )
 
 
 def _turn(
     *,
     host: str,
-    harness: str,
-    session_id: str,
+    source: str,
+    container_id: str,
     turn_id: str,
     role: str,
     text: str,
     ts: int,
     project: str,
-    source: str,
 ) -> dict[str, Any]:
-    rid = record_id(host, harness, session_id, turn_id)
-    file_path = f"{host}/{harness}/{session_id}/{turn_id}"
     return {
-        "id": rid,
-        "forward_content": text,
+        "id": record_id(host, source, container_id, turn_id),
+        "text": text,
         "metadata": {
-            "scope": "session_memory",
-            "project_name": project,
-            "file_path": file_path,
-            "file_hash": sha256_hex(text),
-            "timestamp": ts or 1,
-            "session_id": session_id,
-            "host": host,
-            "harness": harness,
-            "role": role,
             "source": source,
+            "host": host,
+            "container_id": container_id,
+            "timestamp": ts or 1,
+            "project": project,
+            "author_id": role,
+            "kind": "message",
         },
     }
 
 
-def iter_turns(path: Path, host: str, harness: str | None = None) -> Iterator[dict[str, Any]]:
+def iter_turns(path: Path, host: str, source: str | None = None) -> Iterator[dict[str, Any]]:
     name = path.name
-    if harness == "pi" or (harness is None and not name.startswith("rollout-")):
+    if source == "pi" or (source is None and not name.startswith("rollout-")):
         yield from iter_pi_turns(path, host)
-    if harness == "codex" or (harness is None and name.startswith("rollout-")):
+    if source == "codex" or (source is None and name.startswith("rollout-")):
         yield from iter_codex_turns(path, host)
 
 

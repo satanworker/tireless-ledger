@@ -22,9 +22,8 @@ import (
 )
 
 const (
-	lanceTableName        = "turns"
-	lanceChunksTable      = "chunks"
-	lanceMessagesTable    = "messages"
+	lanceChunksTable     = "chunks"
+	lanceMessagesTable   = "messages"
 	lanceVectorIndexName = "vector_ivf_pq"
 	// One partition: a cold search reads the whole PQ index (~100 B/chunk) in a few large
 	// requests instead of two small requests per probed partition, and recall is exact
@@ -35,21 +34,27 @@ const (
 	lanceVectorNProbes      = 1
 )
 
-var lanceOutputColumns = []string{
-	"id", "forward_content", "timestamp", "scope", "project_name", "file_path",
-	"file_hash", "session_id", "host", "harness", "role", "record_kind", "parent_id", "chunk_index", "chunk_count",
-}
+// Columns shared by messages and chunks, in schema order. Chunks add lanceChunkColumns
+// and the vector.
+var (
+	lanceStringColumns = []string{
+		"id", "text", "source", "host", "container_id", "container_kind", "container_title", "project",
+		"author_id", "author_name", "kind", "reply_to", "attrs", "content_hash",
+	}
+	lanceChunkStringColumns = []string{"message_id"}
+	lanceChunkIntColumns    = []string{"chunk_index", "chunk_count"}
+	lanceMessageColumns     = append(append([]string{}, lanceStringColumns...), "timestamp")
+	lanceChunkColumns       = append(append(append([]string{}, lanceMessageColumns...), lanceChunkStringColumns...), lanceChunkIntColumns...)
+)
 
 type cgoLanceStore struct {
-	conn      contracts.IConnection
-	legacy    contracts.ITable
-	chunks    contracts.ITable
-	messages  contracts.ITable
-	dims      int
-	nprobes   int
-	exact     bool
-	split     bool
-	dualWrite bool
+	conn     contracts.IConnection
+	opts     map[string]string
+	chunks   contracts.ITable
+	messages contracts.ITable
+	dims     int
+	nprobes  int
+	exact    bool
 }
 
 type lanceFragmentCounter interface {
@@ -86,23 +91,14 @@ func openLanceStore(ctx context.Context, cfg runtimeConfig) (lanceStore, error) 
 	if nprobes <= 0 {
 		nprobes = lanceVectorNProbes
 	}
-	store := &cgoLanceStore{conn: conn, dims: cfg.Dimensions, nprobes: nprobes, exact: cfg.ExactVectorSearch, split: cfg.SplitTables, dualWrite: cfg.DualWriteSplit || cfg.MigrateSplit}
-	if !store.split || store.dualWrite {
-		store.legacy, err = store.openOrCreateTable(ctx, lanceTableName)
-		if err != nil {
-			store.Close()
-			return nil, err
-		}
+	store := &cgoLanceStore{conn: conn, opts: opts, dims: cfg.Dimensions, nprobes: nprobes, exact: cfg.ExactVectorSearch}
+	store.chunks, err = store.openOrCreateTable(ctx, lanceChunksTable, true)
+	if err == nil {
+		store.messages, err = store.openOrCreateTable(ctx, lanceMessagesTable, false)
 	}
-	if store.split || store.dualWrite {
-		store.chunks, err = store.openOrCreateTable(ctx, lanceChunksTable)
-		if err == nil {
-			store.messages, err = store.openOrCreateTable(ctx, lanceMessagesTable)
-		}
-		if err != nil {
-			store.Close()
-			return nil, err
-		}
+	if err != nil {
+		store.Close()
+		return nil, err
 	}
 	for name, table := range store.activeTables() {
 		if _, ok := table.(lanceFragmentCounter); !ok {
@@ -118,62 +114,97 @@ func openLanceStore(ctx context.Context, cfg runtimeConfig) (lanceStore, error) 
 	return store, nil
 }
 
-func (s *cgoLanceStore) openOrCreateTable(ctx context.Context, name string) (contracts.ITable, error) {
+func (s *cgoLanceStore) openOrCreateTable(ctx context.Context, name string, chunk bool) (contracts.ITable, error) {
 	table, err := s.conn.OpenTable(ctx, name)
 	if err == nil {
 		return table, nil
 	}
-	return s.createTable(ctx, name)
-}
-
-// A search's first read of a column loads every page's dictionary (parent_id, file_hash
-// and file_path cost ~20 MB cold at 330k rows) and every full-zip page's repetition
-// index (forward_content, ~1.3 MB). Plain miniblock pages cost KBs. Compaction applies
-// these to existing tables once the dataset schema carries them.
-var (
-	lanceNoDictionary = arrow.NewMetadata([]string{"lance-encoding:dict-divisor"}, []string{"1000000000"})
-	lanceMiniblock    = arrow.NewMetadata([]string{"lance-encoding:structural-encoding"}, []string{"miniblock"})
-)
-
-func (s *cgoLanceStore) createTable(ctx context.Context, name string) (contracts.ITable, error) {
-	fields := []arrow.Field{
-		{Name: "id", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "vector", Type: arrow.FixedSizeListOf(int32(s.dims), arrow.PrimitiveTypes.Float32), Nullable: true},
-		{Name: "forward_content", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceMiniblock},
-		{Name: "scope", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "project_name", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "file_path", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
-		{Name: "file_hash", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
-		{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "session_id", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
-		{Name: "host", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "harness", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "role", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "record_kind", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "parent_id", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: lanceNoDictionary},
-		{Name: "chunk_index", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-	}
-	schema, err := lancedb.NewSchema(arrow.NewSchema(fields, nil))
+	schema, err := lancedb.NewSchema(arrow.NewSchema(lanceFields(s.dims, chunk, true), nil))
 	if err != nil {
 		return nil, err
 	}
 	return s.conn.CreateTable(ctx, name, schema)
 }
 
+// A search's first read of a column loads every page's dictionary (high-cardinality ids
+// and hashes cost ~20 MB cold at 330k rows) and every full-zip page's repetition index
+// (text, ~1.3 MB). Plain miniblock pages cost KBs.
+var (
+	lanceNoDictionary = arrow.NewMetadata([]string{"lance-encoding:dict-divisor"}, []string{"1000000000"})
+	lanceMiniblock    = arrow.NewMetadata([]string{"lance-encoding:structural-encoding"}, []string{"miniblock"})
+	lanceHighCardinal = map[string]bool{"id": true, "container_id": true, "reply_to": true, "attrs": true, "content_hash": true, "message_id": true}
+)
+
+// lanceFields is the table schema; encodings only matter when creating the table.
+func lanceFields(dims int, chunk, encodings bool) []arrow.Field {
+	field := func(name string, typ arrow.DataType) arrow.Field {
+		f := arrow.Field{Name: name, Type: typ, Nullable: true}
+		if encodings && name == "text" {
+			f.Metadata = lanceMiniblock
+		} else if encodings && lanceHighCardinal[name] {
+			f.Metadata = lanceNoDictionary
+		}
+		return f
+	}
+	fields := make([]arrow.Field, 0, len(lanceChunkColumns)+1)
+	for _, name := range lanceStringColumns {
+		fields = append(fields, field(name, arrow.BinaryTypes.String))
+	}
+	fields = append(fields, field("timestamp", arrow.PrimitiveTypes.Int64))
+	if chunk {
+		for _, name := range lanceChunkStringColumns {
+			fields = append(fields, field(name, arrow.BinaryTypes.String))
+		}
+		for _, name := range lanceChunkIntColumns {
+			fields = append(fields, field(name, arrow.PrimitiveTypes.Int64))
+		}
+		fields = append(fields, field("vector", arrow.FixedSizeListOf(int32(dims), arrow.PrimitiveTypes.Float32)))
+	}
+	return fields
+}
+
+func itemString(item MemoryItem, column string) string {
+	m := item.Metadata
+	switch column {
+	case "id":
+		return item.ID
+	case "text":
+		return item.Text
+	case "source":
+		return m.Source
+	case "host":
+		return m.Host
+	case "container_id":
+		return m.ContainerID
+	case "container_kind":
+		return m.ContainerKind
+	case "container_title":
+		return m.ContainerTitle
+	case "project":
+		return m.Project
+	case "author_id":
+		return m.AuthorID
+	case "author_name":
+		return m.AuthorName
+	case "kind":
+		return m.Kind
+	case "reply_to":
+		return m.ReplyTo
+	case "attrs":
+		return m.Attrs
+	case "content_hash":
+		return m.ContentHash
+	case "message_id":
+		return m.MessageID
+	}
+	panic("unknown lance string column " + column)
+}
+
 func (s *cgoLanceStore) ensureIndexes(ctx context.Context) error {
-	if s.split || s.dualWrite {
-		if err := s.ensureTableIndexes(ctx, s.chunks, "chunks"); err != nil {
-			return err
-		}
-		if err := s.ensureTableIndexes(ctx, s.messages, "messages"); err != nil {
-			return err
-		}
+	if err := s.ensureTableIndexes(ctx, s.chunks, "chunks"); err != nil {
+		return err
 	}
-	if !s.split || s.dualWrite {
-		return s.ensureTableIndexes(ctx, s.legacy, "legacy")
-	}
-	return nil
+	return s.ensureTableIndexes(ctx, s.messages, "messages")
 }
 
 func (s *cgoLanceStore) ensureTableIndexes(ctx context.Context, table contracts.ITable, kind string) error {
@@ -191,16 +222,16 @@ func (s *cgoLanceStore) ensureTableIndexes(ctx context.Context, table contracts.
 		}
 		return false
 	}
-	if kind != "messages" && !hasColumn("forward_content") {
-		if err := table.CreateIndexWithParams(ctx, []string{"forward_content"}, contracts.IndexTypeFts,
-			contracts.IndexParams{}, &contracts.CreateIndexOptions{Name: "forward_content_fts", WaitTimeout: 2 * time.Minute}); err != nil {
-			return fmt.Errorf("create forward_content FTS index: %w", err)
+	if kind == "chunks" && !hasColumn("text") {
+		if err := table.CreateIndexWithParams(ctx, []string{"text"}, contracts.IndexTypeFts,
+			contracts.IndexParams{}, &contracts.CreateIndexOptions{Name: "text_fts", WaitTimeout: 2 * time.Minute}); err != nil {
+			return fmt.Errorf("create text FTS index: %w", err)
 		}
 	}
-	if kind != "chunks" && !hasColumn("session_id") {
-		if err := table.CreateIndexWithParams(ctx, []string{"session_id"}, contracts.IndexTypeBTree,
-			contracts.IndexParams{}, &contracts.CreateIndexOptions{Name: "session_id_btree", WaitTimeout: 2 * time.Minute}); err != nil {
-			return fmt.Errorf("create session_id btree index: %w", err)
+	if kind == "messages" && !hasColumn("container_id") {
+		if err := table.CreateIndexWithParams(ctx, []string{"container_id"}, contracts.IndexTypeBTree,
+			contracts.IndexParams{}, &contracts.CreateIndexOptions{Name: "container_id_btree", WaitTimeout: 2 * time.Minute}); err != nil {
+			return fmt.Errorf("create container_id btree index: %w", err)
 		}
 	}
 	if !hasColumn("id") {
@@ -209,25 +240,18 @@ func (s *cgoLanceStore) ensureTableIndexes(ctx context.Context, table contracts.
 			return fmt.Errorf("create %s id index: %w", kind, err)
 		}
 	}
-	if kind == "legacy" && !hasColumn("record_kind") {
-		if err := table.CreateIndexWithParams(ctx, []string{"record_kind"}, contracts.IndexTypeBitmap,
-			contracts.IndexParams{}, &contracts.CreateIndexOptions{Name: "record_kind_bitmap", WaitTimeout: 2 * time.Minute}); err != nil {
-			return fmt.Errorf("create record_kind index: %w", err)
-		}
-	}
 	return nil
 }
 
 func (s *cgoLanceStore) warm(ctx context.Context) {
 	t0 := time.Now()
 	one := 1
-	table := s.searchTable("chunks")
-	if _, err := table.Select(ctx, contracts.QueryConfig{Columns: []string{"id"}, Limit: &one}); err != nil {
+	if _, err := s.chunks.Select(ctx, contracts.QueryConfig{Columns: []string{"id"}, Limit: &one}); err != nil {
 		slog.Warn("lance scan warmup failed", "err", err)
 	}
-	if _, err := table.Select(ctx, contracts.QueryConfig{
+	if _, err := s.chunks.Select(ctx, contracts.QueryConfig{
 		Columns: []string{"id"}, Limit: &one,
-		FTSSearch: &contracts.FTSSearch{Column: "forward_content", Query: "warmup"},
+		FTSSearch: &contracts.FTSSearch{Column: "text", Query: "warmup"},
 	}); err != nil {
 		slog.Warn("lance FTS warmup failed", "err", err)
 	}
@@ -236,12 +260,10 @@ func (s *cgoLanceStore) warm(ctx context.Context) {
 
 func (s *cgoLanceStore) Close() error {
 	var first error
-	seen := map[contracts.ITable]bool{}
-	for _, table := range []contracts.ITable{s.legacy, s.chunks, s.messages} {
-		if table == nil || seen[table] {
+	for _, table := range []contracts.ITable{s.chunks, s.messages} {
+		if table == nil {
 			continue
 		}
-		seen[table] = true
 		if err := table.Close(); first == nil {
 			first = err
 		}
@@ -295,8 +317,7 @@ func (s *cgoLanceStore) optimizeTable(ctx context.Context, name string, table co
 }
 
 func (s *cgoLanceStore) CreateVectorIndex(ctx context.Context) error {
-	table := s.searchTable("chunks")
-	indexes, err := table.GetAllIndexes(ctx)
+	indexes, err := s.chunks.GetAllIndexes(ctx)
 	if err != nil {
 		return fmt.Errorf("list lance indexes: %w", err)
 	}
@@ -309,7 +330,7 @@ func (s *cgoLanceStore) CreateVectorIndex(ctx context.Context) error {
 		}
 	}
 	partitions, subVectors := lanceVectorPartitions, lanceVectorSubVectors
-	if err := table.CreateIndexWithParams(ctx, []string{"vector"}, contracts.IndexTypeIvfPq,
+	if err := s.chunks.CreateIndexWithParams(ctx, []string{"vector"}, contracts.IndexTypeIvfPq,
 		contracts.IndexParams{NumPartitions: &partitions, NumSubVectors: &subVectors, DistanceType: contracts.DistanceTypeL2},
 		&contracts.CreateIndexOptions{Name: lanceVectorIndexName, WaitTimeout: 10 * time.Minute}); err != nil {
 		return fmt.Errorf("create IVF-PQ vector index: %w", err)
@@ -319,15 +340,14 @@ func (s *cgoLanceStore) CreateVectorIndex(ctx context.Context) error {
 }
 
 func (s *cgoLanceStore) DropVectorIndex(ctx context.Context) error {
-	table := s.searchTable("chunks")
-	indexes, err := table.GetAllIndexes(ctx)
+	indexes, err := s.chunks.GetAllIndexes(ctx)
 	if err != nil {
 		return fmt.Errorf("list lance indexes: %w", err)
 	}
 	// By column, not name: the IVF-Flat index this replaces is named vector_ivf_flat.
 	for _, index := range indexes {
 		if len(index.Columns) == 1 && index.Columns[0] == "vector" {
-			if err := table.DropIndex(ctx, index.Name); err != nil {
+			if err := s.chunks.DropIndex(ctx, index.Name); err != nil {
 				return fmt.Errorf("drop vector index %s: %w", index.Name, err)
 			}
 			slog.Info("dropped vector index", "name", index.Name, "type", index.IndexType)
@@ -381,37 +401,18 @@ func (s *cgoLanceStore) DeleteHost(ctx context.Context, host string) (int, error
 	return total, nil
 }
 
-func (s *cgoLanceStore) Upsert(ctx context.Context, items []MemoryItem) error {
-	if !s.split || s.dualWrite {
-		if err := s.upsertTable(ctx, "legacy", s.legacy, items); err != nil {
-			return err
-		}
+func (s *cgoLanceStore) Upsert(ctx context.Context, messages, chunks []MemoryItem) error {
+	if err := s.upsertTable(ctx, "chunks", s.chunks, chunks, true); err != nil {
+		return err
 	}
-	if s.split || s.dualWrite {
-		var chunks, messages []MemoryItem
-		for _, item := range items {
-			switch item.Metadata.RecordKind {
-			case "chunk":
-				chunks = append(chunks, item)
-			case "message", "":
-				messages = append(messages, item)
-			}
-		}
-		if err := s.upsertTable(ctx, "chunks", s.chunks, chunks); err != nil {
-			return err
-		}
-		if err := s.upsertTable(ctx, "messages", s.messages, messages); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.upsertTable(ctx, "messages", s.messages, messages, false)
 }
 
-func (s *cgoLanceStore) upsertTable(ctx context.Context, name string, table contracts.ITable, items []MemoryItem) error {
+func (s *cgoLanceStore) upsertTable(ctx context.Context, name string, table contracts.ITable, items []MemoryItem, chunk bool) error {
 	if len(items) == 0 {
 		return nil
 	}
-	rec := lanceRecord(items, s.dims)
+	rec := lanceRecord(items, s.dims, chunk)
 	defer rec.Release()
 	if _, err := table.MergeInsert([]string{"id"}).WhenMatchedUpdateAll(nil).WhenNotMatchedInsertAll().Execute(ctx, []arrow.Record{rec}); err != nil {
 		return fmt.Errorf("merge insert %s: %w", name, err)
@@ -420,93 +421,55 @@ func (s *cgoLanceStore) upsertTable(ctx context.Context, name string, table cont
 }
 
 func (s *cgoLanceStore) activeTables() map[string]contracts.ITable {
-	if s.split {
-		return map[string]contracts.ITable{"chunks": s.chunks, "messages": s.messages}
-	}
-	if s.dualWrite {
-		return map[string]contracts.ITable{"legacy": s.legacy, "chunks": s.chunks, "messages": s.messages}
-	}
-	return map[string]contracts.ITable{"legacy": s.legacy}
+	return map[string]contracts.ITable{"chunks": s.chunks, "messages": s.messages}
 }
 
-func (s *cgoLanceStore) searchTable(kind string) contracts.ITable {
-	if s.split {
-		if kind == "messages" {
-			return s.messages
-		}
-		return s.chunks
+func (s *cgoLanceStore) searchTable(kind string) (contracts.ITable, []string) {
+	if kind == "messages" {
+		return s.messages, lanceMessageColumns
 	}
-	return s.legacy
+	return s.chunks, lanceChunkColumns
 }
 
-func lanceRecord(items []MemoryItem, dims int) arrow.Record {
+func lanceRecord(items []MemoryItem, dims int, chunk bool) arrow.Record {
 	pool := memory.NewGoAllocator()
-	id := array.NewStringBuilder(pool)
-	vector := array.NewFixedSizeListBuilder(pool, int32(dims), arrow.PrimitiveTypes.Float32)
-	vectorValues := vector.ValueBuilder().(*array.Float32Builder)
-	content := array.NewStringBuilder(pool)
-	scope := array.NewStringBuilder(pool)
-	project := array.NewStringBuilder(pool)
-	path := array.NewStringBuilder(pool)
-	hash := array.NewStringBuilder(pool)
-	timestamp := array.NewInt64Builder(pool)
-	session := array.NewStringBuilder(pool)
-	host := array.NewStringBuilder(pool)
-	harness := array.NewStringBuilder(pool)
-	role := array.NewStringBuilder(pool)
-	kind := array.NewStringBuilder(pool)
-	parent := array.NewStringBuilder(pool)
-	chunkIndex := array.NewInt64Builder(pool)
-	chunkCount := array.NewInt64Builder(pool)
-	builders := []array.Builder{id, vector, content, scope, project, path, hash, timestamp, session, host, harness, role, kind, parent, chunkIndex, chunkCount}
-	defer func() {
-		for _, builder := range builders {
-			builder.Release()
+	fields := lanceFields(dims, chunk, false)
+	arrays := make([]arrow.Array, 0, len(fields))
+	for _, f := range fields {
+		switch f.Name {
+		case "vector":
+			b := array.NewFixedSizeListBuilder(pool, int32(dims), arrow.PrimitiveTypes.Float32)
+			values := b.ValueBuilder().(*array.Float32Builder)
+			for _, item := range items {
+				b.Append(true)
+				values.AppendValues(item.Vector, nil)
+			}
+			arrays = append(arrays, b.NewArray())
+			b.Release()
+		case "timestamp", "chunk_index", "chunk_count":
+			b := array.NewInt64Builder(pool)
+			for _, item := range items {
+				switch f.Name {
+				case "timestamp":
+					b.Append(item.Metadata.Timestamp)
+				case "chunk_index":
+					b.Append(item.Metadata.ChunkIndex)
+				default:
+					b.Append(item.Metadata.ChunkCount)
+				}
+			}
+			arrays = append(arrays, b.NewArray())
+			b.Release()
+		default:
+			b := array.NewStringBuilder(pool)
+			for _, item := range items {
+				b.Append(itemString(item, f.Name))
+			}
+			arrays = append(arrays, b.NewArray())
+			b.Release()
 		}
-	}()
-	for _, item := range items {
-		id.Append(safeID(item.ID))
-		vector.Append(true)
-		vectorValues.AppendValues(item.Vector, nil)
-		content.Append(item.ForwardContent)
-		scope.Append(string(item.Metadata.Scope))
-		project.Append(item.Metadata.ProjectName)
-		path.Append(item.Metadata.FilePath)
-		hash.Append(item.Metadata.FileHash)
-		timestamp.Append(item.Metadata.Timestamp)
-		session.Append(item.Metadata.SessionID)
-		host.Append(item.Metadata.Host)
-		harness.Append(item.Metadata.Harness)
-		role.Append(item.Metadata.Role)
-		kind.Append(item.Metadata.RecordKind)
-		parent.Append(item.Metadata.ParentID)
-		chunkIndex.Append(item.Metadata.ChunkIndex)
-		chunkCount.Append(item.Metadata.ChunkCount)
 	}
-	schema := arrow.NewSchema([]arrow.Field{
-		{Name: "id", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "vector", Type: arrow.FixedSizeListOf(int32(dims), arrow.PrimitiveTypes.Float32), Nullable: true},
-		{Name: "forward_content", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "scope", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "project_name", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "file_path", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "file_hash", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "session_id", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "host", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "harness", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "role", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "record_kind", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "parent_id", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "chunk_index", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "chunk_count", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-	}, nil)
-	arrays := []arrow.Array{
-		id.NewArray(), vector.NewArray(), content.NewArray(), scope.NewArray(), project.NewArray(), path.NewArray(),
-		hash.NewArray(), timestamp.NewArray(), session.NewArray(), host.NewArray(), harness.NewArray(), role.NewArray(),
-		kind.NewArray(), parent.NewArray(), chunkIndex.NewArray(), chunkCount.NewArray(),
-	}
-	record := array.NewRecord(schema, arrays, int64(len(items)))
+	record := array.NewRecord(arrow.NewSchema(fields, nil), arrays, int64(len(items)))
 	for _, values := range arrays {
 		values.Release()
 	}
@@ -514,15 +477,18 @@ func lanceRecord(items []MemoryItem, dims int) arrow.Record {
 }
 
 func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]queryResult, error) {
-	table := s.searchTable(req.Table)
+	table, columns := s.searchTable(req.Table)
 	limit := req.K
 	if limit <= 0 {
 		limit = 10
 	}
 	where := lanceCombineSQL(lanceFilterSQL(req.Filter), lanceCursorSQL(req.AfterTS, req.AfterID))
-	config := contracts.QueryConfig{Columns: lanceOutputColumns, Where: where}
+	config := contracts.QueryConfig{Columns: columns, Where: where}
 	hasVector := len(req.Vector) > 0
 	hasText := req.BM25 != nil && strings.TrimSpace(req.BM25.Query) != ""
+	if hasText && req.BM25.Field != "" && req.BM25.Field != "text" {
+		return nil, fmt.Errorf("unsupported BM25 field %q", req.BM25.Field)
+	}
 	switch {
 	case hasVector:
 		config.Limit = &limit
@@ -533,19 +499,13 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 			BypassVectorIndex: s.exact,
 		}
 		if hasText {
-			if req.BM25.Field != "" && req.BM25.Field != "forward_content" {
-				return nil, fmt.Errorf("unsupported BM25 field %q", req.BM25.Field)
-			}
 			config.VectorSearch.FullTextQuery = req.BM25.Query
-			config.VectorSearch.FullTextColumn = "forward_content"
+			config.VectorSearch.FullTextColumn = "text"
 			config.Reranker = &contracts.RerankerConfig{Kind: contracts.RerankerRRF, RRFK: 60, Norm: contracts.NormalizeRank}
 		}
 	case hasText:
 		config.Limit = &limit
-		if req.BM25.Field != "" && req.BM25.Field != "forward_content" {
-			return nil, fmt.Errorf("unsupported BM25 field %q", req.BM25.Field)
-		}
-		config.FTSSearch = &contracts.FTSSearch{Column: "forward_content", Query: req.BM25.Query}
+		config.FTSSearch = &contracts.FTSSearch{Column: "text", Query: req.BM25.Query}
 	}
 	var rows []map[string]interface{}
 	var err error
@@ -560,7 +520,7 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	results := make([]queryResult, 0, len(rows))
 	for _, row := range rows {
 		id := stringValue(row["id"])
-		content := stringValue(row["forward_content"])
+		content := stringValue(row["text"])
 		score := numberValue(row["_relevance_score"])
 		if score == 0 {
 			score = numberValue(row["_score"])
@@ -574,11 +534,11 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 			}
 		}
 		delete(row, "id")
-		delete(row, "forward_content")
+		delete(row, "text")
 		delete(row, "_relevance_score")
 		delete(row, "_score")
 		delete(row, "_distance")
-		results = append(results, queryResult{ID: id, Score: score, ForwardContent: content, Metadata: row})
+		results = append(results, queryResult{ID: id, Score: score, Text: content, Metadata: row})
 	}
 	if !hasVector && !hasText {
 		sort.Slice(results, func(i, j int) bool {
@@ -595,33 +555,33 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	return results, nil
 }
 
-// selectCollapsed ranks candidates reading only parent_id, keeps the best row of each of
-// the first `parents` parents, then reads the output columns for just those rows. A cold
+// selectCollapsed ranks candidates reading only message_id, keeps the best row of each of
+// the first `messages` messages, then reads the output columns for just those rows. A cold
 // search reads ~5 rows of the wide columns instead of fetchK per channel.
-func selectCollapsed(ctx context.Context, table contracts.ITable, config contracts.QueryConfig, parents int) ([]map[string]interface{}, error) {
+func selectCollapsed(ctx context.Context, table contracts.ITable, config contracts.QueryConfig, messages int) ([]map[string]interface{}, error) {
 	rank := config
-	rank.Columns = []string{"parent_id"}
+	rank.Columns = []string{"message_id"}
 	rank.WithRowID = true
 	hits, err := table.Select(ctx, rank)
 	if err != nil {
 		return nil, err
 	}
-	seen := make(map[string]bool, parents)
-	kept := make([]map[string]interface{}, 0, parents)
-	rowIDs := make([]string, 0, parents)
+	seen := make(map[string]bool, messages)
+	kept := make([]map[string]interface{}, 0, messages)
+	rowIDs := make([]string, 0, messages)
 	for _, hit := range hits {
 		rowID := strconv.FormatUint(uint64(numberValue(hit["_rowid"])), 10)
-		parent := stringValue(hit["parent_id"])
-		if parent == "" {
-			parent = rowID
+		message := stringValue(hit["message_id"])
+		if message == "" {
+			message = rowID
 		}
-		if seen[parent] {
+		if seen[message] {
 			continue
 		}
-		seen[parent] = true
+		seen[message] = true
 		kept = append(kept, hit)
 		rowIDs = append(rowIDs, rowID)
-		if len(kept) == parents {
+		if len(kept) == messages {
 			break
 		}
 	}
@@ -659,209 +619,218 @@ func selectCollapsed(ctx context.Context, table contracts.ITable, config contrac
 	return kept, nil
 }
 
-type splitMigrationState struct {
-	SourceVersion  uint64 `json:"source_version,omitempty"`
-	SourceRows     int64  `json:"source_rows,omitempty"`
-	MessagesOffset int64  `json:"messages_offset"`
-	ChunksOffset   int64  `json:"chunks_offset"`
-	Complete       bool   `json:"complete"`
+type genericMigrationState struct {
+	SourceVersions map[string]uint64 `json:"source_versions"`
+	Offsets        map[string]int64  `json:"offsets"`
+	Complete       bool              `json:"complete"`
 }
 
-func (s *cgoLanceStore) MigrateSplit(ctx context.Context, batchSize int, checkpointPath string) error {
-	if s.chunks == nil || s.messages == nil {
-		return fmt.Errorf("split tables are not open; enable PI_MEMORYD_DUAL_WRITE_SPLIT")
-	}
-	state := splitMigrationState{}
+// MigrateFrom copies the token-chunks-v4 messages and chunks tables at sourceURL into
+// the generic tables, keeping every vector. The v4 file_path (<host>/<harness>/
+// <session>[/<kind>]/<turn>) is exactly the new readable message id, so raw re-ingestion
+// after the cutover finds every message already present and embeds nothing. markMessages
+// seeds the dedup state for each copied batch of messages.
+func (s *cgoLanceStore) MigrateFrom(ctx context.Context, sourceURL string, batchSize int, checkpointPath string, markMessages func([]MemoryItem) error) error {
+	state := genericMigrationState{SourceVersions: map[string]uint64{}, Offsets: map[string]int64{}}
 	if b, err := os.ReadFile(checkpointPath); err == nil {
 		if err := json.Unmarshal(b, &state); err != nil {
-			return fmt.Errorf("decode split migration checkpoint: %w", err)
+			return fmt.Errorf("decode migration checkpoint: %w", err)
 		}
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("read split migration checkpoint: %w", err)
+		return fmt.Errorf("read migration checkpoint: %w", err)
 	}
-	alreadyComplete := state.Complete
+	if state.Complete {
+		slog.Info("migration already complete", "checkpoint", checkpointPath)
+		return nil
+	}
 	if batchSize <= 0 {
 		batchSize = 1024
 	}
-	if state.SourceVersion == 0 {
-		version, err := s.legacy.Version(ctx)
-		if err != nil {
-			return fmt.Errorf("get legacy migration source version: %w", err)
-		}
-		state.SourceVersion = uint64(version)
-	}
-	timeTravel, ok := s.legacy.(contracts.ITableTimeTravel)
-	if !ok {
-		return fmt.Errorf("legacy table snapshot capability is unavailable")
-	}
-	if err := timeTravel.Checkout(ctx, state.SourceVersion); err != nil {
-		return fmt.Errorf("pin legacy migration source version %d: %w", state.SourceVersion, err)
-	}
-	if state.SourceRows == 0 {
-		rows, err := s.legacy.Count(ctx)
-		if err != nil {
-			return fmt.Errorf("count legacy migration source: %w", err)
-		}
-		state.SourceRows = rows
-		if err := saveSplitMigrationState(checkpointPath, state); err != nil {
-			return err
-		}
-	}
-	if alreadyComplete {
-		slog.Info("split migration bulk copy already complete; verifying IDs", "source_version", state.SourceVersion, "source_rows", state.SourceRows, "checkpoint", checkpointPath)
-	} else {
-		started := time.Now()
-		initialRows := state.MessagesOffset + state.ChunksOffset
-		slog.Info("split migration starting", "source_version", state.SourceVersion, "source_rows", state.SourceRows, "completed_rows", initialRows, "batch_size", batchSize, "checkpoint", checkpointPath)
-		for _, part := range []struct {
-			name   string
-			filter string
-			table  contracts.ITable
-			offset *int64
-		}{
-			{name: "messages", filter: "record_kind = 'message'", table: s.messages, offset: &state.MessagesOffset},
-			{name: "chunks", filter: "record_kind = 'chunk'", table: s.chunks, offset: &state.ChunksOffset},
-		} {
-			for {
-				record, err := s.legacy.Query().Filter(part.filter).Limit(batchSize).Offset(int(*part.offset)).Execute(ctx)
-				if err != nil {
-					return fmt.Errorf("read %s migration batch at %d: %w", part.name, *part.offset, err)
-				}
-				if record == nil || record.NumRows() == 0 {
-					if record != nil {
-						record.Release()
-					}
-					break
-				}
-				rows := record.NumRows()
-				_, err = part.table.MergeInsert([]string{"id"}).WhenMatchedUpdateAll(nil).WhenNotMatchedInsertAll().Execute(ctx, []arrow.Record{record})
-				record.Release()
-				if err != nil {
-					return fmt.Errorf("write %s migration batch at %d: %w", part.name, *part.offset, err)
-				}
-				*part.offset += rows
-				if err := saveSplitMigrationState(checkpointPath, state); err != nil {
-					return err
-				}
-				done := state.MessagesOffset + state.ChunksOffset
-				newRows := done - initialRows
-				elapsed := time.Since(started)
-				rate := float64(0)
-				eta := time.Duration(0)
-				if elapsed > 0 && newRows > 0 {
-					rate = float64(newRows) / elapsed.Seconds()
-					remaining := state.SourceRows - done
-					if remaining > 0 {
-						eta = time.Duration(float64(remaining)/rate) * time.Second
-					}
-				}
-				percent := float64(0)
-				if state.SourceRows > 0 {
-					percent = 100 * float64(done) / float64(state.SourceRows)
-				}
-				slog.Info("split migration batch complete", "table", part.name, "rows", rows, "table_offset", *part.offset, "completed_rows", done, "source_rows", state.SourceRows, "percent", fmt.Sprintf("%.1f", percent), "rows_per_second", fmt.Sprintf("%.1f", rate), "eta", eta)
-			}
-		}
-	}
-	if err := s.reconcileSplitIDs(ctx, batchSize); err != nil {
-		return err
-	}
-	state.Complete = true
-	if err := saveSplitMigrationState(checkpointPath, state); err != nil {
-		return err
-	}
-	messageRows, err := s.messages.Count(ctx)
+	src, err := lancedb.Connect(ctx, sourceURL, &contracts.ConnectionOptions{StorageOptions: s.opts})
 	if err != nil {
-		return fmt.Errorf("count migrated messages: %w", err)
+		return fmt.Errorf("connect migration source: %w", err)
 	}
-	chunkRows, err := s.chunks.Count(ctx)
-	if err != nil {
-		return fmt.Errorf("count migrated chunks: %w", err)
-	}
-	slog.Info("split migration complete", "messages", messageRows, "chunks", chunkRows, "checkpoint", checkpointPath)
-	return nil
-}
-
-// reconcileSplitIDs is the correctness backstop for a resumed migration. The
-// bulk copier is fast, while this final ID-only pass proves that every row in
-// the pinned source snapshot exists in the appropriate destination table and
-// copies only omissions. Newer production rows are already covered by
-// dual-write and may legitimately exist only in the destinations.
-func (s *cgoLanceStore) reconcileSplitIDs(ctx context.Context, batchSize int) error {
-	sourceRows, err := s.legacy.Select(ctx, contracts.QueryConfig{Columns: []string{"id", "record_kind"}})
-	if err != nil {
-		return fmt.Errorf("scan split migration source IDs: %w", err)
-	}
-	source := map[string]map[string]struct{}{
-		"messages": {},
-		"chunks":   {},
-	}
-	for _, row := range sourceRows {
-		id := stringValue(row["id"])
-		switch stringValue(row["record_kind"]) {
-		case "chunk":
-			source["chunks"][id] = struct{}{}
-		case "message", "":
-			source["messages"][id] = struct{}{}
-		default:
-			return fmt.Errorf("unsupported legacy record_kind %q for id %q", stringValue(row["record_kind"]), id)
-		}
-	}
-	copyBatch := batchSize
-	if copyBatch <= 0 || copyBatch > 256 {
-		copyBatch = 256
-	}
+	defer src.Close()
 	for _, part := range []struct {
 		name  string
-		table contracts.ITable
-	}{
-		{name: "messages", table: s.messages},
-		{name: "chunks", table: s.chunks},
-	} {
-		destinationRows, err := part.table.Select(ctx, contracts.QueryConfig{Columns: []string{"id"}})
+		chunk bool
+		dest  contracts.ITable
+	}{{"messages", false, s.messages}, {"chunks", true, s.chunks}} {
+		table, err := src.OpenTable(ctx, part.name)
 		if err != nil {
-			return fmt.Errorf("scan %s migration destination IDs: %w", part.name, err)
+			return fmt.Errorf("open source %s: %w", part.name, err)
 		}
-		destination := make(map[string]struct{}, len(destinationRows))
-		for _, row := range destinationRows {
-			destination[stringValue(row["id"])] = struct{}{}
-		}
-		missing := make([]string, 0)
-		for id := range source[part.name] {
-			if _, ok := destination[id]; !ok {
-				missing = append(missing, id)
-			}
-		}
-		sort.Strings(missing)
-		slog.Info("split migration reconciliation", "table", part.name, "source_ids", len(source[part.name]), "destination_ids", len(destination), "missing_ids", len(missing))
-		for start := 0; start < len(missing); start += copyBatch {
-			end := start + copyBatch
-			if end > len(missing) {
-				end = len(missing)
-			}
-			quoted := make([]string, 0, end-start)
-			for _, id := range missing[start:end] {
-				quoted = append(quoted, lanceQuote(id))
-			}
-			record, err := s.legacy.Query().Filter("id IN (" + strings.Join(quoted, ",") + ")").Execute(ctx)
+		defer table.Close()
+		if state.SourceVersions[part.name] == 0 {
+			version, err := table.Version(ctx)
 			if err != nil {
-				return fmt.Errorf("read %s reconciliation batch: %w", part.name, err)
+				return fmt.Errorf("get source %s version: %w", part.name, err)
 			}
-			rows := record.NumRows()
-			_, mergeErr := part.table.MergeInsert([]string{"id"}).WhenMatchedUpdateAll(nil).WhenNotMatchedInsertAll().Execute(ctx, []arrow.Record{record})
-			record.Release()
-			if mergeErr != nil {
-				return fmt.Errorf("write %s reconciliation batch: %w", part.name, mergeErr)
-			}
-			if rows != int64(end-start) {
-				return fmt.Errorf("read %s reconciliation rows=%d want=%d", part.name, rows, end-start)
-			}
+			state.SourceVersions[part.name] = uint64(version)
 		}
+		timeTravel, ok := table.(contracts.ITableTimeTravel)
+		if !ok {
+			return fmt.Errorf("source %s snapshot capability is unavailable", part.name)
+		}
+		if err := timeTravel.Checkout(ctx, state.SourceVersions[part.name]); err != nil {
+			return fmt.Errorf("pin source %s version %d: %w", part.name, state.SourceVersions[part.name], err)
+		}
+		sourceRows, err := table.Count(ctx)
+		if err != nil {
+			return fmt.Errorf("count source %s: %w", part.name, err)
+		}
+		slog.Info("migration table starting", "table", part.name, "source_version", state.SourceVersions[part.name], "source_rows", sourceRows, "offset", state.Offsets[part.name])
+		for {
+			record, err := table.Query().Limit(batchSize).Offset(int(state.Offsets[part.name])).Execute(ctx)
+			if err != nil {
+				return fmt.Errorf("read %s batch at %d: %w", part.name, state.Offsets[part.name], err)
+			}
+			if record == nil || record.NumRows() == 0 {
+				if record != nil {
+					record.Release()
+				}
+				break
+			}
+			items, err := v4Items(record, part.chunk)
+			record.Release()
+			if err != nil {
+				return fmt.Errorf("convert %s batch at %d: %w", part.name, state.Offsets[part.name], err)
+			}
+			if err := s.upsertTable(ctx, part.name, part.dest, items, part.chunk); err != nil {
+				return err
+			}
+			if !part.chunk {
+				if err := markMessages(items); err != nil {
+					return err
+				}
+			}
+			state.Offsets[part.name] += int64(len(items))
+			if err := saveMigrationState(checkpointPath, state); err != nil {
+				return err
+			}
+			slog.Info("migration batch complete", "table", part.name, "rows", len(items), "offset", state.Offsets[part.name], "source_rows", sourceRows)
+		}
+		destRows, err := part.dest.Count(ctx)
+		if err != nil {
+			return fmt.Errorf("count migrated %s: %w", part.name, err)
+		}
+		// Distinct v4 rows must stay distinct: fewer destination rows means two v4 rows
+		// mapped to one readable id.
+		if destRows < sourceRows {
+			return fmt.Errorf("migrated %s has %d rows, source has %d: readable ids collided", part.name, destRows, sourceRows)
+		}
+		slog.Info("migration table complete", "table", part.name, "source_rows", sourceRows, "destination_rows", destRows)
 	}
-	return nil
+	state.Complete = true
+	return saveMigrationState(checkpointPath, state)
 }
 
-func saveSplitMigrationState(path string, state splitMigrationState) error {
+// v4Items converts a token-chunks-v4 messages or chunks batch into generic rows.
+func v4Items(record arrow.Record, chunk bool) ([]MemoryItem, error) {
+	str := func(name string) (func(int) string, error) {
+		idx := record.Schema().FieldIndices(name)
+		if len(idx) == 0 {
+			return nil, fmt.Errorf("column %s missing", name)
+		}
+		col := record.Column(idx[0])
+		return func(i int) string {
+			if col.IsNull(i) {
+				return ""
+			}
+			return col.ValueStr(i)
+		}, nil
+	}
+	i64 := func(name string) (func(int) int64, error) {
+		idx := record.Schema().FieldIndices(name)
+		if len(idx) == 0 {
+			return nil, fmt.Errorf("column %s missing", name)
+		}
+		col, ok := record.Column(idx[0]).(*array.Int64)
+		if !ok {
+			return nil, fmt.Errorf("column %s is %s, want int64", name, record.Column(idx[0]).DataType())
+		}
+		return func(i int) int64 {
+			if col.IsNull(i) {
+				return 0
+			}
+			return col.Value(i)
+		}, nil
+	}
+	cols := map[string]func(int) string{}
+	for _, name := range []string{"id", "forward_content", "project_name", "file_path", "file_hash", "session_id", "host", "harness", "role"} {
+		f, err := str(name)
+		if err != nil {
+			return nil, err
+		}
+		cols[name] = f
+	}
+	ts, err := i64("timestamp")
+	if err != nil {
+		return nil, err
+	}
+	chunkCount, err := i64("chunk_count")
+	if err != nil {
+		return nil, err
+	}
+	var chunkIndex func(int) int64
+	var vectors *array.FixedSizeList
+	var vectorValues []float32
+	if chunk {
+		if chunkIndex, err = i64("chunk_index"); err != nil {
+			return nil, err
+		}
+		idx := record.Schema().FieldIndices("vector")
+		if len(idx) == 0 {
+			return nil, fmt.Errorf("column vector missing")
+		}
+		var ok bool
+		if vectors, ok = record.Column(idx[0]).(*array.FixedSizeList); !ok {
+			return nil, fmt.Errorf("column vector is %s", record.Column(idx[0]).DataType())
+		}
+		values, ok := vectors.ListValues().(*array.Float32)
+		if !ok {
+			return nil, fmt.Errorf("vector values are %s", vectors.ListValues().DataType())
+		}
+		vectorValues = values.Float32Values()
+	}
+	items := make([]MemoryItem, int(record.NumRows()))
+	for i := range items {
+		messageID, kind := v4MessageID(cols["file_path"](i), cols["id"](i))
+		item := MemoryItem{
+			ID:   messageID,
+			Text: cols["forward_content"](i),
+			Metadata: Metadata{
+				Source: cols["harness"](i), Host: cols["host"](i), ContainerID: cols["session_id"](i),
+				ContainerKind: "agent_session", Project: cols["project_name"](i), AuthorID: cols["role"](i),
+				Kind: kind, Timestamp: ts(i), ContentHash: cols["file_hash"](i), ChunkCount: chunkCount(i),
+			},
+		}
+		if chunk {
+			item.ID = chunkID(messageID, int(chunkIndex(i)))
+			item.Metadata.MessageID = messageID
+			item.Metadata.ChunkIndex = chunkIndex(i)
+			start, end := vectors.ValueOffsets(i)
+			item.Vector = append([]float32(nil), vectorValues[start:end]...)
+		}
+		items[i] = item
+	}
+	return items, nil
+}
+
+// v4MessageID maps a v4 file_path to the readable message id and its kind:
+// <host>/<harness>/<session>/<turn> is a message, <host>/<harness>/<session>/<kind>/<turn>
+// a title/todo/task. Rows without a path (direct HTTP ingest) keep their v4 id.
+func v4MessageID(filePath, v4ID string) (string, string) {
+	if filePath == "" {
+		return v4ID, "message"
+	}
+	if parts := strings.Split(filePath, "/"); len(parts) == 5 {
+		return filePath, parts[3]
+	}
+	return filePath, "message"
+}
+
+func saveMigrationState(path string, state genericMigrationState) error {
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -869,7 +838,7 @@ func saveSplitMigrationState(path string, state splitMigrationState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".split-migration-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".migration-*")
 	if err != nil {
 		return err
 	}

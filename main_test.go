@@ -14,8 +14,8 @@ type blockingLanceStore struct {
 	calls   atomic.Int32
 }
 
-func (b *blockingLanceStore) Close() error                               { return nil }
-func (b *blockingLanceStore) Upsert(context.Context, []MemoryItem) error { return nil }
+func (b *blockingLanceStore) Close() error                                             { return nil }
+func (b *blockingLanceStore) Upsert(context.Context, []MemoryItem, []MemoryItem) error { return nil }
 func (b *blockingLanceStore) Search(context.Context, vectorSearchRequest) ([]queryResult, error) {
 	b.calls.Add(1)
 	select {
@@ -32,7 +32,9 @@ func (b *blockingLanceStore) AuditDuplicates(context.Context) (duplicateAudit, e
 	return duplicateAudit{}, nil
 }
 func (b *blockingLanceStore) DeleteHost(context.Context, string) (int, error) { return 0, nil }
-func (b *blockingLanceStore) MigrateSplit(context.Context, int, string) error { return nil }
+func (b *blockingLanceStore) MigrateFrom(context.Context, string, int, string, func([]MemoryItem) error) error {
+	return nil
+}
 func (b *blockingLanceStore) FragmentCounts(context.Context) (map[string]int, error) {
 	return nil, nil
 }
@@ -49,23 +51,17 @@ func TestParseS3URL(t *testing.T) {
 
 func TestValidateMemoryItem(t *testing.T) {
 	item := MemoryItem{
-		ID:             "repo_file_0",
-		Vector:         []float32{0.1, 0.2},
-		ForwardContent: "package main",
-		Metadata: Metadata{
-			Scope:       ScopeCode,
-			ProjectName: "backend-api",
-			FilePath:    "main.go",
-			FileHash:    "abc123",
-			Timestamp:   time.Now().Unix(),
-		},
+		ID:       "mac/pi/s1/u1",
+		Vector:   []float32{0.1, 0.2},
+		Text:     "package main",
+		Metadata: Metadata{Source: "pi", ContainerID: "s1", Timestamp: time.Now().Unix()},
 	}
 	if err := validateMemoryItem(item, 2); err != nil {
 		t.Fatalf("valid item failed: %v", err)
 	}
-	item.Metadata.Scope = "bad"
+	item.Metadata.ContainerID = ""
 	if err := validateMemoryItem(item, 2); err == nil {
-		t.Fatalf("expected invalid scope error")
+		t.Fatalf("expected missing container_id error")
 	}
 }
 
@@ -99,8 +95,8 @@ func TestDedupStateRemoveHost(t *testing.T) {
 }
 
 func TestRRFMerge(t *testing.T) {
-	a := []queryResult{{ID: "x", Score: 1, ForwardContent: "ann"}, {ID: "y", Score: 2, ForwardContent: "ann-y"}}
-	b := []queryResult{{ID: "y", Score: 9, ForwardContent: "bm25-y"}, {ID: "z", Score: 8, ForwardContent: "bm25-z"}}
+	a := []queryResult{{ID: "x", Score: 1, Text: "ann"}, {ID: "y", Score: 2, Text: "ann-y"}}
+	b := []queryResult{{ID: "y", Score: 9, Text: "bm25-y"}, {ID: "z", Score: 8, Text: "bm25-z"}}
 	out := rrfMerge(a, b, 3)
 	if len(out) != 3 {
 		t.Fatalf("len=%d", len(out))
@@ -114,12 +110,12 @@ func TestQueryFilter(t *testing.T) {
 	if queryFilter(queryRequest{}) != nil {
 		t.Fatal("empty filter must omit")
 	}
-	f := queryFilter(queryRequest{SessionID: "abc"})
-	if f == nil || f.Eq == nil || f.Eq.Field != "session_id" || f.Eq.Value != "abc" {
+	f := queryFilter(queryRequest{ContainerID: "abc"})
+	if f == nil || f.Eq == nil || f.Eq.Field != "container_id" || f.Eq.Value != "abc" {
 		t.Fatalf("filter=%+v", f)
 	}
-	f = queryFilter(queryRequest{Scope: "session_memory", SessionID: "abc"})
-	if f == nil || len(f.And) != 2 {
+	f = queryFilter(queryRequest{Source: "telegram", ContainerKind: "group"})
+	if f == nil || len(f.And) != 2 || lanceFilterSQL(f) != "(source = 'telegram' AND container_kind = 'group')" {
 		t.Fatalf("and=%+v", f)
 	}
 }

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from parse import iter_codex_turns, iter_pi_turns, record_id
+from parse import iter_codex_turns, iter_pi_turns
 
 FIXTURE = Path(__file__).parent / "testdata"
 
@@ -19,11 +19,11 @@ def test_pi_user_and_assistant(tmp_path: Path) -> None:
         + "\n"
     )
     turns = list(iter_pi_turns(p, "mac"))
-    assert [t["metadata"]["role"] for t in turns] == ["user", "assistant"]
-    assert turns[0]["metadata"]["session_id"] == "sess123"
-    assert turns[0]["metadata"]["project_name"] == "tireless-ledger"
-    assert "thinking" not in turns[1]["forward_content"]
-    assert turns[0]["id"] == record_id("mac", "pi", "sess123", "u1")
+    assert [t["metadata"]["author_id"] for t in turns] == ["user", "assistant"]
+    assert turns[0]["metadata"]["container_id"] == "sess123"
+    assert turns[0]["metadata"]["project"] == "tireless-ledger"
+    assert "thinking" not in turns[1]["text"]
+    assert turns[0]["id"] == "mac/pi/sess123/u1"
 
 
 def test_codex_skips_agents_md_and_dupes(tmp_path: Path) -> None:
@@ -44,11 +44,11 @@ def test_codex_skips_agents_md_and_dupes(tmp_path: Path) -> None:
         + "\n"
     )
     turns = list(iter_codex_turns(p, "mac"))
-    assert [t["metadata"]["role"] for t in turns] == ["user", "assistant"]
-    assert turns[0]["metadata"]["session_id"] == "019e8f52-0cc9-7e91-a2bc-daea4b591f58"
-    assert turns[0]["metadata"]["project_name"] == "swap-ui"
-    assert "AGENTS.md" not in turns[0]["forward_content"]
-    assert turns[0]["id"] == record_id("mac", "codex", "019e8f52-0cc9-7e91-a2bc-daea4b591f58", "msg-user")
+    assert [t["metadata"]["author_id"] for t in turns] == ["user", "assistant"]
+    assert turns[0]["metadata"]["container_id"] == "019e8f52-0cc9-7e91-a2bc-daea4b591f58"
+    assert turns[0]["metadata"]["project"] == "swap-ui"
+    assert "AGENTS.md" not in turns[0]["text"]
+    assert turns[0]["id"] == "mac/codex/019e8f52-0cc9-7e91-a2bc-daea4b591f58/msg-user"
 
 
 def test_codex_resume_reuses_payload_id(tmp_path: Path) -> None:
@@ -81,8 +81,7 @@ def test_codex_resume_reuses_payload_id(tmp_path: Path) -> None:
     first = list(iter_codex_turns(original, "vps"))[0]
     replay = list(iter_codex_turns(resumed, "vps"))[0]
     assert first["id"] == replay["id"]
-    assert first["metadata"]["file_path"] == replay["metadata"]["file_path"]
-    assert replay["metadata"]["session_id"] == "thread-original"
+    assert replay["metadata"]["container_id"] == "thread-original"
 
 
 if __name__ == "__main__":

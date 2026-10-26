@@ -17,14 +17,14 @@ func TestParseRawPiPreservesText(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("items=%d", len(items))
 	}
-	if got := items[0].ForwardContent; got != "Keep **this formatting**, punctuation—and UTF-8." {
+	if got := items[0].Text; got != "Keep **this formatting**, punctuation—and UTF-8." {
 		t.Fatalf("text=%q", got)
 	}
-	if items[0].Metadata.Host != "mbp14" || items[0].Metadata.Harness != "pi" || items[0].Metadata.SessionID != "pi-session" {
+	if items[0].Metadata.Host != "mbp14" || items[0].Metadata.Source != "pi" || items[0].Metadata.ContainerID != "pi-session" {
 		t.Fatalf("metadata=%+v", items[0].Metadata)
 	}
-	if items[1].ForwardContent != "Formatting remains exact." {
-		t.Fatalf("assistant=%q", items[1].ForwardContent)
+	if items[1].Text != "Formatting remains exact." {
+		t.Fatalf("assistant=%q", items[1].Text)
 	}
 }
 
@@ -42,14 +42,14 @@ func TestParseRawOmpKeepsHarnessAndTitlelessMessages(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("items=%d", len(items))
 	}
-	if items[0].Metadata.Host != "mbp14" || items[0].Metadata.Harness != "omp" || items[0].Metadata.SessionID != "omp-session" {
+	if items[0].Metadata.Host != "mbp14" || items[0].Metadata.Source != "omp" || items[0].Metadata.ContainerID != "omp-session" {
 		t.Fatalf("metadata=%+v", items[0].Metadata)
 	}
-	if items[0].Metadata.ProjectName != "satanworker" {
-		t.Fatalf("project=%q", items[0].Metadata.ProjectName)
+	if items[0].Metadata.Project != "satanworker" {
+		t.Fatalf("project=%q", items[0].Metadata.Project)
 	}
-	if items[1].ForwardContent != "Backend now accepts OMP JSONL." {
-		t.Fatalf("assistant=%q", items[1].ForwardContent)
+	if items[1].Text != "Backend now accepts OMP JSONL." {
+		t.Fatalf("assistant=%q", items[1].Text)
 	}
 }
 
@@ -66,16 +66,16 @@ func TestParseRawOmpIndexesImportantState(t *testing.T) {
 	}
 	kinds := map[string]int{}
 	for _, item := range items {
-		kinds[item.Metadata.RecordKind]++
-		if item.Metadata.ProjectName != "brimstone" {
-			t.Fatalf("project=%q", item.Metadata.ProjectName)
+		kinds[item.Metadata.Kind]++
+		if item.Metadata.Project != "brimstone" {
+			t.Fatalf("project=%q", item.Metadata.Project)
 		}
 	}
 	if kinds["title"] != 2 || kinds["todo"] != 2 || kinds["task"] != 1 {
 		t.Fatalf("kinds=%v", kinds)
 	}
-	if !strings.Contains(items[2].ForwardContent, "Index todo snapshots for search") {
-		t.Fatalf("todo text=%q", items[2].ForwardContent)
+	if !strings.Contains(items[2].Text, "Index todo snapshots for search") {
+		t.Fatalf("todo text=%q", items[2].Text)
 	}
 }
 
@@ -98,8 +98,8 @@ func TestParseRawCodexStableResumeID(t *testing.T) {
 	if first[0].ID != second[0].ID {
 		t.Fatalf("resume IDs differ: %s %s", first[0].ID, second[0].ID)
 	}
-	if first[0].Metadata.ProjectName != "tireless-ledger" {
-		t.Fatalf("project=%q", first[0].Metadata.ProjectName)
+	if first[0].Metadata.Project != "tireless-ledger" {
+		t.Fatalf("project=%q", first[0].Metadata.Project)
 	}
 }
 
@@ -121,10 +121,10 @@ func TestParseRawClaudeSession(t *testing.T) {
 	}
 	got := map[string][]string{}
 	for _, item := range items {
-		if item.Metadata.Harness != "claude" || item.Metadata.SessionID != "c1" || item.Metadata.ProjectName != "tireless-ledger" {
+		if item.Metadata.Source != "claude" || item.Metadata.ContainerID != "c1" || item.Metadata.Project != "tireless-ledger" {
 			t.Fatalf("metadata=%+v", item.Metadata)
 		}
-		got[item.Metadata.RecordKind] = append(got[item.Metadata.RecordKind], item.ForwardContent)
+		got[item.Metadata.Kind] = append(got[item.Metadata.Kind], item.Text)
 	}
 	if len(got["message"]) != 2 || got["message"][0] != "Index Claude sessions too." || got["message"][1] != "Adding a claude harness." {
 		t.Fatalf("messages=%q", got["message"])
@@ -140,7 +140,7 @@ func TestParseRawClaudeSession(t *testing.T) {
 	}
 
 	sub, err := parseRawSession("home-satan/claude/-repo-tireless-ledger/c1/subagents/agent-a9.jsonl", []byte(`{"type":"user","uuid":"s1","isSidechain":true,"agentId":"a9","sessionId":"c1","cwd":"/repo/tireless-ledger","message":{"role":"user","content":"Subagent brief for Claude parsing."}}`))
-	if err != nil || len(sub) != 1 || sub[0].Metadata.SessionID != "agent-a9" {
+	if err != nil || len(sub) != 1 || sub[0].Metadata.ContainerID != "agent-a9" {
 		t.Fatalf("subagent=%+v err=%v", sub, err)
 	}
 }
@@ -156,10 +156,10 @@ func TestParseRawSessionGrok(t *testing.T) {
 	if err != nil || len(items) != 2 {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
-	if m := items[0].Metadata; m.Harness != "grok" || m.SessionID != "g1" || m.ProjectName != "tireless-ledger" || m.Role != "user" || m.Timestamp != 1791311374 {
+	if m := items[0].Metadata; m.Source != "grok" || m.ContainerID != "g1" || m.Project != "tireless-ledger" || m.AuthorID != "user" || m.Timestamp != 1791311374 {
 		t.Fatalf("meta=%+v", m)
 	}
-	if items[0].ForwardContent != "Index Grok sessions too." || items[1].ForwardContent != "Adding a grok harness." || items[1].Metadata.Role != "assistant" {
+	if items[0].Text != "Index Grok sessions too." || items[1].Text != "Adding a grok harness." || items[1].Metadata.AuthorID != "assistant" {
 		t.Fatalf("items=%+v", items)
 	}
 }
@@ -174,10 +174,10 @@ func TestParseRawSessionGrokbot(t *testing.T) {
 	if err != nil || len(items) != 2 {
 		t.Fatalf("items=%+v err=%v", items, err)
 	}
-	if m := items[0].Metadata; m.Host != "grok-box" || m.Harness != "grokbot" || m.SessionID != "agent-1234abcd" || m.ProjectName != "pentagrok" || m.Role != "user" || m.Timestamp != 1791311374 {
+	if m := items[0].Metadata; m.Host != "grok-box" || m.Source != "grokbot" || m.ContainerID != "agent-1234abcd" || m.Project != "pentagrok" || m.AuthorID != "user" || m.Timestamp != 1791311374 {
 		t.Fatalf("meta=%+v", m)
 	}
-	if m := items[1].Metadata; m.Role != "assistant" || m.Timestamp != 1791311377 || items[1].ForwardContent != "Keys rotated, uploader restarted." {
+	if m := items[1].Metadata; m.AuthorID != "assistant" || m.Timestamp != 1791311377 || items[1].Text != "Keys rotated, uploader restarted." {
 		t.Fatalf("item=%+v", items[1])
 	}
 	omp, err := parseRawSessionForIndex("grok-box/omp/pentagrok-1234abcd.jsonl", body)

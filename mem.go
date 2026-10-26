@@ -11,20 +11,24 @@ import (
 // memStore is the pure-Go test store for memory://.
 // Enough for Mac smoke tests: L2 ANN + bag-of-words BM25-ish.
 type memStore struct {
-	mu    sync.RWMutex
-	dims  int
-	items map[string]MemoryItem
+	mu       sync.RWMutex
+	dims     int
+	messages map[string]MemoryItem
+	chunks   map[string]MemoryItem
 }
 
 func newMemStore(dims int) *memStore {
-	return &memStore{dims: dims, items: map[string]MemoryItem{}}
+	return &memStore{dims: dims, messages: map[string]MemoryItem{}, chunks: map[string]MemoryItem{}}
 }
 
-func (m *memStore) upsert(items []MemoryItem) {
+func (m *memStore) upsert(messages, chunks []MemoryItem) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, it := range items {
-		m.items[it.ID] = it
+	for _, it := range messages {
+		m.messages[it.ID] = it
+	}
+	for _, it := range chunks {
+		m.chunks[it.ID] = it
 	}
 }
 
@@ -41,50 +45,27 @@ func afterCursor(ts int64, id string, afterTS int64, afterID string) bool {
 	return ts == afterTS && id > afterID
 }
 
-func (m *memStore) bySession(sessionID, host, harness string, afterTS int64, afterID string, limit int) []queryResult {
+func (m *memStore) byContainer(containerID, host, source string, kinds map[string]bool, afterTS int64, afterID string, limit int) []queryResult {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]queryResult, 0)
-	for _, it := range m.items {
-		if it.Metadata.SessionID != sessionID {
-			continue
-		}
-		if it.Metadata.RecordKind != "" && it.Metadata.RecordKind != "message" {
+	for _, it := range m.messages {
+		if it.Metadata.ContainerID != containerID || !kinds[it.Metadata.Kind] {
 			continue
 		}
 		if host != "" && it.Metadata.Host != host {
 			continue
 		}
-		if harness != "" && it.Metadata.Harness != harness {
+		if source != "" && it.Metadata.Source != source {
 			continue
 		}
 		if !afterCursor(it.Metadata.Timestamp, it.ID, afterTS, afterID) {
 			continue
 		}
-		out = append(out, queryResult{
-			ID:             it.ID,
-			Score:          float64(it.Metadata.Timestamp),
-			ForwardContent: it.ForwardContent,
-			Metadata: map[string]interface{}{
-				"scope":        string(it.Metadata.Scope),
-				"project_name": it.Metadata.ProjectName,
-				"file_path":    it.Metadata.FilePath,
-				"file_hash":    it.Metadata.FileHash,
-				"timestamp":    it.Metadata.Timestamp,
-				"session_id":   it.Metadata.SessionID,
-				"host":         it.Metadata.Host,
-				"harness":      it.Metadata.Harness,
-				"role":         it.Metadata.Role,
-				"record_kind":  it.Metadata.RecordKind,
-				"parent_id":    it.Metadata.ParentID,
-				"chunk_index":  it.Metadata.ChunkIndex,
-				"chunk_count":  it.Metadata.ChunkCount,
-			},
-		})
+		out = append(out, queryResult{ID: it.ID, Score: float64(it.Metadata.Timestamp), Text: it.Text, Metadata: metadataMap(it.Metadata)})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		ti, _ := out[i].Metadata["timestamp"].(int64)
-		tj, _ := out[j].Metadata["timestamp"].(int64)
+		ti, tj := metaTS(out[i]), metaTS(out[j])
 		if ti == tj {
 			return out[i].ID < out[j].ID
 		}
@@ -104,8 +85,12 @@ func (m *memStore) search(req vectorSearchRequest) []queryResult {
 		score float64
 		item  MemoryItem
 	}
+	table := m.chunks
+	if req.Table == "messages" {
+		table = m.messages
+	}
 	hits := make([]scored, 0)
-	for id, it := range m.items {
+	for id, it := range table {
 		if !memMatch(it, req.Filter) {
 			continue
 		}
@@ -114,7 +99,7 @@ func (m *memStore) search(req vectorSearchRequest) []queryResult {
 		}
 		var score float64
 		if req.BM25 != nil {
-			score = bm25Score(req.BM25.Query, it.ForwardContent)
+			score = bm25Score(req.BM25.Query, it.Text)
 		} else if len(req.Vector) > 0 {
 			score = l2(req.Vector, it.Vector)
 		} else {
@@ -146,26 +131,7 @@ func (m *memStore) search(req vectorSearchRequest) []queryResult {
 	}
 	out := make([]queryResult, 0, len(hits))
 	for _, h := range hits {
-		out = append(out, queryResult{
-			ID:             h.id,
-			Score:          h.score,
-			ForwardContent: h.item.ForwardContent,
-			Metadata: map[string]interface{}{
-				"scope":        string(h.item.Metadata.Scope),
-				"project_name": h.item.Metadata.ProjectName,
-				"file_path":    h.item.Metadata.FilePath,
-				"file_hash":    h.item.Metadata.FileHash,
-				"timestamp":    h.item.Metadata.Timestamp,
-				"session_id":   h.item.Metadata.SessionID,
-				"host":         h.item.Metadata.Host,
-				"harness":      h.item.Metadata.Harness,
-				"role":         h.item.Metadata.Role,
-				"record_kind":  h.item.Metadata.RecordKind,
-				"parent_id":    h.item.Metadata.ParentID,
-				"chunk_index":  h.item.Metadata.ChunkIndex,
-				"chunk_count":  h.item.Metadata.ChunkCount,
-			},
-		})
+		out = append(out, queryResult{ID: h.id, Score: h.score, Text: h.item.Text, Metadata: metadataMap(h.item.Metadata)})
 	}
 	return out
 }
@@ -182,31 +148,11 @@ func memMatch(it MemoryItem, f *vectorFilter) bool {
 		}
 		return true
 	}
-	if f.Eq == nil {
+	if f.Eq == nil || !lanceStringFields[f.Eq.Field] {
 		return true
 	}
 	want, _ := f.Eq.Value.(string)
-	var got string
-	switch f.Eq.Field {
-	case "scope":
-		got = string(it.Metadata.Scope)
-	case "project_name":
-		got = it.Metadata.ProjectName
-	case "session_id":
-		got = it.Metadata.SessionID
-	case "host":
-		got = it.Metadata.Host
-	case "harness":
-		got = it.Metadata.Harness
-	case "role":
-		got = it.Metadata.Role
-	case "file_path":
-		got = it.Metadata.FilePath
-	case "record_kind":
-		got = it.Metadata.RecordKind
-	default:
-		return true
-	}
+	got, _ := metadataMap(it.Metadata)[f.Eq.Field].(string)
 	return got == want
 }
 

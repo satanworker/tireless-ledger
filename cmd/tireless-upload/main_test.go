@@ -15,10 +15,12 @@ func TestParseS3URL(t *testing.T) {
 	}
 }
 
-// -grokbot defaults to empty: the source must be skipped without touching S3.
+// -grokbot and -telegram default to empty: the source must be skipped without touching S3.
 func TestSyncTreeSkipsUnsetRoot(t *testing.T) {
-	scanned, uploaded, err := syncTree(context.Background(), nil, "bucket", "raw", "grok-box", "grokbot", "")
-	if scanned != 0 || uploaded != 0 || err != nil {
-		t.Fatalf("scanned=%d uploaded=%d err=%v", scanned, uploaded, err)
+	for _, harness := range []string{"grokbot", "telegram"} {
+		scanned, uploaded, err := syncTree(context.Background(), nil, "bucket", "raw", "grok-box", harness, "")
+		if scanned != 0 || uploaded != 0 || err != nil {
+			t.Fatalf("%s: scanned=%d uploaded=%d err=%v", harness, scanned, uploaded, err)
+		}
 	}
 }

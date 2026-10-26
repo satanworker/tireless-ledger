@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Generic record schema and Telegram (2026-10-26)
+
+- One schema for every source, so personal and Valantis deployments run the
+  same code: `source, host, container_id, container_kind, container_title,
+  project, author_id, author_name, kind, reply_to, timestamp, text, attrs,
+  content_hash`; chunks add `message_id, chunk_index, chunk_count, vector`.
+  Dropped: `scope`, `file_path`, `file_hash`, `parent_id`, `role`, `harness`,
+  `session_id`, `project_name`, `record_kind`, `forward_content`. Titles, todos
+  and tasks keep their `kind` in Lance instead of being stored as `message`.
+- IDs are readable and host-owned: `<host>/<source>/<container>/<native id>`,
+  chunks `<message id>#<i>` (were sha256 hashes).
+- HTTP API (clean cutover): `text` replaces `forward_content`; query filters
+  `source, host, container_id, container_kind, project, author_id, kind`;
+  `GET /v1/memory/container?container_id=` replaces `/v1/memory/session`.
+  Clients updated: `tireless` CLI (`query -container/-source/-kind`, `container`
+  subcommand), omp `tireless_recall`/`tireless_session`, `mac/` scripts.
+- Telegram: `cmd/tireless-telegram` (Telethon) exports every chat or an
+  allowlist to `<dir>/<chat_id>/<yyyy-mm>.jsonl`; `tireless-upload --telegram`
+  (`TIRELESS_TELEGRAM_DIR`) uploads it as `<host>/telegram/...`. Consecutive
+  DM/group messages within 10 minutes share one embedded window; channel posts
+  stand alone; a new or edited message re-embeds only its window.
+- `--migrate-from <v4 storage URL>` / `make migrate-generic` copies the v4
+  tables with their vectors and seeds the dedup state, so the raw re-scan
+  embeds nothing. Removed the legacy `turns` table mode, `--migrate-split`,
+  `PI_MEMORYD_SPLIT_TABLES` and `PI_MEMORYD_DUAL_WRITE_SPLIT`. Compose default
+  prefix is now `session-recall-lance-generic-v1`.
+
 ### Grok Bot harness (2026-10-12)
 
 - `tireless-upload --grokbot <dir>` (`TIRELESS_GROKBOT_SESSIONS`) mirrors Grok
