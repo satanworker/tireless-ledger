@@ -47,7 +47,7 @@ func main() {
 	}
 	args := fs.Args()
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "usage: tireless [-server] [-embed] [-host] <sync|watch|query|container>\n")
+		fmt.Fprintf(os.Stderr, "usage: tireless [-server] [-embed] [-host] <sync|watch|query|container|sessions>\n")
 		os.Exit(2)
 	}
 	cur, err := index.LoadCursor(*state)
@@ -123,8 +123,49 @@ func main() {
 		}
 		os.Stdout.Write(b)
 		fmt.Println()
+	case "sessions":
+		sf := flag.NewFlagSet("sessions", flag.ExitOnError)
+		since := sf.String("since", "24h", "window start: unix seconds, RFC3339, or a duration ago (24h)")
+		until := sf.String("until", "", "window end (exclusive), same forms; empty = now")
+		sHost := sf.String("host", "", "ingesting host")
+		sSource := sf.String("source", "", "source (pi, codex, omp, telegram, ...)")
+		project := sf.String("project", "", "project filter")
+		_ = sf.Parse(args[1:])
+		params := map[string]string{"host": *sHost, "source": *sSource, "project": *project}
+		for k, v := range map[string]string{"since": *since, "until": *until} {
+			if v == "" {
+				continue
+			}
+			ts, err := parseTime(v, time.Now())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "-%s: %v\n", k, err)
+				os.Exit(2)
+			}
+			params[k] = strconv.FormatInt(ts, 10)
+		}
+		b, err := cli.Sessions(params)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(b)
+		fmt.Println()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		os.Exit(2)
 	}
+}
+
+// parseTime reads unix seconds, RFC3339, or a duration before now (24h, 90m).
+func parseTime(s string, now time.Time) (int64, error) {
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.Unix(), nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return now.Add(-d).Unix(), nil
+	}
+	return 0, fmt.Errorf("%q is not unix seconds, RFC3339, or a duration", s)
 }

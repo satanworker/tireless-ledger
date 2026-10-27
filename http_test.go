@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -107,5 +108,46 @@ func TestIngestQueryContainerHTTP(t *testing.T) {
 	}
 	if len(qr.Results) != 1 || qr.Results[0].ID != "mac/pi/s1/a1" {
 		t.Fatalf("page2=%+v", qr.Results)
+	}
+}
+
+func TestSessionsWindow(t *testing.T) {
+	s := testServer()
+	msg := func(id, container, author string, ts int64, text string) MemoryItem {
+		return MemoryItem{ID: id, Text: text, Metadata: Metadata{Source: "omp", Host: "mac", ContainerID: container, Project: "p", AuthorID: author, Kind: "message", Timestamp: ts}}
+	}
+	title := msg("mac/omp/s1/title/t", "s1", "system", 150, "a title")
+	title.Metadata.Kind = "title"
+	s.mem.upsert([]MemoryItem{
+		msg("mac/omp/s1/u0", "s1", "user", 50, "before the window"),
+		msg("mac/omp/s1/a1", "s1", "assistant", 100, "assistant first"),
+		msg("mac/omp/s1/u1", "s1", "user", 120, "first user prompt in window"),
+		msg("mac/omp/s1/u2", "s1", "user", 130, "second user prompt"),
+		title,
+		msg("mac/omp/s2/u1", "s2", "user", 110, "other session"),
+		msg("mac/omp/s2/u2", "s2", "user", 200, "at until, excluded"),
+		{ID: "tg/1", Text: "chat line", Metadata: Metadata{Source: "telegram", Host: "tg", ContainerID: "c1", AuthorID: "42", Kind: "message", Timestamp: 140}},
+	}, nil)
+	get := func(query string) (int, []sessionSummary) {
+		rec := httptest.NewRecorder()
+		s.sessions(rec, httptest.NewRequest(http.MethodGet, "/v1/memory/sessions?"+query, nil))
+		var out struct{ Sessions []sessionSummary }
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out.Sessions
+	}
+	if code, _ := get("until=200"); code != http.StatusBadRequest {
+		t.Fatalf("missing since: status=%d", code)
+	}
+	_, got := get("since=100&until=200")
+	want := []sessionSummary{
+		{ContainerID: "s1", Host: "mac", Source: "omp", Project: "p", FirstTS: 100, LastTS: 130, Messages: 3, FirstPrompt: "first user prompt in window"},
+		{ContainerID: "s2", Host: "mac", Source: "omp", Project: "p", FirstTS: 110, LastTS: 110, Messages: 1, FirstPrompt: "other session"},
+		{ContainerID: "c1", Host: "tg", Source: "telegram", FirstTS: 140, LastTS: 140, Messages: 1, FirstPrompt: "chat line"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("sessions=%+v", got)
+	}
+	if _, got := get("since=100&source=telegram"); len(got) != 1 || got[0].ContainerID != "c1" {
+		t.Fatalf("source filter=%+v", got)
 	}
 }

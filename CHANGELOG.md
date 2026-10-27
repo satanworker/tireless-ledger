@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Time-ranged session listing (2026-10-27)
+
+- `GET /v1/memory/sessions?since=&until=&host=&source=&project=` lists every
+  container with messages in the window (counts, first/last timestamp, first user
+  prompt), for daily digests. CLI: `tireless sessions -since 24h` (also unix
+  seconds or RFC3339; `-until`, `-host`, `-source`, `-project`). Read-only; the
+  server needs a new `pi-memoryd` release.
+
 ### Telegram exporter package (2026-10-26)
 
 - `flake.nix` exports `tireless-telegram`: `cmd/tireless-telegram` with

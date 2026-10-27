@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -119,6 +120,8 @@ type vectorSearchRequest struct {
 	Filter  *vectorFilter `json:"filter,omitempty"`
 	AfterTS int64         `json:"after_ts,omitempty"`
 	AfterID string        `json:"after_id,omitempty"`
+	// BeforeTS > 0 keeps rows with timestamp < BeforeTS.
+	BeforeTS int64 `json:"-"`
 	// Collapse > 0 returns at most this many rows with distinct message_id, reading the
 	// output columns only for them (vector/text searches).
 	Collapse int `json:"-"`
@@ -345,6 +348,7 @@ func main() {
 	mux.HandleFunc("POST /v1/memory/ingest", s.ingest)
 	mux.HandleFunc("POST /v1/memory/query", s.query)
 	mux.HandleFunc("GET /v1/memory/container", s.containerWalk)
+	mux.HandleFunc("GET /v1/memory/sessions", s.sessions)
 	mux.HandleFunc("GET /v1/raw/status", s.rawStatus)
 
 	if cfg.RawURL != "" {
@@ -636,6 +640,75 @@ func (s *server) containerWalk(w http.ResponseWriter, r *http.Request) {
 		hits = hits[:limit]
 	}
 	writeJSON(w, http.StatusOK, queryResponse{Results: hits})
+}
+
+type sessionSummary struct {
+	ContainerID    string `json:"container_id"`
+	ContainerTitle string `json:"container_title,omitempty"`
+	Host           string `json:"host"`
+	Source         string `json:"source"`
+	Project        string `json:"project,omitempty"`
+	FirstTS        int64  `json:"first_ts"`
+	LastTS         int64  `json:"last_ts"`
+	Messages       int    `json:"messages"`
+	FirstPrompt    string `json:"first_prompt"`
+}
+
+// sessions lists every container with messages in [since, until), oldest first, with its
+// message count in the window and its first user message there (first message for chats).
+// ponytail: reads every message row of the window, text included; for multi-week windows
+// read text only for the chosen first prompts.
+func (s *server) sessions(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	since, _ := strconv.ParseInt(q.Get("since"), 10, 64)
+	until, _ := strconv.ParseInt(q.Get("until"), 10, 64)
+	if since <= 0 {
+		errorJSON(w, http.StatusBadRequest, errors.New("since (unix seconds) required"))
+		return
+	}
+	hits, err := s.runSearch(r.Context(), vectorSearchRequest{
+		Table:    "messages",
+		K:        math.MaxInt32,
+		Filter:   eqFilters("kind", "message", "host", q.Get("host"), "source", q.Get("source"), "project", q.Get("project")),
+		AfterTS:  since,
+		BeforeTS: until,
+	})
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		errorJSON(w, status, err)
+		return
+	}
+	out := make([]*sessionSummary, 0)
+	byKey := map[string]*sessionSummary{}
+	userPrompt := map[*sessionSummary]bool{}
+	for _, h := range hits { // timestamp order
+		str := func(k string) string { v, _ := h.Metadata[k].(string); return v }
+		key := str("host") + "/" + str("source") + "/" + str("container_id")
+		sum := byKey[key]
+		if sum == nil {
+			sum = &sessionSummary{ContainerID: str("container_id"), ContainerTitle: str("container_title"), Host: str("host"),
+				Source: str("source"), Project: str("project"), FirstTS: metaTS(h)}
+			byKey[key] = sum
+			out = append(out, sum)
+		}
+		sum.LastTS = metaTS(h)
+		sum.Messages++
+		if isUser := str("author_id") == "user"; sum.FirstPrompt == "" || isUser && !userPrompt[sum] {
+			sum.FirstPrompt = clipRunes(h.Text, 300)
+			userPrompt[sum] = isUser
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": out})
+}
+
+func clipRunes(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
 }
 
 func containerIncludeKinds(include string) (map[string]bool, bool) {

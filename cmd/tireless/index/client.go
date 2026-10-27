@@ -210,7 +210,17 @@ func (c *Client) Query(text string, embed bool, filters map[string]string, limit
 
 // Container walks one container. params: container_id, host, source, after_ts, after_id, include (empty = unset).
 func (c *Client) Container(params map[string]string, limit int) (json.RawMessage, error) {
-	u, err := url.Parse(c.Server + "/v1/memory/container")
+	params["limit"] = strconv.Itoa(limit)
+	return c.get("/v1/memory/container", params)
+}
+
+// Sessions lists containers active in a window. params: since, until (unix seconds), host, source, project.
+func (c *Client) Sessions(params map[string]string) (json.RawMessage, error) {
+	return c.get("/v1/memory/sessions", params)
+}
+
+func (c *Client) get(path string, params map[string]string) (json.RawMessage, error) {
+	u, err := url.Parse(c.Server + path)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +230,6 @@ func (c *Client) Container(params map[string]string, limit int) (json.RawMessage
 			q.Set(k, v)
 		}
 	}
-	q.Set("limit", strconv.Itoa(limit))
 	u.RawQuery = q.Encode()
 	resp, err := c.HTTP.Get(u.String())
 	if err != nil {

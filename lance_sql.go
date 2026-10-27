@@ -51,6 +51,13 @@ func lanceCursorSQL(afterTS int64, afterID string) string {
 	}
 }
 
+func lanceBeforeSQL(beforeTS int64) string {
+	if beforeTS <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("timestamp < %d", beforeTS)
+}
+
 func lanceCombineSQL(parts ...string) string {
 	nonempty := make([]string, 0, len(parts))
 	for _, part := range parts {

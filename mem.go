@@ -97,6 +97,9 @@ func (m *memStore) search(req vectorSearchRequest) []queryResult {
 		if !afterCursor(it.Metadata.Timestamp, id, req.AfterTS, req.AfterID) {
 			continue
 		}
+		if req.BeforeTS > 0 && it.Metadata.Timestamp >= req.BeforeTS {
+			continue
+		}
 		var score float64
 		if req.BM25 != nil {
 			score = bm25Score(req.BM25.Query, it.Text)

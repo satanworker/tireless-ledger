@@ -482,7 +482,7 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	if limit <= 0 {
 		limit = 10
 	}
-	where := lanceCombineSQL(lanceFilterSQL(req.Filter), lanceCursorSQL(req.AfterTS, req.AfterID))
+	where := lanceCombineSQL(lanceFilterSQL(req.Filter), lanceCursorSQL(req.AfterTS, req.AfterID), lanceBeforeSQL(req.BeforeTS))
 	config := contracts.QueryConfig{Columns: columns, Where: where}
 	hasVector := len(req.Vector) > 0
 	hasText := req.BM25 != nil && strings.TrimSpace(req.BM25.Query) != ""
