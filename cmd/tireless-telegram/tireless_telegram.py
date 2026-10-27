@@ -206,6 +206,8 @@ def main():
         datetime.datetime.strptime(args.since, "%Y-%m-%d")
     for k in ("session", "out", "state"):
         setattr(args, k, os.path.expanduser(getattr(args, k)))
+    # The session file is a full account login; exports are private messages.
+    os.umask(0o077)
     asyncio.run(run(args))
 
 
