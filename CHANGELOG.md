@@ -7,6 +7,8 @@
 - `flake.nix` exports `tireless-telegram`: `cmd/tireless-telegram` with
   Python + Telethon, so hosts run the exporter from the flake input instead of
   a host-side `telethon-python` wrapper. home-satan runs it on a timer.
+- Lance container walk: a timestamp-only cursor (`after_ts` without `after_id`)
+  is inclusive, like the raw walk, so walking from a hit's ts starts at the hit.
 
 ### Fix: v4 migration duplicated messages (2026-10-26)
 

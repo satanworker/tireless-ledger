@@ -30,7 +30,7 @@ func TestLanceCursorSQL(t *testing.T) {
 	}{
 		{0, "", ""},
 		{0, "a", "id > 'a'"},
-		{10, "", "timestamp > 10"},
+		{10, "", "timestamp >= 10"}, // must match afterCursor: walking from a hit's ts includes the hit
 		{10, "a'b", "(timestamp > 10 OR (timestamp = 10 AND id > 'a''b'))"},
 	}
 	for _, tc := range cases {

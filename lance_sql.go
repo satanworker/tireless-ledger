@@ -43,7 +43,9 @@ func lanceCursorSQL(afterTS int64, afterID string) string {
 	case afterTS <= 0:
 		return "id > " + lanceQuote(afterID)
 	case afterID == "":
-		return fmt.Sprintf("timestamp > %d", afterTS)
+		// Same as afterCursor: a timestamp-only cursor includes that second, so walking
+		// from a hit's ts starts at the hit.
+		return fmt.Sprintf("timestamp >= %d", afterTS)
 	default:
 		return fmt.Sprintf("(timestamp > %d OR (timestamp = %d AND id > %s))", afterTS, afterTS, lanceQuote(afterID))
 	}
