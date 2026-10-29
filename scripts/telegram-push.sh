@@ -71,7 +71,8 @@ run() {
   fi
   nix run "$FLAKE#tireless-telegram" -- \
     --chats "$CONF/chats" --types dm,group,topic --since 2026-09-26
-  rsync -a --exclude '*.tmp' \
+  # GNU rsync from Nix: macOS's /usr/bin/rsync is openrsync.
+  nix run nixpkgs#rsync -- -a --exclude '*.tmp' \
     -e "ssh -i $KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
     "$STATE/export/" "tg-$PUSH_NAME@$PUSH_SERVER:"
 }

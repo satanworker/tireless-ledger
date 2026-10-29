@@ -253,6 +253,8 @@ uploaded. Each append-only file is one bot in the Pi session format: a
 the slug is the project. Records keep the `grokbot` harness, so their IDs never
 collide with Pi or OMP rows.
 
+Teammates push their own chats from a Mac with `scripts/telegram-push.sh`; see [docs/telegram-push.md](docs/telegram-push.md).
+
 The `telegram` tree holds exports written by `cmd/tireless-telegram` (Telethon; the `tireless-telegram` flake package). It is off unless `tireless-upload --telegram <dir>` / `TIRELESS_TELEGRAM_DIR` names the export directory, uploaded as `<host>/telegram/<chat_id>/<yyyy-mm>.jsonl`. Each line is one message version:
 
 ```json
