@@ -22,21 +22,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential clang cmake git libprotobuf-dev libssl-dev pkg-config protobuf-compiler \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=lance-src /opt/lancedb-go /opt/lancedb-go
+# One job keeps the default 3 GB buildx builder alive; raise it on a big host.
+ARG CARGO_BUILD_JOBS=1
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/opt/lancedb-go/rust/target \
-    CARGO_BUILD_JOBS=1 cargo build --manifest-path /opt/lancedb-go/rust/Cargo.toml --release --features aws,remote \
+    cargo build --manifest-path /opt/lancedb-go/rust/Cargo.toml --release --features aws,remote \
   && mkdir -p /out \
   && cp /opt/lancedb-go/rust/target/release/liblancedb_go.a /out/
 
 FROM scratch AS lance-artifact
 COPY --from=lance-build /out/liblancedb_go.a /liblancedb_go.a
 
-# Published output of `make lance-lib` for the pins above. Override locally with
+# Published outputs of `make lance-lib` for the pins above, one per
+# architecture. Override locally with
 # --build-context lance-lib=<dir containing liblancedb_go.a>.
-FROM scratch AS lance-lib
+FROM scratch AS lance-lib-arm64
 ADD --checksum=sha256:5b02d03d9b52e53868741e03faf3741201a9c93bfbb16b208ed33612e65c286f \
     https://github.com/satanworker/tireless-ledger/releases/download/lance-lib-0.40.0-r1/liblancedb_go-linux-arm64.a \
     /liblancedb_go.a
+
+FROM scratch AS lance-lib-amd64
+ADD --checksum=sha256:1e260684b645ac74936f3ff9114f81f98588077882c92131684b04ec542ba93a \
+    https://github.com/satanworker/tireless-ledger/releases/download/lance-lib-0.40.0-r1/liblancedb_go-linux-amd64.a \
+    /liblancedb_go.a
+
+FROM lance-lib-${TARGETARCH} AS lance-lib
 
 FROM golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac AS go-build
 WORKDIR /src
@@ -44,16 +54,18 @@ COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 COPY --from=lance-src /opt/lancedb-go /opt/lancedb-go
-COPY --from=lance-lib /liblancedb_go.a /opt/lancedb-go/lib/linux_arm64/liblancedb_go.a
+ARG TARGETARCH
+COPY --from=lance-lib /liblancedb_go.a /opt/lancedb-go/lib/linux_${TARGETARCH}/liblancedb_go.a
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go mod edit -replace github.com/lancedb/lancedb-go=/opt/lancedb-go \
-  && GOMAXPROCS=1 CGO_ENABLED=1 CGO_LDFLAGS='/opt/lancedb-go/lib/linux_arm64/liblancedb_go.a -lm -ldl -lpthread' \
+  && GOMAXPROCS=1 CGO_ENABLED=1 CGO_LDFLAGS="/opt/lancedb-go/lib/linux_${TARGETARCH}/liblancedb_go.a -lm -ldl -lpthread" \
      go build -trimpath -ldflags='-s -w' -o /out/pi-memoryd .
 
 FROM scratch AS release-artifact
-COPY --from=go-build /out/pi-memoryd /pi-memoryd-linux-arm64
+ARG TARGETARCH
+COPY --from=go-build /out/pi-memoryd /pi-memoryd-linux-${TARGETARCH}
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
