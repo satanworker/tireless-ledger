@@ -21,7 +21,7 @@ GOARCH         ?= $(shell go env GOARCH)
 	docker-build up down doctor recall-local embed-local mac-test \
 	install-startup-service install-optimize-timer install-server-uploader install-upload-timer \
 	build-uploader install-uploader-bin install-mac-uploader install-raw-uploader \
-	fragment-counts migrate-generic buildx-builder lance-lib release-linux
+	fragment-counts migrate-generic buildx-builder lance-lib release-linux release-cli
 
 all: build
 
@@ -57,6 +57,17 @@ release-linux: buildx-builder
 		-o $(BIN_DIR)/tireless-upload-linux-arm64 ./cmd/tireless-upload
 	docker buildx stop $(BUILDX_BUILDER) >/dev/null
 	cd $(BIN_DIR) && sha256sum pi-memoryd-linux-arm64 tireless-upload-linux-arm64
+
+## Recall CLI for machines without Nix: one static binary per platform, skill embedded.
+## Attach to every GitHub release so .../releases/latest/download/tireless-<os>-<arch> works.
+CLI_PLATFORMS ?= darwin/arm64 darwin/amd64 linux/amd64 linux/arm64
+release-cli:
+	@mkdir -p $(BIN_DIR)
+	for p in $(CLI_PLATFORMS); do \
+		CGO_ENABLED=0 GOOS=$${p%/*} GOARCH=$${p#*/} go build $(GO_FLAGS) -ldflags='$(GO_LDFLAGS)' \
+			-o $(BIN_DIR)/tireless-$${p%/*}-$${p#*/} ./cmd/tireless || exit 1; \
+	done
+	cd $(BIN_DIR) && shasum -a 256 tireless-darwin-* tireless-linux-amd64 tireless-linux-arm64
 
 ## Slow, one-off: rebuild the patched Lance static library. Needed only when
 ## LANCEDB_GO_COMMIT or docker/lancedb-go-* change. Publish the result as a

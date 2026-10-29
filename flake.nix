@@ -27,5 +27,34 @@
           exec ${pkgs.python3.withPackages (ps: [ ps.telethon ])}/bin/python3 ${./cmd/tireless-telegram/tireless_telegram.py} "$@"
         '';
       });
+
+      # Recall CLI, its stores file and the agent skill (~/.agents/skills: omp, Codex, Pi;
+      # ~/.claude/skills: Claude Code). Machines without Nix get the same from `tireless init`.
+      homeManagerModules.default = { config, lib, pkgs, ... }:
+        let cfg = config.programs.tireless; in
+        {
+          options.programs.tireless = {
+            enable = lib.mkEnableOption "the tireless recall CLI and its agent skill";
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.tireless;
+              description = "The `tireless` command the skill calls.";
+            };
+            stores = lib.mkOption {
+              type = lib.types.attrsOf lib.types.str;
+              default = { };
+              example = { personal = "100.127.82.49"; valantis = "100.97.80.65"; };
+              description = "Store name -> host; the server is host:8090 and its embedder host:8091.";
+            };
+          };
+          config = lib.mkIf cfg.enable {
+            home.packages = [ cfg.package ];
+            xdg.configFile."tireless/stores" = lib.mkIf (cfg.stores != { }) {
+              text = lib.concatStrings (lib.mapAttrsToList (name: host: "${name} http://${host}:8090 http://${host}:8091\n") cfg.stores);
+            };
+            home.file.".agents/skills/tireless-recall".source = ./cmd/tireless/skill;
+            home.file.".claude/skills/tireless-recall".source = ./cmd/tireless/skill;
+          };
+        };
     };
 }

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Multi-store recall CLI and shared skill (2026-10-29)
+
+- `tireless` reads named stores from `~/.config/tireless/stores` (`tireless init
+  personal=HOST valantis=HOST`; server `:8090`, embedder `:8091`). `query`,
+  `container` and `sessions` ask every store in parallel (or `-store NAME`),
+  label each item with its store and alternate query hits by rank. A failing
+  store is reported on stderr; the rest still answer. `sync`/`watch` need
+  `-store` when several are configured. No stores file = previous behaviour.
+- Output is the compact agent digest (what the omp extension and grok-box jq
+  used to render); `-json` keeps raw JSON. Query words no longer need quoting.
+- The agent skill lives in `cmd/tireless/skill/SKILL.md`, is embedded in the
+  binary (`tireless init` installs it into `~/.agents/skills` and
+  `~/.claude/skills`) and is exported with the CLI by the flake's
+  `homeManagerModules.default` (`programs.tireless.{enable,stores,package}`).
+- `make release-cli` builds `tireless-{darwin,linux}-{arm64,amd64}` for
+  machines without Nix.
+
 ### Time-ranged session listing (2026-10-27)
 
 - `GET /v1/memory/sessions?since=&until=&host=&source=&project=` lists every

@@ -24,9 +24,39 @@ session directories; it only ingests objects that an uploader has copied to R2.
 
 ## Nix packages
 
-This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI used by the omp `tireless_recall` tools and grok-box), `packages.<system>.tireless-upload` and `packages.<system>.tireless-telegram` (the Telethon exporter) for Linux and macOS. Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `pi-memoryd` itself links the patched Lance library, so it ships as the `release-linux` binary. When `go.mod`/`go.sum` change, update `vendorHash` in `flake.nix`.
+This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI), `packages.<system>.tireless-upload` and `packages.<system>.tireless-telegram` (the Telethon exporter) for Linux and macOS, plus `homeManagerModules.default` (below). Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `pi-memoryd` itself links the patched Lance library, so it ships as the `release-linux` binary. When `go.mod`/`go.sum` change, update `vendorHash` in `flake.nix`.
 
 The live derived recall store defaults to `s3://<bucket>/session-recall-lance-generic-v2/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
+
+## Recall CLI and skill
+
+`tireless` searches one or more stores (deployments) at once. A store is a name and a host whose `pi-memoryd` listens on `:8090` and whose embedder listens on `:8091`; each query is embedded by the store it searches. Hits from several stores alternate by rank, because scores are rank-fusion values computed within one store.
+
+The agent skill ([`cmd/tireless/skill/SKILL.md`](cmd/tireless/skill/SKILL.md)) is the only harness glue: it tells any Agent Skills harness (omp, Claude Code, Codex, Pi) to run `tireless` in a shell, so there are no per-harness tools.
+
+Without Nix, download the binary for your machine (`tireless-darwin-arm64`, `-darwin-amd64`, `-linux-amd64`, `-linux-arm64`) and run `init`, which writes `~/.config/tireless/stores` and installs the skill into `~/.agents/skills` and `~/.claude/skills`:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/tireless https://github.com/satanworker/tireless-ledger/releases/latest/download/tireless-darwin-arm64
+chmod +x ~/.local/bin/tireless
+tireless init valantis=100.97.80.65   # several stores: personal=100.127.82.49 valantis=100.97.80.65
+tireless query "staking discount"
+```
+
+With Home Manager, import `tireless-ledger.homeManagerModules.default` and set `programs.tireless = { enable = true; stores.valantis = "100.97.80.65"; };`. `package` replaces the binary (grok-box uses an ssh wrapper).
+
+| Command | Does |
+|---|---|
+| `tireless init NAME=HOST …` | Write the stores file and install the skill |
+| `tireless stores` | List configured stores |
+| `tireless query [-store S] [-limit N] [-project P] [-source S] [-kind K] [-container ID] <words…>` | Search every store (or one) |
+| `tireless container [-store S] [-after-ts TS] [-limit N] <container_id>` | Walk a session or chat from a hit |
+| `tireless sessions [-store S] [-since 24h] [-until …] [-host H] [-source S] [-project P]` | Sessions and chats active in a window |
+
+Output is a compact digest for agents; `-json` prints `{"results": [...]}` / `{"sessions": [...]}` with a `store` field on every item. A store that fails is reported on stderr while the others answer; the command fails only when every store does. Without a stores file, or with `-server`/`-embed`, the CLI uses one store from `TIRELESS_SERVER`/`TIRELESS_EMBED` (default localhost). `sync`/`watch` write, so with several stores they need `-store`.
+
+Every GitHub release attaches the CLI binaries from `make release-cli`, so `releases/latest/download/tireless-<os>-<arch>` always resolves.
 
 ## Record schema
 
