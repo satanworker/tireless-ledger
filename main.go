@@ -83,6 +83,9 @@ type ingestResponse struct {
 	Errors   []string `json:"errors,omitempty"`
 }
 
+// maxQueryRunes keeps an embedded query inside the model's context window.
+const maxQueryRunes = 2000
+
 type queryRequest struct {
 	QueryVector   []float32 `json:"query_vector,omitempty"`
 	QueryText     string    `json:"query_text,omitempty"`
@@ -94,6 +97,9 @@ type queryRequest struct {
 	AuthorID      string    `json:"author_id,omitempty"`
 	Kind          string    `json:"kind,omitempty"`
 	Limit         int       `json:"limit"`
+	// Embed asks the server to embed query_text with its own model. Unset keeps the old
+	// contract: a client vector is used, and no vector means BM25 only.
+	Embed *bool `json:"embed,omitempty"`
 }
 
 type queryResult struct {
@@ -152,6 +158,20 @@ type server struct {
 	lance      lanceStore
 	readyCheck func(context.Context) error
 	raw        *rawIngestor
+	embedHTTP  *http.Client
+}
+
+// indexer embeds and writes records. It needs only the server and an HTTP client, so
+// text pushes and query embedding work without a raw bucket.
+func (s *server) indexer() *rawIngestor {
+	if s.raw != nil {
+		return s.raw
+	}
+	client := s.embedHTTP
+	if client == nil {
+		client = &http.Client{Timeout: 2 * time.Minute}
+	}
+	return &rawIngestor{server: s, http: client}
 }
 
 type runtimeConfig struct {
@@ -180,6 +200,9 @@ type runtimeConfig struct {
 	RawMaxObjectBytes int64
 	EmbedURL          string
 	EmbedBatchSize    int
+	QueryPrefix       string
+	DocPrefix         string
+	ChunkTokens       int
 }
 
 type duplicateAudit struct {
@@ -224,6 +247,7 @@ func main() {
 		cfg:        cfg,
 		dedup:      state,
 		querySlots: make(chan struct{}, cfg.MaxConcurrent),
+		embedHTTP:  &http.Client{Timeout: 2 * time.Minute},
 	}
 	if local {
 		s.mem = newMemStore(cfg.Dimensions)
@@ -395,6 +419,9 @@ func loadConfig() runtimeConfig {
 	flag.Int64Var(&cfg.RawMaxObjectBytes, "raw-max-object-bytes", envInt64("PI_MEMORYD_RAW_MAX_OBJECT_BYTES", 128<<20), "largest raw object accepted")
 	flag.StringVar(&cfg.EmbedURL, "embed-url", env("PI_MEMORYD_EMBED_URL", "http://llama-embed:8091"), "OpenAI-compatible embedding server")
 	flag.IntVar(&cfg.EmbedBatchSize, "embed-batch-size", envInt("PI_MEMORYD_EMBED_BATCH_SIZE", 32), "texts per embedding request")
+	flag.StringVar(&cfg.QueryPrefix, "query-prefix", env("PI_MEMORYD_QUERY_PREFIX", "Represent this sentence for searching relevant passages: "), "instruction the embedding model expects before a query (default: bge v1.5)")
+	flag.StringVar(&cfg.DocPrefix, "doc-prefix", env("PI_MEMORYD_DOC_PREFIX", ""), "instruction the embedding model expects before a document")
+	flag.IntVar(&cfg.ChunkTokens, "chunk-tokens", envInt("PI_MEMORYD_CHUNK_TOKENS", embedChunkTokens), "tokens per embedded chunk, header included")
 	flag.Parse()
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 1
@@ -441,7 +468,7 @@ func (s *server) ready(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ready", "query_embed": s.cfg.EmbedURL != "", "dimensions": s.cfg.Dimensions})
 }
 
 func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
@@ -454,15 +481,26 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
 	messages := make([]MemoryItem, 0, len(req.Records))
 	chunks := make([]MemoryItem, 0, len(req.Records))
 	pending := make(map[string]string, len(req.Records))
+	var textOnly []MemoryItem
 	for i, rec := range req.Records {
-		if err := validateMemoryItem(rec, s.cfg.Dimensions); err != nil {
+		// A record without a vector is embedded here, as a contextual unit like raw ingest.
+		embedHere := len(rec.Vector) == 0 && s.cfg.EmbedURL != ""
+		dims := s.cfg.Dimensions
+		if embedHere {
+			dims = 0
+		}
+		if err := validateMemoryItem(rec, dims); err != nil {
 			resp.Errors = append(resp.Errors, fmt.Sprintf("records[%d]: %v", i, err))
 			continue
 		}
-		rec.Metadata.ContentHash = hashText(rec.Text)
 		if rec.Metadata.Kind == "" {
 			rec.Metadata.Kind = "message"
 		}
+		if embedHere {
+			textOnly = append(textOnly, rec)
+			continue
+		}
+		rec.Metadata.ContentHash = hashText(rec.Text)
 		rec.Metadata.MessageID, rec.Metadata.ChunkIndex = "", 0
 		if s.dedup.Seen(rec.ID, rec.Metadata.ContentHash) {
 			resp.Skipped++
@@ -492,6 +530,17 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Accepted = len(messages)
+	if len(textOnly) > 0 {
+		groups := chunkGroups(textOnly, func(item MemoryItem, hash string) bool { return !s.dedup.Seen(item.ID, hash) })
+		resp.Skipped += len(textOnly) - len(groups)
+		written, err := s.indexer().indexGroups(r.Context(), groups, func(m MemoryItem) string { return m.ID })
+		if err != nil {
+			resp.Errors = append(resp.Errors, err.Error())
+			writeJSON(w, http.StatusBadGateway, resp)
+			return
+		}
+		resp.Accepted += written
+	}
 	status := http.StatusAccepted
 	if len(resp.Errors) > 0 && resp.Accepted == 0 {
 		status = http.StatusBadRequest
@@ -504,6 +553,20 @@ func (s *server) query(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(r, &req); err != nil {
 		errorJSON(w, http.StatusBadRequest, err)
 		return
+	}
+	if req.Embed != nil && !*req.Embed {
+		req.QueryVector = nil
+	}
+	// The server embeds when asked, and replaces a vector from another model (a client
+	// built for an older store); clients then need not know the model.
+	staleVector := req.Embed == nil && len(req.QueryVector) > 0 && len(req.QueryVector) != s.cfg.Dimensions
+	if strings.TrimSpace(req.QueryText) != "" && s.cfg.EmbedURL != "" && (req.Embed != nil && *req.Embed || staleVector) {
+		vectors, err := s.indexer().embedTexts(r.Context(), []string{clipRunes(req.QueryText, maxQueryRunes)}, s.cfg.QueryPrefix)
+		if err != nil {
+			errorJSON(w, http.StatusBadGateway, fmt.Errorf("embed query: %w", err))
+			return
+		}
+		req.QueryVector = vectors[0]
 	}
 	hasVec := len(req.QueryVector) > 0
 	hasText := strings.TrimSpace(req.QueryText) != ""
@@ -844,16 +907,32 @@ func appendFilter(base *vectorFilter, extra vectorFilter) *vectorFilter {
 
 func collapseChunkHits(hits []queryResult, limit int) []queryResult {
 	seen := make(map[string]bool, len(hits))
+	bodies := make(map[string]bool, len(hits))
+	moments := map[string][]int64{}
 	out := make([]queryResult, 0, len(hits))
 	for _, hit := range hits {
 		parent, _ := hit.Metadata["message_id"].(string)
 		if parent == "" {
 			parent = hit.ID
 		}
-		if seen[parent] {
+		// A chunk's content_hash covers its body: the same prompt or message indexed
+		// in several sessions shows once, at its best rank.
+		body, _ := hit.Metadata["content_hash"].(string)
+		if seen[parent] || body != "" && bodies[body] {
 			continue
 		}
-		seen[parent] = true
+		// Telegram units quote the lines before them, so neighbours match together:
+		// keep one hit per chat moment (the container walk shows the rest).
+		source, _ := hit.Metadata["source"].(string)
+		container, _ := hit.Metadata["container_id"].(string)
+		ts := metaTS(hit)
+		if source == "telegram" && nearMoment(moments[container], ts) {
+			continue
+		}
+		if source == "telegram" {
+			moments[container] = append(moments[container], ts)
+		}
+		seen[parent], bodies[body] = true, body != ""
 		hit.Metadata["matched_chunk_id"] = hit.ID
 		hit.ID = parent
 		out = append(out, hit)
@@ -862,6 +941,15 @@ func collapseChunkHits(hits []queryResult, limit int) []queryResult {
 		}
 	}
 	return out
+}
+
+func nearMoment(kept []int64, ts int64) bool {
+	for _, k := range kept {
+		if k-ts <= telegramLeadGap && ts-k <= telegramLeadGap {
+			return true
+		}
+	}
+	return false
 }
 
 func rrfMerge(a, b []queryResult, limit int) []queryResult {
@@ -928,7 +1016,7 @@ func validateMemoryItem(item MemoryItem, dims int) error {
 	if item.ID == "" {
 		return errors.New("id required")
 	}
-	if len(item.Vector) != dims {
+	if dims > 0 && len(item.Vector) != dims {
 		return fmt.Errorf("vector dimensions=%d want=%d", len(item.Vector), dims)
 	}
 	if item.Text == "" {

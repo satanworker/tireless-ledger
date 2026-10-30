@@ -108,7 +108,7 @@ func TestParseRawClaudeSession(t *testing.T) {
 {"type":"user","uuid":"m0","isMeta":true,"timestamp":"2026-09-30T10:00:00Z","cwd":"/repo/tireless-ledger","sessionId":"c1","message":{"role":"user","content":"<local-command-caveat>Caveat: ignore</local-command-caveat>"}}
 {"type":"user","uuid":"u1","timestamp":"2026-09-30T10:00:01Z","cwd":"/repo/tireless-ledger","sessionId":"c1","message":{"role":"user","content":"Index Claude sessions too."}}
 {"type":"assistant","uuid":"a1","timestamp":"2026-09-30T10:00:02Z","sessionId":"c1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private"},{"type":"text","text":"Adding a claude harness."}]}}
-{"type":"assistant","uuid":"a2","timestamp":"2026-09-30T10:00:03Z","sessionId":"c1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-todo","name":"TodoWrite","input":{"todos":[{"content":"Parse Claude JSONL","status":"in_progress"}]}},{"type":"tool_use","id":"t-sync","name":"Agent","input":{}},{"type":"tool_use","id":"t-async","name":"Agent","input":{}},{"type":"tool_use","id":"t-bash","name":"Bash","input":{}}]}}
+{"type":"assistant","uuid":"a2","timestamp":"2026-09-30T10:00:03Z","sessionId":"c1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-todo","name":"TodoWrite","input":{"todos":[{"content":"Parse Claude JSONL","status":"in_progress"}]}},{"type":"tool_use","id":"t-sync","name":"Agent","input":{}},{"type":"tool_use","id":"t-async","name":"Agent","input":{}},{"type":"tool_use","id":"t-bash","name":"Bash","input":{"command":"go test ./...","description":"Run the tests"}},{"type":"tool_use","id":"t-bare","name":"Bash","input":{"command":"cat >> notes.md <<'EOF'"}}]}}
 {"type":"user","uuid":"r1","timestamp":"2026-09-30T10:00:04Z","sessionId":"c1","toolUseResult":{"status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-sync","content":[{"type":"text","text":"Subagent found the uploader roots."}]}]}}
 {"type":"user","uuid":"r2","timestamp":"2026-09-30T10:00:05Z","sessionId":"c1","toolUseResult":{"isAsync":true},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-async","content":"Async agent launched successfully."}]}}
 {"type":"user","uuid":"r3","timestamp":"2026-09-30T10:00:06Z","sessionId":"c1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-bash","content":"bash output"}]}}
@@ -137,6 +137,9 @@ func TestParseRawClaudeSession(t *testing.T) {
 	}
 	if len(got["task"]) != 1 || !strings.Contains(got["task"][0], "Subagent found the uploader roots.") {
 		t.Fatalf("tasks=%q", got["task"])
+	}
+	if len(got["tool"]) != 1 || got["tool"][0] != "Ran: Run the tests\n$ go test ./..." {
+		t.Fatalf("tools=%q", got["tool"])
 	}
 
 	sub, err := parseRawSession("home-satan/claude/-repo-tireless-ledger/c1/subagents/agent-a9.jsonl", []byte(`{"type":"user","uuid":"s1","isSidechain":true,"agentId":"a9","sessionId":"c1","cwd":"/repo/tireless-ledger","message":{"role":"user","content":"Subagent brief for Claude parsing."}}`))
@@ -203,5 +206,15 @@ func TestRawObjectIdentityRejectsUnknownFiles(t *testing.T) {
 	}
 	if host, harness, ok := rawObjectIdentity("grok-box/grokbot/pentagrok-1234abcd.jsonl"); !ok || host != "grok-box" || harness != "grokbot" {
 		t.Fatalf("host=%q harness=%q ok=%v", host, harness, ok)
+	}
+}
+
+func TestParseRawSkipsCRMSummarizerSession(t *testing.T) {
+	body := []byte(`{"type":"user","uuid":"u1","cwd":"/repo/x","sessionId":"s1","message":{"role":"user","content":"Summarize the relationship with \"Borsa\" from these Telegram chats (Valantis | Borsa) for a CRM page."}}
+{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"role":"assistant","content":[{"type":"text","text":"STATUS: closed"}]}}
+`)
+	items, err := parseRawSessionForIndex("imp-home/claude/-repo-x/s1.jsonl", body)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("items=%+v err=%v", items, err)
 	}
 }

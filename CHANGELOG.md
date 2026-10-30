@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Contextual recall (2026-10-30)
+
+- Every record is embedded as a header + body unit (`context.go`): chat or session
+  title, project, author; Telegram messages with up to two earlier lines and the
+  replied-to line instead of 1,200-character windows; agent answers with the prompt
+  they answer. Long messages repeat the header on every chunk.
+- Claude Code Bash calls with a description are indexed as `kind=tool`; bb CRM summarizer sessions
+  are skipped. `POST /v1/memory/ingest` embeds records sent without a vector, so
+  the CRM pushes company notes and summaries as plain text (`source=crm`).
+- The server embeds queries (`"embed": true`, advertised by `/-/ready`) and
+  replaces wrong-size client vectors; the CLI uses it when offered. The model is
+  configuration: `PI_MEMORYD_QUERY_PREFIX`, `_DOC_PREFIX`, `_CHUNK_TOKENS`.
+- Results drop chunks whose body repeats a better hit and keep one Telegram hit
+  per chat per 10 minutes.
+- Parser version `contextual-v1`: a store re-derives every object.
+- The flake builds `pi-memoryd` (CGO, patched lancedb-go and the published
+  `liblancedb_go.a`), so Nix hosts no longer need the Docker release binary.
+
 ### Multi-store recall CLI and shared skill (2026-10-29)
 
 - `tireless` reads named stores from `~/.config/tireless/stores` (`tireless init

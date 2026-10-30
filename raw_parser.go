@@ -14,11 +14,17 @@ import (
 	"time"
 )
 
-// Bumping this re-parses every raw object; messages whose id and text are unchanged
-// are still skipped by the dedup state, so only changed derivations are re-embedded.
-const rawParserVersion = "generic-v1"
+// Bumping this re-parses every raw object; units whose embedded text is unchanged
+// are skipped by the dedup state (rawDerivedKey), so only changed ones are re-embedded.
+const rawParserVersion = "contextual-v1"
 
 var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", "<INSTRUCTIONS>"}
+
+// Sessions opened by these prompts only restate data indexed elsewhere: the bb CRM
+// summarizer pastes a whole Telegram transcript (its result is pushed as source=crm).
+var skippedSessionPrefixes = []string{`Summarize the relationship with "`}
+
+const toolCommandRunes = 500
 
 var rawSources = map[string]bool{"pi": true, "codex": true, "omp": true, "claude": true, "grok": true, "grokbot": true, "telegram": true}
 
@@ -38,7 +44,28 @@ func parseRawObject(key string, body []byte, includeState bool) ([]MemoryItem, e
 	if source == "telegram" {
 		return parseTelegramJSONL(body, host)
 	}
-	return parseSessionJSONL(body, host, source, key, includeState)
+	items, err := parseSessionJSONL(body, host, source, key, includeState)
+	if err != nil || skippedSession(items) {
+		return nil, err
+	}
+	return items, nil
+}
+
+// skippedSession reports whether the session's first user message opens with a
+// skippedSessionPrefixes prompt.
+func skippedSession(items []MemoryItem) bool {
+	for _, item := range items {
+		if item.Metadata.Kind != "message" || item.Metadata.AuthorID != "user" {
+			continue
+		}
+		for _, prefix := range skippedSessionPrefixes {
+			if strings.HasPrefix(strings.TrimSpace(item.Text), prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 func rawObjectIdentity(key string) (host, source string, ok bool) {
@@ -148,6 +175,12 @@ func parseSessionJSONL(body []byte, host, harness, source string, includeState b
 								}
 							case "Agent", "Task":
 								claudeTaskCalls[stringField(part, "id")] = true
+							case "Bash":
+								// The description is the agent's plain-English account of the step.
+								input, _ := part["input"].(map[string]interface{})
+								if text := bashToolText(input); text != "" {
+									items = append(items, rawRecord(host, harness, sessionID, stringField(part, "id"), role, text, ts, project, "tool"))
+								}
 							}
 						case "tool_result":
 							toolUseID := stringField(part, "tool_use_id")
@@ -333,6 +366,20 @@ func toolResultText(m map[string]interface{}, toolName string) string {
 		return ""
 	}
 	return "TOOL " + toolName + " RESULT:\n" + text
+}
+
+func bashToolText(input map[string]interface{}) string {
+	description := strings.TrimSpace(stringField(input, "description"))
+	command := strings.TrimSpace(stringField(input, "command"))
+	// Without a description the record is just a command, often a heredoc whose
+	// content is indexed elsewhere: skip it.
+	if command == "" || description == "" {
+		return ""
+	}
+	if r := []rune(command); len(r) > toolCommandRunes {
+		command = string(r[:toolCommandRunes]) + "…"
+	}
+	return "Ran: " + description + "\n$ " + command
 }
 
 func todoTextFromSessionRecord(m map[string]interface{}, source string) string {

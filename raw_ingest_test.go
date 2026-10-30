@@ -71,10 +71,12 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	embeds := 0
 	r := &rawIngestor{server: s, store: store, registry: registry, http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path == "/tokenize" {
 			return testTokenResponse(req)
 		}
+		embeds++
 		return testEmbeddingResponse(req, 2)
 	})}}
 	s.raw = r
@@ -106,6 +108,9 @@ func TestRawIngestScanIsCrashSafeAndIdempotent(t *testing.T) {
 	}
 	if memRows(s) != 2 {
 		t.Fatalf("replay duplicated rows=%d", memRows(s))
+	}
+	if embeds != 1 {
+		t.Fatalf("an unchanged unit was re-embedded after a parser bump: embed requests=%d", embeds)
 	}
 }
 
@@ -219,7 +224,7 @@ func TestTokenChunksCoverEntireMessageWithOverlap(t *testing.T) {
 	words[len(words)-1] = "TAIL_SENTINEL"
 	text := strings.Join(words, " ")
 	r := &rawIngestor{server: testServer(), http: &http.Client{Transport: roundTripFunc(testTokenResponse)}}
-	chunks, err := r.splitTokenChunks(context.Background(), text)
+	chunks, err := r.splitTokenChunks(context.Background(), text, embedChunkTokens)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,8 +261,8 @@ func TestLongMessageTailIsSearchableAndContainerKeepsOriginal(t *testing.T) {
 		return testEmbeddingResponse(req, 2)
 	})}}
 	message := rawRecord("mbp14", "pi", "session-long", "turn-long", "assistant", text, 123, "project", "message")
-	groups := chunkGroups([]MemoryItem{message}, func(MemoryItem) bool { return true })
-	if _, err := r.indexGroups(context.Background(), groups); err != nil {
+	groups := chunkGroups([]MemoryItem{message}, func(MemoryItem, string) bool { return true })
+	if _, err := r.indexGroups(context.Background(), groups, func(m MemoryItem) string { return m.ID }); err != nil {
 		t.Fatal(err)
 	}
 	hits := s.mem.search(vectorSearchRequest{

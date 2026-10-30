@@ -36,22 +36,33 @@ func TestTelegramParseAndWindows(t *testing.T) {
 		t.Fatalf("topic=%+v", byID)
 	}
 
-	all := chunkGroups(items, func(MemoryItem) bool { return true })
-	windows := map[string]chunkGroup{}
+	all := chunkGroups(items, func(MemoryItem, string) bool { return true })
+	units := map[string]chunkGroup{}
 	for _, g := range all {
-		windows[g.id] = g
+		units[g.id] = g
 	}
-	core := windows["tgbox/telegram/-100/1"]
-	if len(all) != 3 || core.text != "Alice: pushed v0.3.1 to staging\nBob: on it" || len(core.pending) != 2 || core.meta.AuthorID != "" {
-		t.Fatalf("windows=%+v", all)
+	if len(all) != 4 {
+		t.Fatalf("one unit per message: %+v", all)
 	}
-	if _, ok := windows["tgbox/telegram/-100/3"]; !ok {
-		t.Fatalf("message after the gap must open a new window: %+v", all)
+	reply := units["tgbox/telegram/-100/2"]
+	if reply.header != `Telegram group "Core"` || reply.text != "Alice: pushed v0.3.1 to staging\nBob: on it" {
+		t.Fatalf("reply unit=%+v", reply)
+	}
+	if later := units["tgbox/telegram/-100/3"]; later.text != "Alice: next day" {
+		t.Fatalf("a message after the gap must not lead in: %+v", later)
 	}
 
-	// Only the window holding a changed message is re-embedded.
-	changed := chunkGroups(items, func(item MemoryItem) bool { return item.ID == "tgbox/telegram/-100/2" })
-	if len(changed) != 1 || changed[0].id != "tgbox/telegram/-100/1" || len(changed[0].pending) != 1 {
+	// An edit re-embeds the message and the units that quote it.
+	hashes := map[string]string{}
+	chunkGroups(items, func(item MemoryItem, hash string) bool { hashes[item.ID] = hash; return false })
+	edited := append([]MemoryItem(nil), items...)
+	for i := range edited {
+		if edited[i].ID == "tgbox/telegram/-100/1" {
+			edited[i].Text = "pushed v0.3.2 to staging"
+		}
+	}
+	changed := chunkGroups(edited, func(item MemoryItem, hash string) bool { return hashes[item.ID] != hash })
+	if len(changed) != 2 || changed[0].id != "tgbox/telegram/-100/1" || changed[1].id != "tgbox/telegram/-100/2" {
 		t.Fatalf("changed=%+v", changed)
 	}
 
@@ -59,7 +70,7 @@ func TestTelegramParseAndWindows(t *testing.T) {
 		{ID: "c/1", Text: "post one", Metadata: Metadata{Source: "telegram", ContainerID: "-200", ContainerKind: "channel", Timestamp: 10}},
 		{ID: "c/2", Text: "post two", Metadata: Metadata{Source: "telegram", ContainerID: "-200", ContainerKind: "channel", Timestamp: 11}},
 	}
-	if posts := chunkGroups(channel, func(MemoryItem) bool { return true }); len(posts) != 2 {
+	if posts := chunkGroups(channel, func(MemoryItem, string) bool { return true }); len(posts) != 2 || posts[1].text != "post two" {
 		t.Fatalf("channel posts must stand alone: %+v", posts)
 	}
 }

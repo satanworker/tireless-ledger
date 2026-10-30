@@ -496,10 +496,9 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 	if err != nil {
 		return fmt.Errorf("extract: %w", err)
 	}
-	seen := func(item MemoryItem) bool {
-		return r.server.dedup.Seen(rawDerivedKey(item.ID), item.Metadata.ContentHash)
-	}
-	groups := chunkGroups(items, func(item MemoryItem) bool { return !seen(item) })
+	groups := chunkGroups(items, func(item MemoryItem, hash string) bool {
+		return !r.server.dedup.Seen(rawDerivedKey(item.ID), hash)
+	})
 	groupBatch := r.server.cfg.EmbedBatchSize
 	if groupBatch <= 0 {
 		groupBatch = 32
@@ -510,7 +509,7 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 		if end > len(groups) {
 			end = len(groups)
 		}
-		written, err := r.indexGroups(ctx, groups[start:end])
+		written, err := r.indexGroups(ctx, groups[start:end], func(m MemoryItem) string { return rawDerivedKey(m.ID) })
 		if err != nil {
 			return err
 		}
@@ -523,23 +522,38 @@ func (r *rawIngestor) process(ctx context.Context, obj rawObject) error {
 	return nil
 }
 
-// rawDerivedKey is the dedup key of a raw-derived message: a parser version bump
-// re-derives every message once.
+// rawDerivedKey is the dedup key of a raw-derived record. Its hash covers the exact
+// embedded unit, so a parser version bump re-parses every object but re-embeds only
+// the units whose text changed.
 func rawDerivedKey(id string) string {
-	return id + "|" + rawParserVersion
+	return id + "|unit"
 }
 
 // indexGroups token-splits and embeds each group, then writes the group's pending
 // messages and its chunks. It returns the number of messages written.
-func (r *rawIngestor) indexGroups(ctx context.Context, groups []chunkGroup) (int, error) {
+func (r *rawIngestor) indexGroups(ctx context.Context, groups []chunkGroup, dedupKey func(MemoryItem) string) (int, error) {
 	var messages, chunks []MemoryItem
 	for _, group := range groups {
-		texts, err := r.splitTokenChunks(ctx, group.text)
+		budget := r.server.cfg.ChunkTokens
+		if budget <= 0 {
+			budget = embedChunkTokens
+		}
+		if group.header != "" {
+			n, err := r.tokenCount(ctx, group.header)
+			if err != nil {
+				return 0, fmt.Errorf("tokenize %s header: %w", group.id, err)
+			}
+			budget = max(budget-n-1, 2*embedChunkOverlap)
+		}
+		texts, err := r.splitTokenChunks(ctx, group.text, budget)
 		if err != nil {
 			return 0, fmt.Errorf("tokenize %s: %w", group.id, err)
 		}
 		for i, text := range texts {
-			chunk := MemoryItem{ID: chunkID(group.id, i), Text: text, Metadata: group.meta}
+			// The header rides on every chunk; content_hash covers only the body so
+			// identical bodies (a prompt reused across sessions) collapse at query time.
+			chunk := MemoryItem{ID: chunkID(group.id, i), Text: joinHeader(group.header, text), Metadata: group.meta}
+			chunk.Metadata.ContentHash = hashText(text)
 			chunk.Metadata.MessageID = group.id
 			chunk.Metadata.ChunkIndex = int64(i)
 			chunk.Metadata.ChunkCount = int64(len(texts))
@@ -565,7 +579,7 @@ func (r *rawIngestor) indexGroups(ctx context.Context, groups []chunkGroup) (int
 		if end > len(texts) {
 			end = len(texts)
 		}
-		batch, err := r.embedTexts(ctx, texts[start:end])
+		batch, err := r.embedTexts(ctx, texts[start:end], r.server.cfg.DocPrefix)
 		if err != nil {
 			return 0, err
 		}
@@ -573,14 +587,22 @@ func (r *rawIngestor) indexGroups(ctx context.Context, groups []chunkGroup) (int
 			chunks[start+i].Vector = vector
 		}
 	}
-	if err := r.server.flush(messages, chunks, func(m MemoryItem) string { return rawDerivedKey(m.ID) }); err != nil {
+	if err := r.server.flush(messages, chunks, dedupKey); err != nil {
 		return 0, fmt.Errorf("index: %w", err)
 	}
 	return len(messages), nil
 }
 
-func (r *rawIngestor) embedTexts(ctx context.Context, texts []string) ([][]float32, error) {
-	payload, _ := json.Marshal(map[string]interface{}{"input": texts, "model": "bge-small-en-v1.5"})
+// embedTexts embeds texts, each behind prefix (the model's document or query instruction).
+func (r *rawIngestor) embedTexts(ctx context.Context, texts []string, prefix string) ([][]float32, error) {
+	if prefix != "" {
+		prefixed := make([]string, len(texts))
+		for i, text := range texts {
+			prefixed[i] = prefix + text
+		}
+		texts = prefixed
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"input": texts})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(r.server.cfg.EmbedURL, "/")+"/v1/embeddings", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -643,16 +665,16 @@ func (r *rawIngestor) tokenCount(ctx context.Context, text string) (int, error) 
 	return len(out.Tokens), nil
 }
 
-func (r *rawIngestor) splitTokenChunks(ctx context.Context, text string) ([]string, error) {
+func (r *rawIngestor) splitTokenChunks(ctx context.Context, text string, maxTokens int) ([]string, error) {
 	count, err := r.tokenCount(ctx, text)
 	if err != nil {
 		return nil, err
 	}
-	if count <= embedChunkTokens {
+	if count <= maxTokens {
 		return []string{text}, nil
 	}
 	runes := []rune(text)
-	chunks := make([]string, 0, count/(embedChunkTokens-embedChunkOverlap)+1)
+	chunks := make([]string, 0, count/(maxTokens-embedChunkOverlap)+1)
 	start := 0
 	for start < len(runes) {
 		remaining := string(runes[start:])
@@ -660,7 +682,7 @@ func (r *rawIngestor) splitTokenChunks(ctx context.Context, text string) ([]stri
 		if err != nil {
 			return nil, err
 		}
-		if remainingCount <= embedChunkTokens {
+		if remainingCount <= maxTokens {
 			chunks = append(chunks, remaining)
 			break
 		}
@@ -672,7 +694,7 @@ func (r *rawIngestor) splitTokenChunks(ctx context.Context, text string) ([]stri
 			if err != nil {
 				return nil, err
 			}
-			if n <= embedChunkTokens {
+			if n <= maxTokens {
 				best = mid
 				lo = mid + 1
 			} else {

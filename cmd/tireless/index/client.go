@@ -169,6 +169,20 @@ func (c *Client) Ingest(turns []Turn) (IngestResp, error) {
 }
 
 // Query filters: container_id, project, source, kind (empty = unset).
+// serverEmbeds reports whether the server embeds query text itself (pi-memoryd
+// advertises query_embed on /-/ready); older servers need a client-side vector.
+func (c *Client) serverEmbeds() bool {
+	resp, err := c.HTTP.Get(c.Server + "/-/ready")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var ready struct {
+		QueryEmbed bool `json:"query_embed"`
+	}
+	return json.NewDecoder(resp.Body).Decode(&ready) == nil && ready.QueryEmbed
+}
+
 func (c *Client) Query(text string, embed bool, filters map[string]string, limit int) (json.RawMessage, error) {
 	q := map[string]any{"limit": limit}
 	for k, v := range filters {
@@ -179,7 +193,10 @@ func (c *Client) Query(text string, embed bool, filters map[string]string, limit
 	if text != "" {
 		q["query_text"] = text
 	}
-	if embed || text == "" {
+	if text != "" && c.serverEmbeds() {
+		// The server embeds with its own model; this client need not match it.
+		q["embed"] = embed
+	} else if embed || text == "" {
 		qtext, err := c.clipTokens(QueryPrefix+text, embedMax)
 		if err != nil {
 			return nil, err
