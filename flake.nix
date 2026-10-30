@@ -7,7 +7,7 @@
     let
       systems = [ "aarch64-linux" "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      # One module, one vendorHash: update it whenever go.mod/go.sum change.
+      # Update this vendorHash and pi-memoryd's whenever go.mod/go.sum change.
       goPackage = pkgs: pname: subPackage: pkgs.buildGoModule {
         inherit pname;
         version = self.shortRev or self.dirtyShortRev or "dev";

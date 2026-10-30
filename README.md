@@ -24,13 +24,13 @@ session directories; it only ingests objects that an uploader has copied to R2.
 
 ## Nix packages
 
-This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI), `packages.<system>.tireless-upload` and `packages.<system>.tireless-telegram` (the Telethon exporter) for Linux and macOS, plus `homeManagerModules.default` (below). Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `pi-memoryd` itself links the patched Lance library, so it ships as the `release-linux` binary. When `go.mod`/`go.sum` change, update `vendorHash` in `flake.nix`.
+This repository is the single source for the clients. Its flake exports `packages.<system>.tireless` (the recall CLI), `packages.<system>.tireless-upload` and `packages.<system>.tireless-telegram` (the Telethon exporter) for Linux and macOS, plus `homeManagerModules.default` (below). Every machine takes them from the `tireless-ledger` flake input; there are no copies in host repos. Roll out a client change on every machine with `nix flake update tireless-ledger` and a rebuild. `packages.<linux>.pi-memoryd` builds the server from source with the patched Lance library (`liblancedb_go.a` from `make lance-lib`); hosts without Nix use the `release-linux` binary. When `go.mod`/`go.sum` change, update both `vendorHash`es in `flake.nix`.
 
 The live derived recall store defaults to `s3://<bucket>/session-recall-lance-generic-v2/`. Untouched raw JSONL in R2 remains the authoritative source. Set `PI_MEMORYD_S3_PREFIX` to select a different derived prefix for rollback. The daemon does not copy the table into RAM or run a Python/HTTP storage sidecar.
 
 ## Recall CLI and skill
 
-`tireless` searches one or more stores (deployments) at once. A store is a name and a host whose `pi-memoryd` listens on `:8090` and whose embedder listens on `:8091`; each query is embedded by the store it searches. Hits from several stores alternate by rank, because scores are rank-fusion values computed within one store.
+`tireless` searches one or more stores (deployments) at once. A store is a name and a host whose `pi-memoryd` listens on `:8090`. A server that advertises `query_embed` on `/-/ready` embeds queries itself, so the CLI needs only `:8090`; with an older server the CLI embeds the query with the store's embedder on `:8091`, as before. Hits from several stores alternate by rank, because scores are rank-fusion values computed within one store.
 
 The agent skill ([`cmd/tireless/skill/SKILL.md`](cmd/tireless/skill/SKILL.md)) is the only harness glue: it tells any Agent Skills harness (omp, Claude Code, Codex, Pi) to run `tireless` in a shell, so there are no per-harness tools.
 
@@ -57,6 +57,26 @@ With Home Manager, import `tireless-ledger.homeManagerModules.default` and set `
 Output is a compact digest for agents; `-json` prints `{"results": [...]}` / `{"sessions": [...]}` with a `store` field on every item. A store that fails is reported on stderr while the others answer; the command fails only when every store does. Without a stores file, or with `-server`/`-embed`, the CLI uses one store from `TIRELESS_SERVER`/`TIRELESS_EMBED` (default localhost). `sync`/`watch` write, so with several stores they need `-store`.
 
 Every GitHub release attaches the CLI binaries from `make release-cli`, so `releases/latest/download/tireless-<os>-<arch>` always resolves.
+
+## Upgrading a deployment to contextual recall
+
+Commit `3295836` (CHANGELOG, "Contextual recall") changes how records are embedded, not which model embeds them. Per deployment:
+
+**Server, keeping its model.** Deploy the new `pi-memoryd` (Nix: `tireless-ledger.packages.<system>.pi-memoryd`, x86_64/aarch64 Linux; otherwise `make release-linux`). No configuration change: the defaults are still bge-small. The first start re-parses every raw object (parser `contextual-v1`) and re-embeds every record once with the deployment's own model, in place; search keeps working, with a mix of old and new units until it finishes. Nothing else changes: `source=crm` records only exist where something pushes them (imp-home's bb CRM plugin).
+
+**Changing the model** (imp-home runs EmbeddingGemma-300M) needs a new storage prefix and state directory, never the old store:
+
+- Embedder: `llama-server -m embeddinggemma-300M-Q8_0.gguf --embedding` (no `--pooling cls`), about 550 MB RAM.
+- `PI_MEMORYD_DIMENSIONS=768`, `PI_MEMORYD_CHUNK_TOKENS=512`, `PI_MEMORYD_QUERY_PREFIX="task: search result | query: "`, `PI_MEMORYD_DOC_PREFIX="title: none | text: "` (quoted: systemd strips trailing spaces).
+- To avoid hours of partial recall, fill the new prefix first with a second `pi-memoryd` on another port and its own `PI_MEMORYD_STATE`, then `--optimize` and `--create-vector-index` with the same settings, copy `dedup_state.json` and `raw_registry.json` into the service's state directory, and switch. The full re-embed costs about 1,400 tokens/s on 12–16 x86 threads.
+- Keep a bge-small embedder on `:8091` while old CLIs remain (below); the server replaces their 384-dim vectors with its own.
+
+**CLI on other machines.** Nothing breaks:
+
+- New CLI with an old server: embeds client-side through `:8091`, as before.
+- Old CLI with a new server on its old model: unchanged.
+- Old CLI with a server on a new model: works only while `:8091` still serves the old model, because the old CLI checks the vector size itself. Update the CLI, then drop `:8091` from the embedder and the tailnet grant.
+- Nix machines get the new CLI with `nix flake update tireless-ledger`. Machines that download `releases/latest/download/tireless-<os>-<arch>` need a release cut after `3295836` (`make release-cli`, attach to the release); until then they keep the old CLI.
 
 ## Record schema
 
