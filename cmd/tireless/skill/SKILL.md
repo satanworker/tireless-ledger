@@ -33,7 +33,7 @@ tireless sessions [-store NAME] [-since 24h] [-until …] [-project P] [-source 
 ## Rules
 
 - Only past decisions and discussion. For repository code use grep or code search.
-- Start with tireless, and add `-json` if the digest isn't enough. Read local session files (`~/.omp`, `~/.claude`, `~/.codex`, `~/.pi`) only when tireless can't answer, e.g. the store is unreachable or the session isn't ingested yet. Say that you did: they cover only this machine.
+- Start with tireless, and add `-json` if the digest isn't enough. Fall back to this machine's local history only when tireless can't answer: the store is unreachable, or the session is newer than the last ingest (uploads run every few minutes). In omp use the `archive` API in eval (`archive.sessions`, `archive.session`, `archive.search`); other harnesses read their session files (`~/.claude`, `~/.codex`, `~/.pi`). Say that you did: it covers only this machine.
 - No relevant hits → say so and list the queries you tried. Never fill gaps from memory.
 - A store that fails prints `store NAME: …` on stderr while the others still answer; say which store was unreachable instead of treating it as no results.
 - Past decisions may be out of date: check the current code or config before acting on them.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path"
@@ -118,8 +119,10 @@ func syncTree(ctx context.Context, client *s3.Client, bucket, prefix, host, harn
 		if err != nil {
 			return err
 		}
+		// Live sessions keep appending: send exactly the bytes stat saw, or the PUT fails on a
+		// body longer than ContentLength. A cut last line is skipped by the parser and re-sent next run.
 		_, putErr := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket: &bucket, Key: &key, Body: file, ContentLength: aws.Int64(stat.Size()), ContentType: aws.String("application/x-ndjson"),
+			Bucket: &bucket, Key: &key, Body: io.NewSectionReader(file, 0, stat.Size()), ContentLength: aws.Int64(stat.Size()), ContentType: aws.String("application/x-ndjson"),
 		})
 		closeErr := file.Close()
 		if putErr != nil {
