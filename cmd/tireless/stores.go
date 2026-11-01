@@ -246,8 +246,9 @@ func join(parts ...string) string {
 	return strings.Join(keep, " ")
 }
 
-// printHits is the compact digest agents read: header, ids to follow up with, 500-char snippet.
-func printHits(w io.Writer, hits []map[string]any, took time.Duration) {
+// printHits is the digest agents read: header, ids to follow up with, then a 500-char snippet,
+// or the whole text when full (container reads exist to show context, so cutting it defeats them).
+func printHits(w io.Writer, hits []map[string]any, took time.Duration, full bool) {
 	fmt.Fprintf(w, "%d hits in %dms\n", len(hits), took.Milliseconds())
 	for i, h := range hits {
 		m, _ := h["metadata"].(map[string]any)
@@ -255,13 +256,17 @@ func printHits(w io.Writer, hits []map[string]any, took time.Duration) {
 		if kind == "message" {
 			kind = ""
 		}
+		text := str(h, "text")
+		if !full {
+			text = snippet(text, 500)
+		}
 		fmt.Fprintf(w, "\n%s\n%s\n%s\n",
 			join(fmt.Sprintf("%d.", i+1), str(h, "store"), str(m, "host")+"/"+str(m, "source"),
 				"container="+or(str(m, "container_title"), str(m, "container_id")),
 				"author="+or(str(m, "author_name"), str(m, "author_id")),
 				prefix("project=", str(m, "project")), when(m["timestamp"]), prefix("kind=", kind)),
 			join(prefix("store=", str(h, "store")), "container_id="+str(m, "container_id"), "ts="+str(m, "timestamp"), "id="+str(h, "id")),
-			snippet(str(h, "text"), 500))
+			text)
 	}
 }
 

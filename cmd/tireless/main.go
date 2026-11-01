@@ -155,7 +155,7 @@ func main() {
 			return c.Query(q, *emb, filters, *limit)
 		})
 		hits := interleave(rs, *limit)
-		emit(*asJSON, "results", hits, func() { printHits(os.Stdout, hits, time.Since(start)) })
+		emit(*asJSON, "results", hits, func() { printHits(os.Stdout, hits, time.Since(start), false) })
 	case "container":
 		sf := flag.NewFlagSet("container", flag.ExitOnError)
 		storeName := sf.String("store", "", "store the hit came from (default: all)")
@@ -185,7 +185,7 @@ func main() {
 			return c.Container(map[string]string{"container_id": sf.Arg(0), "host": *cHost, "source": *cSource, "after_ts": ts, "after_id": *afterID, "include": *include}, *limit)
 		})
 		hits := concat(rs)
-		emit(*asJSON, "results", hits, func() { printHits(os.Stdout, hits, time.Since(start)) })
+		emit(*asJSON, "results", hits, func() { printHits(os.Stdout, hits, time.Since(start), true) })
 	case "sessions":
 		sf := flag.NewFlagSet("sessions", flag.ExitOnError)
 		storeName := sf.String("store", "", "list only this store (default: all)")
