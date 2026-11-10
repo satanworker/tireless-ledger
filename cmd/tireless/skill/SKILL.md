@@ -18,7 +18,7 @@ tireless sessions [-store NAME] [-since 24h] [-until …] [-project P] [-source 
 
 - `query` searches every configured store at once; each hit shows its `store`, `container_id`, `ts` and a 500-character snippet.
 - `container` prints each message in full; that is where you read what was actually said or decided.
-- `-source`: `omp`, `pi`, `codex`, `claude`, `grok`, `grokbot`, `telegram`. `-kind`: `message`, `title`, `todo`, `task`.
+- `-source`: `omp`, `pi`, `codex`, `claude`, `grok`, `grokbot`, `telegram`, `docs` (contracts and legal documents from the shared Google Drive; `container_id` is the Drive folder, e.g. `HyENA`, and the full Markdown is at `/var/lib/drive-sync/text/<folder>/<file>.md` on imp-home). `-kind`: `message`, `title`, `todo`, `task`, `document`.
 - `sessions` lists every session or chat active in a window (default: last 24 hours), for "what did I work on" questions.
 
 ## Workflow
