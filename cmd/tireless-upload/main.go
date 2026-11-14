@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,13 +18,55 @@ import (
 )
 
 type settings struct {
-	rawURL, endpoint, region, host, piRoot, codexRoot, ompRoot, claudeRoot, grokRoot, grokbotRoot, telegramRoot string
+	rawURL, endpoint, region, host, piRoot, codexRoot, ompRoot, claudeRoot, grokRoot, grokbotRoot string
+	chats                                                                                         chatDirs
 }
+
+// harnesses are the agent session sources; a chat source may not reuse their names.
+var harnesses = []string{"pi", "codex", "omp", "claude", "grok", "grokbot"}
+
+// chatDirs maps a chat source (platform tag, e.g. telegram, x) to its export directory.
+// Each uploads as <host>/<source>/<rel>; an empty directory disables the source.
+type chatDirs map[string]string
+
+func (c chatDirs) String() string { return "" }
+
+// Set takes <source>=<dir> for the repeatable --chat flag.
+func (c chatDirs) Set(value string) error {
+	source, dir, ok := strings.Cut(value, "=")
+	if !ok {
+		return fmt.Errorf("want <source>=<dir>, got %q", value)
+	}
+	return c.set(source, dir)
+}
+
+func (c chatDirs) set(source, dir string) error {
+	if source == "" || source == "." || source == ".." || strings.ContainsAny(source, "/\\") {
+		return fmt.Errorf("chat source %q must be a single path segment", source)
+	}
+	for _, harness := range harnesses {
+		if source == harness {
+			return fmt.Errorf("chat source %q is an agent harness name", source)
+		}
+	}
+	c[source] = dir
+	return nil
+}
+
+// alias is a flag.Value for --telegram/--x: shorthand for --chat <source>=<dir>.
+type alias struct {
+	chats  chatDirs
+	source string
+}
+
+func (a alias) String() string       { return "" }
+func (a alias) Set(dir string) error { return a.chats.set(a.source, dir) }
 
 func main() {
 	home, _ := os.UserHomeDir()
 	hostname, _ := os.Hostname()
-	cfg := settings{}
+	// telegram and x are always chat sources, so their walks skip each other's folder even when unset.
+	cfg := settings{chats: chatDirs{"telegram": env("TIRELESS_TELEGRAM_DIR", ""), "x": env("TIRELESS_X_DIR", "")}}
 	flag.StringVar(&cfg.rawURL, "raw-url", env("TIRELESS_RAW_URL", env("PI_MEMORYD_RAW_URL", "")), "S3 raw prefix")
 	flag.StringVar(&cfg.endpoint, "endpoint", env("TIRELESS_S3_ENDPOINT", env("PI_MEMORYD_S3_ENDPOINT", env("AWS_ENDPOINT_URL", ""))), "S3-compatible endpoint")
 	flag.StringVar(&cfg.region, "region", env("AWS_REGION", env("AWS_DEFAULT_REGION", "auto")), "S3 region")
@@ -34,7 +77,9 @@ func main() {
 	flag.StringVar(&cfg.claudeRoot, "claude", env("TIRELESS_CLAUDE_SESSIONS", filepath.Join(home, ".claude", "projects")), "Claude Code projects directory")
 	flag.StringVar(&cfg.grokRoot, "grok", env("TIRELESS_GROK_SESSIONS", filepath.Join(home, ".grok", "sessions")), "Grok sessions directory")
 	flag.StringVar(&cfg.grokbotRoot, "grokbot", env("TIRELESS_GROKBOT_SESSIONS", ""), "Grok Bot chat export directory (disabled when empty)")
-	flag.StringVar(&cfg.telegramRoot, "telegram", env("TIRELESS_TELEGRAM_DIR", ""), "Telegram export directory (disabled when empty)")
+	flag.Var(cfg.chats, "chat", "chat export `source=dir`, uploaded to <host>/<source>/ (repeatable)")
+	flag.Var(alias{cfg.chats, "telegram"}, "telegram", "Telegram export `dir`, same as --chat telegram=<dir> (env TIRELESS_TELEGRAM_DIR; disabled when empty)")
+	flag.Var(alias{cfg.chats, "x"}, "x", "X DM export `dir`, same as --chat x=<dir> (env TIRELESS_X_DIR; disabled when empty)")
 	flag.Parse()
 	if err := run(context.Background(), cfg); err != nil {
 		log.Fatal(err)
@@ -62,20 +107,45 @@ func run(ctx context.Context, cfg settings) error {
 			o.UsePathStyle = true
 		}
 	})
-	totalScanned, totalUploaded := 0, 0
-	for _, source := range []struct{ harness, root string }{{"pi", cfg.piRoot}, {"codex", cfg.codexRoot}, {"omp", cfg.ompRoot}, {"claude", cfg.claudeRoot}, {"grok", cfg.grokRoot}, {"grokbot", cfg.grokbotRoot}, {"telegram", cfg.telegramRoot}} {
-		scanned, uploaded, err := syncTree(ctx, client, bucket, prefix, cfg.host, source.harness, source.root)
+	scanned, uploaded, err := syncAll(ctx, client, bucket, prefix, cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("scanned=%d uploaded=%d skipped=%d\n", scanned, uploaded, scanned-uploaded)
+	return nil
+}
+
+func syncAll(ctx context.Context, client *s3.Client, bucket, prefix string, cfg settings) (totalScanned, totalUploaded int, err error) {
+	type source struct {
+		harness, root string
+		skip          map[string]bool
+	}
+	sources := []source{{"pi", cfg.piRoot, nil}, {"codex", cfg.codexRoot, nil}, {"omp", cfg.ompRoot, nil}, {"claude", cfg.claudeRoot, nil}, {"grok", cfg.grokRoot, nil}, {"grokbot", cfg.grokbotRoot, nil}}
+	// A chat inbox may hold another platform's export (e.g. <inbox>/x/): skip top-level folders named after a chat source.
+	chatNames := map[string]bool{}
+	names := make([]string, 0, len(cfg.chats))
+	for name := range cfg.chats {
+		chatNames[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		sources = append(sources, source{name, cfg.chats[name], chatNames})
+	}
+	for _, source := range sources {
+		scanned, uploaded, err := syncTree(ctx, client, bucket, prefix, cfg.host, source.harness, source.root, source.skip)
 		if err != nil {
-			return err
+			return totalScanned, totalUploaded, err
 		}
 		totalScanned += scanned
 		totalUploaded += uploaded
 	}
-	fmt.Printf("scanned=%d uploaded=%d skipped=%d\n", totalScanned, totalUploaded, totalScanned-totalUploaded)
-	return nil
+	return totalScanned, totalUploaded, nil
 }
 
-func syncTree(ctx context.Context, client *s3.Client, bucket, prefix, host, harness, root string) (scanned, uploaded int, err error) {
+// syncTree uploads every *.jsonl under root to <prefix>/<host>/<harness>/<rel>, skipping files whose
+// remote size already matches and top-level directories named in skipTop.
+func syncTree(ctx context.Context, client *s3.Client, bucket, prefix, host, harness, root string, skipTop map[string]bool) (scanned, uploaded int, err error) {
 	info, statErr := os.Stat(root)
 	if root == "" || os.IsNotExist(statErr) {
 		return 0, 0, nil
@@ -94,6 +164,9 @@ func syncTree(ctx context.Context, client *s3.Client, bucket, prefix, host, harn
 	err = filepath.WalkDir(root, func(filePath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if entry.IsDir() && skipTop[entry.Name()] && filepath.Dir(filePath) == filepath.Clean(root) {
+			return filepath.SkipDir
 		}
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".jsonl") {
 			return nil
