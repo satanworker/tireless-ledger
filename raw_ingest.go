@@ -406,13 +406,29 @@ func (r *rawIngestor) containerRecordWalk(ctx context.Context, containerID, host
 	return results, true, nil
 }
 
+type rawStatusCounts struct {
+	Indexed    int `json:"indexed"`
+	Failed     int `json:"failed"`
+	Processing int `json:"processing"`
+}
+
 type rawStatusResponse struct {
-	Enabled       bool      `json:"enabled"`
-	Indexed       int       `json:"indexed"`
-	Failed        int       `json:"failed"`
-	Processing    int       `json:"processing"`
-	LastScan      time.Time `json:"last_scan,omitempty"`
-	LastScanError string    `json:"last_scan_error,omitempty"`
+	Enabled bool `json:"enabled"`
+	rawStatusCounts
+	LastScan      time.Time                  `json:"last_scan,omitempty"`
+	LastScanError string                     `json:"last_scan_error,omitempty"`
+	Sources       map[string]rawStatusCounts `json:"sources,omitempty"`
+}
+
+func (c *rawStatusCounts) add(status string) {
+	switch status {
+	case "indexed":
+		c.Indexed++
+	case "failed":
+		c.Failed++
+	case "processing":
+		c.Processing++
+	}
 }
 
 type rawIngestor struct {
@@ -741,17 +757,14 @@ func (s *server) rawStatus(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, rawStatusResponse{})
 		return
 	}
-	status := rawStatusResponse{Enabled: true}
+	status := rawStatusResponse{Enabled: true, Sources: map[string]rawStatusCounts{}}
 	s.raw.registry.mu.RLock()
-	for _, entry := range s.raw.registry.Objects {
-		switch entry.Status {
-		case "indexed":
-			status.Indexed++
-		case "failed":
-			status.Failed++
-		case "processing":
-			status.Processing++
-		}
+	for key, entry := range s.raw.registry.Objects {
+		status.add(entry.Status)
+		_, source, _ := rawObjectIdentity(key)
+		counts := status.Sources[source]
+		counts.add(entry.Status)
+		status.Sources[source] = counts
 	}
 	s.raw.registry.mu.RUnlock()
 	s.raw.mu.RLock()

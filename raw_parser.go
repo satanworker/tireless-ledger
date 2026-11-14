@@ -26,7 +26,7 @@ var skippedSessionPrefixes = []string{`Summarize the relationship with "`}
 
 const toolCommandRunes = 500
 
-var rawSources = map[string]bool{"pi": true, "codex": true, "omp": true, "claude": true, "grok": true, "grokbot": true, "telegram": true}
+var rawSources = map[string]bool{"pi": true, "codex": true, "omp": true, "claude": true, "grok": true, "grokbot": true, "telegram": true, "x": true}
 
 func parseRawSession(key string, body []byte) ([]MemoryItem, error) {
 	return parseRawObject(key, body, false)
@@ -39,10 +39,10 @@ func parseRawSessionForIndex(key string, body []byte) ([]MemoryItem, error) {
 func parseRawObject(key string, body []byte, includeState bool) ([]MemoryItem, error) {
 	host, source, ok := rawObjectIdentity(key)
 	if !ok {
-		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok|grokbot|telegram>/<path>.jsonl")
+		return nil, fmt.Errorf("object key must be <host>/<pi|codex|omp|claude|grok|grokbot|telegram|x>/<path>.jsonl")
 	}
-	if source == "telegram" {
-		return parseTelegramJSONL(body, host)
+	if isChatSource(source) {
+		return parseChatJSONL(body, host, source)
 	}
 	items, err := parseSessionJSONL(body, host, source, key, includeState)
 	if err != nil || skippedSession(items) {

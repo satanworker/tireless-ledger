@@ -921,15 +921,17 @@ func collapseChunkHits(hits []queryResult, limit int) []queryResult {
 		if seen[parent] || body != "" && bodies[body] {
 			continue
 		}
-		// Telegram units quote the lines before them, so neighbours match together:
+		// Chat units quote the lines before them, so neighbours match together:
 		// keep one hit per chat moment (the container walk shows the rest).
 		source, _ := hit.Metadata["source"].(string)
 		container, _ := hit.Metadata["container_id"].(string)
+		container = source + "/" + container
 		ts := metaTS(hit)
-		if source == "telegram" && nearMoment(moments[container], ts) {
+		chat := isChatSource(source)
+		if chat && nearMoment(moments[container], ts) {
 			continue
 		}
-		if source == "telegram" {
+		if chat {
 			moments[container] = append(moments[container], ts)
 		}
 		seen[parent], bodies[body] = true, body != ""

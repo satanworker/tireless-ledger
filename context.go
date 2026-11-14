@@ -48,8 +48,8 @@ func chunkGroups(items []MemoryItem, pending func(item MemoryItem, unitHash stri
 			titles[item.Metadata.ContainerID] = sessionTitle(item.Text)
 		}
 	}
-	lines := map[string]string{}      // telegram message id -> "Author: text"
-	lead := map[string][]MemoryItem{} // telegram container -> its latest messages
+	lines := map[string]string{}      // chat message id -> "Author: text"
+	lead := map[string][]MemoryItem{} // chat source/container -> its latest messages
 	questions := map[string]string{}  // session -> latest user prompt
 	groups := make([]chunkGroup, 0)
 	for _, item := range items {
@@ -59,14 +59,15 @@ func chunkGroups(items []MemoryItem, pending func(item MemoryItem, unitHash stri
 		}
 		var body []string
 		switch {
-		case meta.Source == "telegram":
+		case isChatSource(meta.Source):
 			line := item.Text
 			if author := telegramAuthor(meta); author != "" {
 				line = author + ": " + line
 			}
 			if meta.ContainerKind != "channel" {
+				key := meta.Source + "/" + meta.ContainerID
 				quoted := false
-				for _, prev := range lead[meta.ContainerID] {
+				for _, prev := range lead[key] {
 					if meta.Timestamp-prev.Metadata.Timestamp <= telegramLeadGap {
 						body = append(body, clipLine(lines[prev.ID], contextLineRunes))
 						quoted = quoted || prev.ID == meta.ReplyTo
@@ -75,11 +76,11 @@ func chunkGroups(items []MemoryItem, pending func(item MemoryItem, unitHash stri
 				if parent, ok := lines[meta.ReplyTo]; ok && !quoted {
 					body = append([]string{"> " + clipLine(parent, contextLineRunes)}, body...)
 				}
-				recent := append(lead[meta.ContainerID], item)
+				recent := append(lead[key], item)
 				if len(recent) > telegramLeadLines {
 					recent = recent[len(recent)-telegramLeadLines:]
 				}
-				lead[meta.ContainerID] = recent
+				lead[key] = recent
 			}
 			lines[item.ID] = line
 			body = append(body, line)
@@ -108,13 +109,24 @@ var harnessNames = map[string]string{
 	"claude": "Claude Code", "codex": "Codex", "pi": "Pi", "omp": "OMP", "grok": "Grok", "grokbot": "Grok bot",
 }
 
+var xKinds = map[string]string{"dm": "DM", "group": "group"}
+
 var telegramKinds = map[string]string{"dm": "direct chat", "group": "group", "channel": "channel", "topic": "group topic"}
 
 // contextHeader is the one line that says where a record is from.
 func contextHeader(m Metadata) string {
 	title := strings.TrimSpace(m.ContainerTitle)
-	switch m.Source {
-	case "telegram":
+	switch {
+	case m.Source == "x":
+		kind := valueOr(xKinds[m.ContainerKind], "chat")
+		if title == "" {
+			return "X " + kind
+		}
+		if kind == "DM" {
+			kind = "DM with"
+		}
+		return fmt.Sprintf("X %s %q", kind, title)
+	case isChatSource(m.Source):
 		kind := telegramKinds[m.ContainerKind]
 		if kind == "" {
 			kind = "chat"
@@ -123,7 +135,7 @@ func contextHeader(m Metadata) string {
 			return "Telegram " + kind
 		}
 		return fmt.Sprintf("Telegram %s %q", kind, title)
-	case "crm":
+	case m.Source == "crm":
 		return fmt.Sprintf("CRM notes on %q", valueOr(title, m.ContainerID))
 	}
 	header := valueOr(harnessNames[m.Source], m.Source) + " session"

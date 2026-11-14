@@ -9,10 +9,16 @@ import (
 	"strings"
 )
 
-// telegramLine is one exported message version, written by cmd/tireless-telegram to
-// <host>/telegram/<chat_id>/<yyyy-mm>.jsonl. An edit appends a new line with the same
-// id; the last line wins.
-type telegramLine struct {
+// chatSources are the chat platforms. Their objects share one line format and code
+// path; the platform is only the record's source. Add a platform here.
+var chatSources = map[string]bool{"telegram": true, "x": true}
+
+func isChatSource(source string) bool { return chatSources[source] }
+
+// chatLine is one exported message version, written to
+// <host>/<source>/<chat_id>/<yyyy-mm>.jsonl (cmd/tireless-telegram for Telegram, the
+// Mac's export for X). An edit appends a new line with the same id; the last line wins.
+type chatLine struct {
 	ID         string `json:"id"`
 	ChatID     string `json:"chat_id"`
 	ChatType   string `json:"chat_type"`
@@ -26,15 +32,21 @@ type telegramLine struct {
 	FwdFrom    string `json:"fwd_from"`
 	Media      string `json:"media"`
 	Text       string `json:"text"`
+	// Extra fields (X export). Decoded loosely so a type surprise keeps the line.
+	SenderHandle  interface{} `json:"sender_handle"`
+	Encrypted     interface{} `json:"encrypted"`
+	Verified      interface{} `json:"verified"`
+	MessageID     interface{} `json:"message_id"`
+	SourceAccount interface{} `json:"source_account"`
 }
 
-func parseTelegramJSONL(body []byte, host string) ([]MemoryItem, error) {
+func parseChatJSONL(body []byte, host, source string) ([]MemoryItem, error) {
 	index := map[string]int{}
 	items := make([]MemoryItem, 0)
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64*1024), 64<<20)
 	for scanner.Scan() {
-		var line telegramLine
+		var line chatLine
 		if json.Unmarshal(bytes.TrimSpace(scanner.Bytes()), &line) != nil || line.ID == "" || line.ChatID == "" {
 			continue
 		}
@@ -42,7 +54,7 @@ func parseTelegramJSONL(body []byte, host string) ([]MemoryItem, error) {
 		if line.TopicID != "" {
 			container += ":" + line.TopicID
 		}
-		prefix := host + "/telegram/" + container + "/"
+		prefix := host + "/" + source + "/" + container + "/"
 		text := strings.TrimSpace(line.Text)
 		ts := line.Date
 		if ts == 0 {
@@ -52,9 +64,9 @@ func parseTelegramJSONL(body []byte, host string) ([]MemoryItem, error) {
 			ID:   prefix + line.ID,
 			Text: text,
 			Metadata: Metadata{
-				Source: "telegram", Host: host, ContainerID: container, ContainerKind: line.ChatType,
+				Source: source, Host: host, ContainerID: container, ContainerKind: line.ChatType,
 				ContainerTitle: line.ChatTitle, AuthorID: line.SenderID, AuthorName: line.SenderName,
-				Kind: "message", Timestamp: ts, Attrs: telegramAttrs(line), ContentHash: hashText(text),
+				Kind: "message", Timestamp: ts, Attrs: chatAttrs(line), ContentHash: hashText(text),
 			},
 		}
 		if line.ReplyTo != "" {
@@ -81,7 +93,7 @@ func parseTelegramJSONL(body []byte, host string) ([]MemoryItem, error) {
 	return kept, nil
 }
 
-func telegramAttrs(line telegramLine) string {
+func chatAttrs(line chatLine) string {
 	attrs := map[string]interface{}{}
 	if line.FwdFrom != "" {
 		attrs["fwd_from"] = line.FwdFrom
@@ -91,6 +103,12 @@ func telegramAttrs(line telegramLine) string {
 	}
 	if line.Media != "" {
 		attrs["media"] = line.Media
+	}
+	for key, v := range map[string]interface{}{"sender_handle": line.SenderHandle, "encrypted": line.Encrypted,
+		"verified": line.Verified, "message_id": line.MessageID, "source_account": line.SourceAccount} {
+		if v != nil && v != "" {
+			attrs[key] = v
+		}
 	}
 	if len(attrs) == 0 {
 		return ""
