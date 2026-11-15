@@ -53,6 +53,28 @@ func TestParseRawOmpKeepsHarnessAndTitlelessMessages(t *testing.T) {
 	}
 }
 
+func TestParseRawOmpIndexesLiveVoiceTurns(t *testing.T) {
+	body := []byte(`{"type":"session","id":"omp-session","timestamp":"2026-11-15T13:30:19Z","cwd":"/repo/brimstone"}
+{"type":"custom_message","customType":"live-delegation","content":"recall the session about a Telegram bot","display":true,"attribution":"agent","id":"v1","timestamp":"2026-11-15T13:30:43Z"}
+{"type":"custom_message","customType":"advisor","content":"advisor note that is not the user","display":true,"attribution":"agent","id":"n1","timestamp":"2026-11-15T13:30:44Z"}
+{"type":"message","id":"a1","timestamp":"2026-11-15T13:30:50Z","message":{"role":"assistant","content":[{"type":"text","text":"Found the Telegram bot session."}]}}
+`)
+	items, err := parseRawSession("mbp14/omp/-repo-brimstone/session.jsonl", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items=%+v", items)
+	}
+	voice := items[0].Metadata
+	if items[0].Text != "recall the session about a Telegram bot" || voice.AuthorID != "user" || voice.AuthorName != "user (voice)" || voice.Kind != "message" {
+		t.Fatalf("voice=%q %+v", items[0].Text, voice)
+	}
+	if items[0].ID != "mbp14/omp/omp-session/v1" {
+		t.Fatalf("id=%s", items[0].ID)
+	}
+}
+
 func TestParseRawOmpIndexesImportantState(t *testing.T) {
 	body := []byte(`{"type":"title","id":"title-1","title":"Serving table people search"}
 {"type":"session","id":"omp-session","timestamp":"2026-09-01T18:19:23Z","cwd":"/repo/brimstone","title":"Serving table people search"}
