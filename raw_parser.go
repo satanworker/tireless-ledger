@@ -16,7 +16,7 @@ import (
 
 // Bumping this re-parses every raw object; units whose embedded text is unchanged
 // are skipped by the dedup state (rawDerivedKey), so only changed ones are re-embedded.
-const rawParserVersion = "contextual-v1"
+const rawParserVersion = "contextual-v2"
 
 var skippedUserPrefixes = []string{"# AGENTS.md", "<permissions instructions>", "<INSTRUCTIONS>"}
 
@@ -238,6 +238,17 @@ func parseSessionJSONL(body []byte, host, harness, source string, includeState b
 						items = append(items, rawRecord(host, harness, sessionID, entryID, "user_todo_edit", text, parseRawTimestamp(obj["timestamp"]), project, "todo"))
 					}
 				}
+				continue
+			case "custom_message":
+				// omp /live: the realtime voice model forwards what the user said as a
+				// live-delegation entry (attribution "agent"), not a user message.
+				text := contentText(obj["content"])
+				if stringField(obj, "customType") != "live-delegation" || !indexableMessage("user", text) {
+					continue
+				}
+				item := rawRecord(host, harness, sessionID, entryID, "user", text, parseRawTimestamp(obj["timestamp"]), project, "message")
+				item.Metadata.AuthorName = "user (voice)"
+				items = append(items, item)
 				continue
 			case "message":
 				msg, _ := obj["message"].(map[string]interface{})

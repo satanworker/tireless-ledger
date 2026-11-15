@@ -51,6 +51,8 @@ func TestParseOmpKeepsSource(t *testing.T) {
 	raw := strings.Join([]string{
 		`{"type":"session","version":3,"id":"omp123","timestamp":"2026-09-01T18:19:23.097Z","cwd":"/Users/x/Developer/satanworker"}`,
 		`{"type":"message","id":"u1","timestamp":"2026-09-01T18:20:42.948Z","message":{"role":"user","content":[{"type":"text","text":"sync omp history please"}]}}`,
+		`{"type":"custom_message","customType":"live-delegation","content":"what changed in the sync, said by voice","attribution":"agent","id":"v1","timestamp":"2026-09-01T18:21:00Z"}`,
+		`{"type":"custom_message","customType":"advisor","content":"advisor note that is not the user","attribution":"agent","id":"n1","timestamp":"2026-09-01T18:21:01Z"}`,
 		"",
 	}, "\n")
 	st := &fileState{Source: "omp", Host: "mac", Project: "unknown"}
@@ -58,11 +60,14 @@ func TestParseOmpKeepsSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(turns) != 1 || turns[0].Source != "omp" || turns[0].Container != "omp123" {
+	if len(turns) != 2 || turns[0].Source != "omp" || turns[0].Container != "omp123" {
 		t.Fatalf("turns=%+v", turns)
 	}
 	if turns[0].ID != "mac/omp/omp123/u1" {
 		t.Fatalf("id=%s", turns[0].ID)
+	}
+	if turns[1].ID != "mac/omp/omp123/v1" || turns[1].Author != "user" || turns[1].Text != "what changed in the sync, said by voice" {
+		t.Fatalf("voice=%+v", turns[1])
 	}
 }
 
