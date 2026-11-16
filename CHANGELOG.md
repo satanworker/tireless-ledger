@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### X DMs as a chat source (2026-11-16)
+
+- Chat platforms are one source class (`isChatSource`: `telegram`, `x`); the parser,
+  lead-in, header and per-moment hit grouping key on source + container. `x` objects
+  live at `<host>/x/<conversation_id>/<yyyy-mm>.jsonl`; extra line fields go to attrs.
+  Telegram records are byte-identical (VAL-2548).
+- `tireless-upload --chat <source>=<dir>` (repeatable), with `--telegram` and the new
+  `--x` / `TIRELESS_X_DIR` as aliases; a chat walk skips a top-level folder named after
+  another chat source (VAL-2549).
+- `/v1/raw/status` gains a per-source `sources` map. Skill lists `x` and `docs`.
+
 ### Contextual recall (2026-10-30)
 
 - Every record is embedded as a header + body unit (`context.go`): chat or session
