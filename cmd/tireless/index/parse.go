@@ -167,25 +167,35 @@ func parsePi(obj map[string]any, st *fileState) (Turn, bool) {
 		}
 		return Turn{}, false
 	}
-	if typ != "message" {
+	var role, text string
+	var ts int64
+	switch typ {
+	case "custom_message":
+		// omp /live forwards the user's speech as a live-delegation entry.
+		if ct, _ := obj["customType"].(string); ct != "live-delegation" {
+			return Turn{}, false
+		}
+		role, text, ts = "user", partsText(obj["content"]), parseTS(obj["timestamp"])
+	case "message":
+		msg, _ := obj["message"].(map[string]any)
+		role, _ = msg["role"].(string)
+		text = partsText(msg["content"])
+		ts = parseTS(obj["timestamp"])
+		if ts == 0 {
+			ts = parseTS(msg["timestamp"])
+		}
+	default:
 		return Turn{}, false
 	}
-	msg, _ := obj["message"].(map[string]any)
-	role, _ := msg["role"].(string)
 	if role != "user" && role != "assistant" {
 		return Turn{}, false
 	}
-	text := partsText(msg["content"])
 	if len(text) < minChars || (role == "user" && skipUserText(text)) {
 		return Turn{}, false
 	}
 	turnID, _ := obj["id"].(string)
 	if turnID == "" {
 		return Turn{}, false
-	}
-	ts := parseTS(obj["timestamp"])
-	if ts == 0 {
-		ts = parseTS(msg["timestamp"])
 	}
 	return makeTurn(st.Host, st.Source, st.Container, turnID, role, text, ts, st.Project), true
 }

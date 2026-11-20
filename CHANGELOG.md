@@ -26,6 +26,16 @@
   another chat source (VAL-2549).
 - `/v1/raw/status` gains a per-source `sources` map. Skill lists `x` and `docs`.
 
+### omp voice turns (2026-11-15)
+
+- omp `/live` turns (`custom_message` / `live-delegation`) are indexed as user
+  messages with `author_name` `user (voice)`, by the server parser and by
+  `tireless sync`. Before, a session driven by voice only had the agent's replies
+  indexed, and those replies had no `Re:` prompt.
+- Parser version `contextual-v2`: a store re-parses every object; only messages
+  whose embedded text changes (new voice turns and the replies after them) are
+  re-embedded.
+
 ### Contextual recall (2026-10-30)
 
 - Every record is embedded as a header + body unit (`context.go`): chat or session
