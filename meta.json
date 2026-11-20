@@ -1,0 +1,10 @@
+{
+ "docId": "2ZQDh18egiZ6c75kskGKzu6Jq5Ux",
+ "branch": "main",
+ "path": "docker/lance/requirements.txt",
+ "commit": "84b9fd34d7b555ace1140ff6a28ef7d895563868",
+ "heads": [
+  "e21def9a3877636c791f36aad4e75f5dab1039d4b117f42b2448aff6ac9f2762"
+ ],
+ "replayVersion": 1
+}
