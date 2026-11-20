@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -26,6 +27,35 @@ func testServer() *server {
 		cfg:   runtimeConfig{Dimensions: 2},
 		dedup: &dedupState{Files: map[string]string{}},
 		mem:   newMemStore(2),
+	}
+}
+
+func TestIngestRefusedFromThisHost(t *testing.T) {
+	reached := 0
+	h := refuseFromThisHost(func(http.ResponseWriter, *http.Request) { reached++ })
+	local := []string{"127.0.0.1:4000", "[::1]:4000", "[::ffff:127.0.0.1]:4000"}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && !n.IP.IsLoopback() {
+				local = append(local, net.JoinHostPort(n.IP.String(), "4000"))
+			}
+		}
+	}
+	for _, addr := range local {
+		req := httptest.NewRequest(http.MethodPost, "/v1/memory/ingest", nil)
+		req.RemoteAddr = addr
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s: status=%d", addr, rec.Code)
+		}
+	}
+	// Another tailnet device.
+	req := httptest.NewRequest(http.MethodPost, "/v1/memory/ingest", nil)
+	req.RemoteAddr = "100.127.82.200:4000"
+	h(httptest.NewRecorder(), req)
+	if reached != 1 {
+		t.Fatalf("tailnet ingest reached handler %d times", reached)
 	}
 }
 

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow/go/v17/arrow"
@@ -489,30 +491,30 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	if hasText && req.BM25.Field != "" && req.BM25.Field != "text" {
 		return nil, fmt.Errorf("unsupported BM25 field %q", req.BM25.Field)
 	}
-	switch {
-	case hasVector:
+	if hasVector || hasText {
 		config.Limit = &limit
+	}
+	configs := []contracts.QueryConfig{config}
+	if hasVector {
 		nprobes := s.nprobes
 		refine := lanceVectorRefineFactor
-		config.VectorSearch = &contracts.VectorSearch{
+		configs[0].VectorSearch = &contracts.VectorSearch{
 			Column: "vector", Vector: req.Vector, K: limit, Nprobes: &nprobes, RefineFactor: &refine,
 			BypassVectorIndex: s.exact,
 		}
 		if hasText {
-			config.VectorSearch.FullTextQuery = req.BM25.Query
-			config.VectorSearch.FullTextColumn = "text"
-			config.Reranker = &contracts.RerankerConfig{Kind: contracts.RerankerRRF, RRFK: 60, Norm: contracts.NormalizeRank}
+			configs = append(configs, config)
 		}
-	case hasText:
-		config.Limit = &limit
-		config.FTSSearch = &contracts.FTSSearch{Column: "text", Query: req.BM25.Query}
+	}
+	if hasText {
+		configs[len(configs)-1].FTSSearch = &contracts.FTSSearch{Column: "text", Query: req.BM25.Query}
 	}
 	var rows []map[string]interface{}
 	var err error
 	if req.Collapse > 0 && (hasVector || hasText) {
-		rows, err = selectCollapsed(ctx, table, config, req.Collapse)
+		rows, err = selectCollapsed(ctx, table, configs, req.Collapse)
 	} else {
-		rows, err = table.Select(ctx, config)
+		rows, err = selectFused(ctx, table, configs)
 	}
 	if err != nil {
 		return nil, err
@@ -538,6 +540,7 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 		delete(row, "_relevance_score")
 		delete(row, "_score")
 		delete(row, "_distance")
+		delete(row, "_rowid")
 		results = append(results, queryResult{ID: id, Score: score, Text: content, Metadata: row})
 	}
 	if !hasVector && !hasText {
@@ -555,14 +558,78 @@ func (s *cgoLanceStore) Search(ctx context.Context, req vectorSearchRequest) ([]
 	return results, nil
 }
 
+// selectFused runs one search, or a vector and a text search fused in Go by reciprocal rank
+// on _rowid (k=60, as rrfMerge). Lance's native hybrid RRF fails ("expected column
+// _distance not found in rank") when a selective filter leaves the vector side empty.
+func selectFused(ctx context.Context, table contracts.ITable, configs []contracts.QueryConfig) ([]map[string]interface{}, error) {
+	if len(configs) == 1 {
+		return selectSearch(ctx, table, configs[0])
+	}
+	lists := make([][]map[string]interface{}, len(configs))
+	errs := make([]error, len(configs))
+	var wg sync.WaitGroup
+	for i, config := range configs {
+		config.WithRowID = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lists[i], errs[i] = selectSearch(ctx, table, config)
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	score := map[float64]float64{}
+	var fused []map[string]interface{}
+	for _, rows := range lists {
+		for i, row := range rows {
+			id := numberValue(row["_rowid"])
+			if _, ok := score[id]; !ok {
+				fused = append(fused, row)
+			}
+			score[id] += 1.0 / float64(60+i+1)
+		}
+	}
+	for _, row := range fused {
+		row["_relevance_score"] = score[numberValue(row["_rowid"])]
+	}
+	sort.SliceStable(fused, func(i, j int) bool {
+		return fused[i]["_relevance_score"].(float64) > fused[j]["_relevance_score"].(float64)
+	})
+	if limit := configs[0].Limit; limit != nil && len(fused) > *limit {
+		fused = fused[:*limit]
+	}
+	return fused, nil
+}
+
+// selectSearch retries a filtered IVF-PQ search that returns fewer than K rows as a flat
+// scan. The index search drops filtered rows far from the query: on home-satan a
+// project=grokbot-legal filter (196 chunks) returned none of them, the flat scan 10.
+// ponytail: a broad filter whose index search under-fills scans every matching vector.
+func selectSearch(ctx context.Context, table contracts.ITable, config contracts.QueryConfig) ([]map[string]interface{}, error) {
+	rows, err := table.Select(ctx, config)
+	vs := config.VectorSearch
+	if err != nil || vs == nil || vs.BypassVectorIndex || config.Where == "" || config.Limit == nil || len(rows) >= *config.Limit {
+		return rows, err
+	}
+	flat := *vs
+	flat.BypassVectorIndex = true
+	config.VectorSearch = &flat
+	return table.Select(ctx, config)
+}
+
 // selectCollapsed ranks candidates reading only message_id, keeps the best row of each of
 // the first `messages` messages, then reads the output columns for just those rows. A cold
 // search reads ~5 rows of the wide columns instead of fetchK per channel.
-func selectCollapsed(ctx context.Context, table contracts.ITable, config contracts.QueryConfig, messages int) ([]map[string]interface{}, error) {
-	rank := config
-	rank.Columns = []string{"message_id"}
-	rank.WithRowID = true
-	hits, err := table.Select(ctx, rank)
+func selectCollapsed(ctx context.Context, table contracts.ITable, configs []contracts.QueryConfig, messages int) ([]map[string]interface{}, error) {
+	rank := make([]contracts.QueryConfig, len(configs))
+	for i, config := range configs {
+		config.Columns = []string{"message_id"}
+		config.WithRowID = true
+		rank[i] = config
+	}
+	hits, err := selectFused(ctx, table, rank)
 	if err != nil {
 		return nil, err
 	}
@@ -590,14 +657,14 @@ func selectCollapsed(ctx context.Context, table contracts.ITable, config contrac
 	}
 	// No Limit: Lance 10 applies a limit on a `_rowid IN` scan as a row range before the
 	// filter and returns nothing.
-	full, err := table.Select(ctx, contracts.QueryConfig{Columns: config.Columns, Where: "_rowid IN (" + strings.Join(rowIDs, ",") + ")", WithRowID: true})
+	full, err := table.Select(ctx, contracts.QueryConfig{Columns: configs[0].Columns, Where: "_rowid IN (" + strings.Join(rowIDs, ",") + ")", WithRowID: true})
 	if err != nil {
 		return nil, err
 	}
 	if len(full) != len(kept) {
 		// A concurrent merge-insert rewrote a hit between the two reads (row ids are row
 		// addresses); rank and fetch in one pass instead.
-		return table.Select(ctx, config)
+		return selectFused(ctx, table, configs)
 	}
 	byRowID := make(map[float64]map[string]interface{}, len(full))
 	for _, row := range full {
@@ -606,7 +673,7 @@ func selectCollapsed(ctx context.Context, table contracts.ITable, config contrac
 	for i, hit := range kept {
 		row := byRowID[numberValue(hit["_rowid"])]
 		if row == nil {
-			return table.Select(ctx, config)
+			return selectFused(ctx, table, configs)
 		}
 		for _, k := range []string{"_relevance_score", "_score", "_distance"} {
 			if v, ok := hit[k]; ok {

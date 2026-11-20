@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Filtered recall and read-only local ingest (2026-11-20)
+
+- Hybrid queries run the vector and the text search separately and fuse them in Go
+  (RRF on row id, k=60) instead of Lance's native RRF, which failed with 502
+  `expected column _distance not found in rank` when a filter left the vector side
+  empty (`-project grokbot-legal tax` on home-satan).
+- A filtered IVF-PQ search that returns fewer than K rows is retried as a flat scan:
+  the index search dropped filtered rows far from the query (196 grokbot-legal chunks,
+  0 returned).
+- `POST /v1/memory/ingest` answers 403 to callers on the server's own host (loopback
+  or any of its addresses), so agents running there can read but not write. Ingest
+  from other tailnet devices is unchanged.
+
 ### X DMs as a chat source (2026-11-16)
 
 - Chat platforms are one source class (`isChatSource`: `telegram`, `x`); the parser,

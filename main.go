@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -369,7 +370,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /-/ready", s.ready)
-	mux.HandleFunc("POST /v1/memory/ingest", s.ingest)
+	mux.HandleFunc("POST /v1/memory/ingest", refuseFromThisHost(s.ingest))
 	mux.HandleFunc("POST /v1/memory/query", s.query)
 	mux.HandleFunc("GET /v1/memory/container", s.containerWalk)
 	mux.HandleFunc("GET /v1/memory/sessions", s.sessions)
@@ -390,6 +391,41 @@ func main() {
 		slog.Error("http server stopped", "err", err)
 		os.Exit(1)
 	}
+}
+
+// refuseFromThisHost keeps agents on the server's own host (home-satan's omp-agent reaches
+// :8090 on loopback and on the host's tailnet address) read-only, so a prompt-injected agent
+// cannot plant records every agent later trusts. Other tailnet devices ingest as before.
+func refuseFromThisHost(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if fromThisHost(r.RemoteAddr) {
+			errorJSON(w, http.StatusForbidden, errors.New("ingest from the server's own host is refused; ingest from another tailnet device"))
+			return
+		}
+		next(w, r)
+	}
+}
+
+// fromThisHost fails closed: an unparsable address or unreadable interface list counts as local.
+func fromThisHost(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsLoopback() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return true
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func loadConfig() runtimeConfig {

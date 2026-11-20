@@ -213,7 +213,7 @@ A CGO-disabled binary rejects S3 storage with a clear startup error.
 ## Lance behavior
 
 - Merge-insert on stable `id`; an ingest response is successful only after persistence.
-- Vector (single-partition IVF-PQ), BM25, and combined hybrid search with LanceDB RRF.
+- Vector (single-partition IVF-PQ), BM25, and hybrid search: the vector and BM25 searches run separately and are fused in Go by reciprocal rank (k=60). A filtered IVF-PQ search that returns fewer than K rows is retried as a flat scan, because the index search drops filtered rows far from the query.
 - Search reads only the `chunks` table; container walking reads only `messages`.
 - Container walk filters in Lance, applies the `(after_ts, after_id)` cursor, and returns `(timestamp, id)` order.
 - Chunks use vector, `text` FTS, and scalar `id` indexes; messages use scalar `container_id` and `id` indexes.
@@ -245,7 +245,7 @@ operational baselines rather than a latency guarantee.
 ## HTTP API
 
 - `GET /-/ready`
-- `POST /v1/memory/ingest` — `{records:[{id, vector, text, metadata:{source, host, container_id, timestamp, …}}]}`; one chunk `<id>#0` per record
+- `POST /v1/memory/ingest` — `{records:[{id, vector, text, metadata:{source, host, container_id, timestamp, …}}]}`; one chunk `<id>#0` per record. Refused (403) from the server's own host, loopback or any of its addresses, so agents running beside the server stay read-only; ingest from another tailnet device.
 - `POST /v1/memory/query` — filters `source`, `host`, `container_id`, `container_kind`, `project`, `author_id`, `kind`
 - `GET /v1/memory/container?container_id=...&host=&source=&after_ts=...&after_id=...[&include=todos|tasks|titles|state]`
 - `GET /v1/memory/sessions?since=<unix>[&until=<unix>][&host=&source=&project=]` — one row per container with messages in `[since, until)`, oldest first: `container_id`, `host`, `source`, `project`, `first_ts`, `last_ts`, `messages` (count in the window), `first_prompt` (first user message in the window, first message for chats; 300 chars). CLI: `tireless sessions -since 24h|<unix>|<RFC3339> [-until …] [-host] [-source] [-project]`; walk one session's window with `tireless container -after-ts <since> <container_id>`.
