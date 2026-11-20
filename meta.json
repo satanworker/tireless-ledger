@@ -1,0 +1,10 @@
+{
+ "docId": "9GacJ9TA1pWdnLCf28T8P4ttZbc",
+ "branch": "main",
+ "path": "tasks/🌙-wipe-r2-and-re-sync-after-fts-compact-poison.md",
+ "commit": "84b9fd34d7b555ace1140ff6a28ef7d895563868",
+ "heads": [
+  "2050668fbf9d6cbbf0afd4d4f14a70472505cf8dfa08be3e5ff740da8b80f718"
+ ],
+ "replayVersion": 1
+}
